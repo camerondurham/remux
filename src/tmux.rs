@@ -1,0 +1,144 @@
+use anyhow::{Result, anyhow, bail};
+use serde::Serialize;
+use std::fmt;
+
+pub const INVENTORY_COMMAND: &str = "tmux list-panes -a -F '#S\t#I\t#P\t#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}'";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PaneTarget {
+    pub host: String,
+    pub session: String,
+    pub window: String,
+    pub pane: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Pane {
+    pub target: String,
+    pub host: String,
+    pub session: String,
+    pub window: String,
+    pub pane: String,
+    pub pane_id: String,
+    pub pid: Option<u32>,
+    pub command: String,
+    pub cwd: String,
+}
+
+impl PaneTarget {
+    pub fn parse(input: &str) -> Result<Self> {
+        let (host, rest) = input.split_once('/').ok_or_else(|| {
+            anyhow!("pane target must look like <host>/<session>:<window>.<pane>")
+        })?;
+        let (session, rest) = rest
+            .rsplit_once(':')
+            .ok_or_else(|| anyhow!("pane target must include tmux session and window"))?;
+        let (window, pane) = rest.split_once('.').ok_or_else(|| {
+            anyhow!("pane target must include window and pane as <window>.<pane>")
+        })?;
+
+        if host.is_empty() || session.is_empty() || window.is_empty() || pane.is_empty() {
+            bail!("pane target must look like <host>/<session>:<window>.<pane>");
+        }
+
+        Ok(Self {
+            host: host.to_string(),
+            session: session.to_string(),
+            window: window.to_string(),
+            pane: pane.to_string(),
+        })
+    }
+
+    pub fn tmux_target(&self) -> String {
+        format!("{}:{}.{}", self.session, self.window, self.pane)
+    }
+}
+
+impl fmt::Display for PaneTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}/{}:{}.{}",
+            self.host, self.session, self.window, self.pane
+        )
+    }
+}
+
+pub fn parse_inventory(host: &str, output: &str) -> Result<Vec<Pane>> {
+    let mut panes = Vec::new();
+    for (index, line) in output.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() != 7 {
+            bail!(
+                "failed to parse tmux inventory line {} for host `{}`: expected 7 tab-separated fields, got {}",
+                index + 1,
+                host,
+                fields.len()
+            );
+        }
+        let session = fields[0].to_string();
+        let window = fields[1].to_string();
+        let pane = fields[2].to_string();
+        let target = format!("{host}/{session}:{window}.{pane}");
+        panes.push(Pane {
+            target,
+            host: host.to_string(),
+            session,
+            window,
+            pane,
+            pane_id: fields[3].to_string(),
+            pid: fields[4].parse().ok(),
+            command: fields[5].to_string(),
+            cwd: fields[6].to_string(),
+        });
+    }
+    Ok(panes)
+}
+
+pub fn capture_command(target: &PaneTarget, lines: usize) -> String {
+    format!(
+        "tmux capture-pane -pt {} -S -{}",
+        shell_quote(&target.tmux_target()),
+        lines
+    )
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_pane_target() {
+        let target = PaneTarget::parse("pi/codex:0.1").unwrap();
+        assert_eq!(target.host, "pi");
+        assert_eq!(target.session, "codex");
+        assert_eq!(target.window, "0");
+        assert_eq!(target.pane, "1");
+        assert_eq!(target.to_string(), "pi/codex:0.1");
+    }
+
+    #[test]
+    fn parses_tmux_inventory() {
+        let output = "codex\t0\t1\t%3\t1234\tzsh\t/home/cam/work\n";
+        let panes = parse_inventory("pi", output).unwrap();
+        assert_eq!(panes[0].target, "pi/codex:0.1");
+        assert_eq!(panes[0].pid, Some(1234));
+        assert_eq!(panes[0].command, "zsh");
+    }
+
+    #[test]
+    fn capture_command_quotes_target() {
+        let target = PaneTarget::parse("pi/codex:0.1").unwrap();
+        assert_eq!(
+            capture_command(&target, 120),
+            "tmux capture-pane -pt 'codex:0.1' -S -120"
+        );
+    }
+}

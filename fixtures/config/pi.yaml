@@ -1,0 +1,9 @@
+hosts:
+  - id: pi
+    type: ssh
+    ssh:
+      target: cam@192.168.0.197
+      config_file: /dev/null
+      options:
+        BatchMode: "yes"
+        ConnectTimeout: "5"
