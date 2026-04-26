@@ -45,7 +45,7 @@ fn run_app(
 ) -> Result<()> {
     let (tx, rx) = mpsc::channel();
     let mut app = App::new(filter);
-    spawn_refresh(&config, host.clone(), tx.clone(), &mut app);
+    spawn_refresh(&config, host.clone(), tx.clone(), &mut app)?;
 
     loop {
         while let Ok(message) = rx.try_recv() {
@@ -98,9 +98,28 @@ struct App {
     help: bool,
     status: String,
     polling: bool,
+    host_progress: Vec<HostProgress>,
+    refresh_started_at: Option<Instant>,
     captured_for: Option<String>,
     captured_output: Option<String>,
     last_refresh: Option<Instant>,
+}
+
+#[derive(Clone)]
+struct HostProgress {
+    id: String,
+    state: HostProgressState,
+    started_at: Option<Instant>,
+    finished_at: Option<Instant>,
+    message: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostProgressState {
+    Queued,
+    Polling,
+    Ok,
+    Unreachable,
 }
 
 impl App {
@@ -113,6 +132,8 @@ impl App {
             help: false,
             status: "polling".to_string(),
             polling: false,
+            host_progress: Vec::new(),
+            refresh_started_at: None,
             captured_for: None,
             captured_output: None,
             last_refresh: None,
@@ -147,24 +168,138 @@ impl App {
         }
     }
 
+    fn begin_refresh(&mut self, host_ids: Vec<String>) {
+        self.polling = true;
+        self.refresh_started_at = Some(Instant::now());
+        self.host_progress = host_ids
+            .into_iter()
+            .map(|id| HostProgress {
+                id,
+                state: HostProgressState::Queued,
+                started_at: None,
+                finished_at: None,
+                message: None,
+            })
+            .collect();
+        self.status = self.progress_summary();
+    }
+
     fn apply_refresh(&mut self, message: RefreshMessage) {
-        self.polling = false;
-        self.last_refresh = Some(Instant::now());
-        match message.result {
-            Ok(snapshots) => {
-                self.status = format!("{} host(s) refreshed", snapshots.len());
-                self.snapshots = snapshots;
-                self.clamp_selection();
+        match message {
+            RefreshMessage::HostStarted { host } => {
+                if let Some(progress) = self.host_progress.iter_mut().find(|item| item.id == host) {
+                    progress.state = HostProgressState::Polling;
+                    progress.started_at = Some(Instant::now());
+                    progress.message = None;
+                }
+                self.status = self.progress_summary();
             }
-            Err(err) => {
-                self.status = format!("{err:#}");
+            RefreshMessage::HostFinished { snapshot } => {
+                self.update_host_finished(&snapshot);
+                self.upsert_snapshot(snapshot);
+                self.clamp_selection();
+                self.status = self.progress_summary();
+            }
+            RefreshMessage::Complete => {
+                self.polling = false;
+                self.last_refresh = Some(Instant::now());
+                self.status = format!("scan complete: {}", self.progress_summary());
             }
         }
     }
+
+    fn update_host_finished(&mut self, snapshot: &HostSnapshot) {
+        if let Some(progress) = self
+            .host_progress
+            .iter_mut()
+            .find(|item| item.id == snapshot.host)
+        {
+            progress.state = match snapshot.status {
+                snapshot::SnapshotStatus::Ok => HostProgressState::Ok,
+                snapshot::SnapshotStatus::Unreachable => HostProgressState::Unreachable,
+            };
+            progress.finished_at = Some(Instant::now());
+            progress.message = snapshot.errors.first().map(|error| error.message.clone());
+        }
+    }
+
+    fn upsert_snapshot(&mut self, snapshot: HostSnapshot) {
+        if let Some(existing) = self
+            .snapshots
+            .iter_mut()
+            .find(|existing| existing.host == snapshot.host)
+        {
+            *existing = snapshot;
+        } else {
+            self.snapshots.push(snapshot);
+        }
+
+        let order: Vec<String> = self
+            .host_progress
+            .iter()
+            .map(|progress| progress.id.clone())
+            .collect();
+        self.snapshots.sort_by_key(|snapshot| {
+            order
+                .iter()
+                .position(|host| host == &snapshot.host)
+                .unwrap_or(usize::MAX)
+        });
+    }
+
+    fn progress_summary(&self) -> String {
+        if self.host_progress.is_empty() {
+            return "no hosts queued".to_string();
+        }
+
+        let total = self.host_progress.len();
+        let finished = self
+            .host_progress
+            .iter()
+            .filter(|host| host.state.is_finished())
+            .count();
+        let queued = self
+            .host_progress
+            .iter()
+            .filter(|host| host.state == HostProgressState::Queued)
+            .count();
+        let polling: Vec<String> = self
+            .host_progress
+            .iter()
+            .filter(|host| host.state == HostProgressState::Polling)
+            .map(|host| {
+                let elapsed = host
+                    .started_at
+                    .map(|started| format_elapsed(started.elapsed()))
+                    .unwrap_or_else(|| "0s".to_string());
+                format!("{} {elapsed}", host.id)
+            })
+            .collect();
+
+        let mut parts = vec![format!("{finished}/{total} hosts")];
+        if !polling.is_empty() {
+            parts.push(format!("polling {}", polling.join(", ")));
+        }
+        if queued > 0 {
+            parts.push(format!("{queued} queued"));
+        }
+        if let Some(started) = self.refresh_started_at {
+            parts.push(format!("elapsed {}", format_elapsed(started.elapsed())));
+        }
+        parts.join(" | ")
+    }
 }
 
-struct RefreshMessage {
-    result: Result<Vec<HostSnapshot>>,
+impl HostProgressState {
+    fn is_finished(self) -> bool {
+        matches!(self, HostProgressState::Ok | HostProgressState::Unreachable)
+    }
+}
+
+enum RefreshMessage {
+    HostStarted { host: String },
+    HostFinished { snapshot: HostSnapshot },
+    Complete,
 }
 
 fn spawn_refresh(
@@ -172,38 +307,41 @@ fn spawn_refresh(
     host: Option<String>,
     tx: mpsc::Sender<RefreshMessage>,
     app: &mut App,
-) {
+) -> Result<()> {
     if app.polling {
-        return;
+        return Ok(());
     }
-    app.polling = true;
-    app.status = "polling".to_string();
+    let host_ids = host_ids_for_refresh(config, host.as_deref())?;
+    app.begin_refresh(host_ids.clone());
     let config = config.clone();
     thread::spawn(move || {
-        let result = poll_hosts(&config, host.as_deref());
-        let _ = tx.send(RefreshMessage { result });
+        poll_hosts(&config, host_ids, tx);
     });
+    Ok(())
 }
 
-fn poll_hosts(config: &Config, host: Option<&str>) -> Result<Vec<HostSnapshot>> {
-    let host_ids: Vec<String> = match host {
+fn host_ids_for_refresh(config: &Config, host: Option<&str>) -> Result<Vec<String>> {
+    Ok(match host {
         Some(host) => vec![config.host(host)?.id.clone()],
         None => config.hosts.iter().map(|host| host.id.clone()).collect(),
-    };
+    })
+}
+
+fn poll_hosts(config: &Config, host_ids: Vec<String>, tx: mpsc::Sender<RefreshMessage>) {
     if host_ids.is_empty() {
-        return Ok(Vec::new());
+        let _ = tx.send(RefreshMessage::Complete);
+        return;
     }
 
     let worker_count = config.poll.max_concurrency.min(host_ids.len()).max(1);
-    let order = host_ids.clone();
     let queue = Arc::new(Mutex::new(VecDeque::from(host_ids)));
-    let (tx, rx) = mpsc::channel();
+    let mut handles = Vec::new();
 
     for _ in 0..worker_count {
         let queue = Arc::clone(&queue);
         let tx = tx.clone();
         let config = config.clone();
-        thread::spawn(move || {
+        handles.push(thread::spawn(move || {
             loop {
                 let host_id = {
                     let mut queue = queue.lock().expect("poll queue poisoned");
@@ -212,22 +350,27 @@ fn poll_hosts(config: &Config, host: Option<&str>) -> Result<Vec<HostSnapshot>> 
                 let Some(host_id) = host_id else {
                     break;
                 };
+                if tx
+                    .send(RefreshMessage::HostStarted {
+                        host: host_id.clone(),
+                    })
+                    .is_err()
+                {
+                    break;
+                }
                 let snapshot = snapshot::snapshot_host(&config, &host_id)
                     .unwrap_or_else(|err| synthetic_error_snapshot(host_id, err));
-                let _ = tx.send(snapshot);
+                if tx.send(RefreshMessage::HostFinished { snapshot }).is_err() {
+                    break;
+                }
             }
-        });
+        }));
     }
-    drop(tx);
 
-    let mut snapshots: Vec<HostSnapshot> = rx.into_iter().collect();
-    snapshots.sort_by_key(|snapshot| {
-        order
-            .iter()
-            .position(|host| host == &snapshot.host)
-            .unwrap_or(usize::MAX)
-    });
-    Ok(snapshots)
+    for handle in handles {
+        let _ = handle.join();
+    }
+    let _ = tx.send(RefreshMessage::Complete);
 }
 
 fn synthetic_error_snapshot(host: String, err: anyhow::Error) -> HostSnapshot {
@@ -282,7 +425,7 @@ fn handle_key(
             Ok(false)
         }
         KeyCode::Char('r') => {
-            spawn_refresh(config, host, tx, app);
+            spawn_refresh(config, host, tx, app)?;
             Ok(false)
         }
         KeyCode::Down | KeyCode::Char('j') => {
@@ -390,18 +533,28 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
 
 fn draw_hosts(frame: &mut ratatui::Frame<'_>, area: ratatui::layout::Rect, app: &App) {
     let mut spans = Vec::new();
-    for snapshot in &app.snapshots {
-        let status = match snapshot.status {
-            snapshot::SnapshotStatus::Ok => "ok",
-            snapshot::SnapshotStatus::Unreachable => "unreachable",
-        };
-        let style = if matches!(snapshot.status, snapshot::SnapshotStatus::Ok) {
-            Style::default().fg(Color::Green)
-        } else {
-            Style::default().fg(Color::Red)
-        };
-        spans.push(Span::styled(format!("{} {}", snapshot.host, status), style));
-        spans.push(Span::raw("   "));
+    if !app.host_progress.is_empty() {
+        for progress in &app.host_progress {
+            spans.push(Span::styled(
+                format!("{} {}", progress.id, progress_label(progress)),
+                progress_style(progress.state),
+            ));
+            spans.push(Span::raw("   "));
+        }
+    } else {
+        for snapshot in &app.snapshots {
+            let status = match snapshot.status {
+                snapshot::SnapshotStatus::Ok => "ok",
+                snapshot::SnapshotStatus::Unreachable => "unreachable",
+            };
+            let style = if matches!(snapshot.status, snapshot::SnapshotStatus::Ok) {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::Red)
+            };
+            spans.push(Span::styled(format!("{} {}", snapshot.host, status), style));
+            spans.push(Span::raw("   "));
+        }
     }
     if spans.is_empty() {
         spans.push(Span::raw("no hosts"));
@@ -584,6 +737,66 @@ fn status_style(status: MatchStatus) -> Style {
         MatchStatus::Shadowed => Style::default().fg(Color::Blue),
         MatchStatus::Unreachable => Style::default().fg(Color::Red),
         MatchStatus::Unknown => Style::default().fg(Color::Gray),
+    }
+}
+
+fn progress_label(progress: &HostProgress) -> String {
+    match progress.state {
+        HostProgressState::Queued => "queued".to_string(),
+        HostProgressState::Polling => {
+            let elapsed = progress
+                .started_at
+                .map(|started| format_elapsed(started.elapsed()))
+                .unwrap_or_else(|| "0s".to_string());
+            format!("polling {elapsed}")
+        }
+        HostProgressState::Ok => {
+            let elapsed = progress
+                .started_at
+                .zip(progress.finished_at)
+                .map(|(started, finished)| format_elapsed(finished.duration_since(started)))
+                .unwrap_or_else(|| "done".to_string());
+            format!("ok {elapsed}")
+        }
+        HostProgressState::Unreachable => {
+            let elapsed = progress
+                .started_at
+                .zip(progress.finished_at)
+                .map(|(started, finished)| format_elapsed(finished.duration_since(started)))
+                .unwrap_or_else(|| "done".to_string());
+            if let Some(message) = &progress.message {
+                format!("unreachable {elapsed}: {}", short_message(message))
+            } else {
+                format!("unreachable {elapsed}")
+            }
+        }
+    }
+}
+
+fn progress_style(state: HostProgressState) -> Style {
+    match state {
+        HostProgressState::Queued => Style::default().fg(Color::DarkGray),
+        HostProgressState::Polling => Style::default().fg(Color::Cyan),
+        HostProgressState::Ok => Style::default().fg(Color::Green),
+        HostProgressState::Unreachable => Style::default().fg(Color::Red),
+    }
+}
+
+fn format_elapsed(duration: Duration) -> String {
+    if duration.as_millis() < 1_000 {
+        format!("{}ms", duration.as_millis())
+    } else {
+        format!("{}s", duration.as_secs())
+    }
+}
+
+fn short_message(message: &str) -> String {
+    let first_line = message.lines().next().unwrap_or(message).trim();
+    const LIMIT: usize = 48;
+    if first_line.chars().count() <= LIMIT {
+        first_line.to_string()
+    } else {
+        format!("{}...", first_line.chars().take(LIMIT).collect::<String>())
     }
 }
 
