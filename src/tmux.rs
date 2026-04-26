@@ -11,6 +11,7 @@ pub struct PaneTarget {
     pub session: String,
     pub window: String,
     pub pane: String,
+    pub pane_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -47,11 +48,16 @@ impl PaneTarget {
             session: session.to_string(),
             window: window.to_string(),
             pane: pane.to_string(),
+            pane_id: None,
         })
     }
 
     pub fn tmux_target(&self) -> String {
         format!("{}:{}.{}", self.session, self.window, self.pane)
+    }
+
+    pub fn pane_selector(&self) -> &str {
+        self.pane_id.as_deref().unwrap_or(&self.pane)
     }
 }
 

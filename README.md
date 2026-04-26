@@ -50,6 +50,8 @@ Edit `~/.config/remux/config.yaml`, then run:
 ```bash
 remux hosts
 remux list
+remux attach --readonly pi-agent
+remux attach pi-agent
 remux tui
 ```
 
@@ -59,13 +61,23 @@ Useful commands:
 remux snapshot <host> [--json]
 remux inspect <watch-id-or-pane-target> [--json]
 remux capture <watch-id-or-pane-target> [--lines N]
-remux attach [--readonly] <watch-id-or-pane-target>
+remux attach --readonly <watch-id-or-pane-target>
+remux attach <watch-id-or-pane-target>
 ```
 
 Pane targets look like:
 
 ```text
 pi/work:0.1
+```
+
+Direct pane targets also work:
+
+```bash
+remux inspect 'pi/work:0.1'
+remux capture 'pi/work:0.1'
+remux attach --readonly 'pi/work:0.1'
+remux attach 'pi/work:0.1'
 ```
 
 ## Configuration
@@ -103,6 +115,30 @@ watches:
 Default config path: `~/.config/remux/config.yaml`.
 
 Legacy `sessions` entries are still accepted as exact tmux-coordinate watches.
+
+## Commands
+
+```bash
+remux hosts
+remux snapshot <host> [--json]
+remux list [--json]
+remux inspect <watch-id-or-pane-target> [--json]
+remux capture <watch-id-or-pane-target> [--lines N]
+remux attach --readonly <watch-id-or-pane-target>
+remux attach <watch-id-or-pane-target>
+remux tui [--host HOST] [--filter TEXT]
+```
+
+Aliases:
+
+```bash
+remux ls
+remux i <watch-id-or-pane-target>
+remux a [--readonly] <watch-id-or-pane-target>
+```
+
+`attach --readonly` is a peek. `attach` without `--readonly` is an explicit
+read-write jump.
 
 ## Status Semantics
 
@@ -158,8 +194,13 @@ Attach is always explicit. `remux attach --readonly ...` uses `tmux attach-sessi
 ## TUI Keys
 
 ```text
-enter attach | r refresh | / filter | c capture | i inspect | q quit
+enter readonly attach | a read-write jump | r refresh | / filter | c capture | i inspect | q quit
 ```
+
+Passive discovery commands stay read-only: `hosts`, `list`, `snapshot`,
+`inspect`, `capture`, and TUI polling do not enter a remote session. Read-write
+attach only happens from intentional CLI attach/jump actions or the TUI `a`
+key.
 
 ## Development
 

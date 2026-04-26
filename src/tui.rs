@@ -5,7 +5,7 @@ use crate::snapshot::{
     SnapshotStatus,
 };
 use crate::tmux::PaneTarget;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
@@ -554,17 +554,20 @@ fn attach_selected(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     readonly: bool,
 ) -> Result<()> {
-    let Some(target) = selected_attach_target(app) else {
-        app.status = "selected row cannot attach".to_string();
+    if app.selected_row().is_none() {
+        app.status = "no selected row".to_string();
         return Ok(());
-    };
-    let result = suspend_terminal(terminal, || {
+    }
+    let action = if readonly { "read-only attach" } else { "jump" };
+    let result = suspend_terminal(terminal, || -> Result<PaneTarget> {
+        let target = selected_attach_target(config, app, action)?;
         attach::attach_target(config, &target, readonly)
+            .with_context(|| format!("failed to {action} `{target}`"))?;
+        Ok(target)
     });
-    if let Err(err) = result {
-        app.status = format!("{err:#}");
-    } else {
-        app.status = format!("attached to {target}");
+    match result {
+        Ok(target) => app.status = format!("{action}ed {target}"),
+        Err(err) => app.status = format!("{err:#}"),
     }
     Ok(())
 }
@@ -597,11 +600,10 @@ fn inspect_selected(config: &Config, app: &mut App) -> Result<()> {
         return Ok(());
     };
     let display_id = row.display_id.clone();
-    let id = row
-        .watch_id
-        .clone()
-        .or_else(|| row.raw_target.clone())
-        .unwrap_or_else(|| row.display_id.clone());
+    let Some(id) = row.watch_id.clone().or_else(|| row.raw_target.clone()) else {
+        app.status = "selected row has no inspect target".to_string();
+        return Ok(());
+    };
 
     match snapshot::inspect(config, &id) {
         Ok(detail) => {
@@ -614,19 +616,37 @@ fn inspect_selected(config: &Config, app: &mut App) -> Result<()> {
     Ok(())
 }
 
-fn selected_attach_target(app: &App) -> Option<PaneTarget> {
-    let row = app.selected_row()?;
-    if matches!(
-        row.match_status,
-        MatchStatus::Ambiguous
-            | MatchStatus::Missing
-            | MatchStatus::Shadowed
-            | MatchStatus::Unreachable
-            | MatchStatus::Unknown
-    ) {
-        return None;
+fn selected_attach_target(config: &Config, app: &App, action: &str) -> Result<PaneTarget> {
+    let row = app
+        .selected_row()
+        .ok_or_else(|| anyhow!("no selected row"))?;
+    if let Some(reason) = attach_refusal_reason(row) {
+        bail!("selected row cannot attach: {reason}");
     }
-    PaneTarget::parse(row.raw_target.as_ref()?).ok()
+    if let Some(watch_id) = &row.watch_id {
+        return snapshot::target_for_action(config, watch_id, action);
+    }
+
+    let raw_target = row
+        .raw_target
+        .as_ref()
+        .ok_or_else(|| anyhow!("selected row has no live pane"))?;
+    PaneTarget::parse(raw_target)
+        .with_context(|| format!("selected row has invalid pane target `{raw_target}`"))
+}
+
+fn attach_refusal_reason(row: &SessionSnapshot) -> Option<String> {
+    match row.match_status {
+        MatchStatus::Matched | MatchStatus::Orphan => None,
+        MatchStatus::Missing => Some("missing live pane".to_string()),
+        MatchStatus::Ambiguous => Some("ambiguous candidates".to_string()),
+        MatchStatus::Shadowed => Some(format!(
+            "shadowed by {}",
+            row.shadowed_by.as_deref().unwrap_or("another watch")
+        )),
+        MatchStatus::Unreachable => Some("host unreachable".to_string()),
+        MatchStatus::Unknown => Some("unknown attach state".to_string()),
+    }
 }
 
 fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
@@ -814,8 +834,8 @@ fn draw_detail(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             Line::from("k/up select previous"),
             Line::from("r refresh now"),
             Line::from("/ filter"),
-            Line::from("enter attach read-only"),
-            Line::from("a attach read-write"),
+            Line::from("enter readonly attach"),
+            Line::from("a read-write jump"),
             Line::from("c capture into detail"),
             Line::from("i inspect and refresh detail"),
             Line::from("q quit"),
@@ -859,7 +879,9 @@ fn draw_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     };
     let mut spans = vec![
         key_span("enter"),
-        Span::raw(" attach | "),
+        Span::raw(" readonly | "),
+        key_span("a"),
+        Span::raw(" jump | "),
         key_span("r"),
         Span::raw(" refresh | "),
         key_span("/"),
@@ -1194,21 +1216,16 @@ fn tmux_target(row: &SessionSnapshot) -> String {
 }
 
 fn attach_hint(row: &SessionSnapshot) -> String {
-    match row.match_status {
-        MatchStatus::Matched => format!("enter -> remux attach --readonly {}", row.display_id),
-        MatchStatus::Orphan => row
-            .raw_target
-            .as_ref()
-            .map(|target| format!("enter -> remux attach --readonly '{target}'"))
-            .unwrap_or_else(|| "unavailable".to_string()),
-        MatchStatus::Missing => "unavailable, missing live pane".to_string(),
-        MatchStatus::Ambiguous => "unavailable, ambiguous watch".to_string(),
-        MatchStatus::Shadowed => format!(
-            "unavailable, shadowed by {}",
-            row.shadowed_by.as_deref().unwrap_or("another watch")
-        ),
-        MatchStatus::Unreachable => "unavailable, host unreachable".to_string(),
-        MatchStatus::Unknown => "unavailable".to_string(),
+    if let Some(reason) = attach_refusal_reason(row) {
+        return format!("unavailable, {reason}");
+    }
+
+    if row.watch_id.is_some() {
+        format!("enter readonly | a jump -> remux attach {}", row.display_id)
+    } else if let Some(target) = &row.raw_target {
+        format!("enter readonly | a jump -> remux attach '{target}'")
+    } else {
+        "unavailable".to_string()
     }
 }
 

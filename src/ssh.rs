@@ -50,9 +50,14 @@ pub fn run_interactive(
 
     if status.success() {
         Ok(())
+    } else if status.code() == Some(255) {
+        Err(anyhow!(
+            "ssh connection failed for host `{}` with status {status}",
+            host.id
+        ))
     } else {
         Err(anyhow!(
-            "interactive ssh for host `{}` exited with status {status}",
+            "remote interactive command on host `{}` exited with status {status}",
             host.id
         ))
     }
