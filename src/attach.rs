@@ -74,22 +74,19 @@ fn switch_client_target(target: &PaneTarget) -> String {
 fn add_select_args(command: &mut Command, target: &PaneTarget) {
     // `select-pane -t %id` only activates the pane *inside its window*; it
     // does not switch the client's current window. Always issue an explicit
-    // `select-window` so the attach ends up focused on the right window.
-    if let Some(pane_id) = target.pane_id.as_deref() {
-        command.arg(";").arg("select-window").arg("-t").arg(pane_id);
-        command.arg(";").arg("select-pane").arg("-t").arg(pane_id);
-    } else {
-        command
-            .arg(";")
-            .arg("select-window")
-            .arg("-t")
-            .arg(&target.window);
-        command
-            .arg(";")
-            .arg("select-pane")
-            .arg("-t")
-            .arg(&target.pane);
-    }
+    // `select-window` first. `select-window -t` takes a target-window, not a
+    // target-pane, so we always use the window index — the prior
+    // `attach-session -t <session>` already set the client's session.
+    command
+        .arg(";")
+        .arg("select-window")
+        .arg("-t")
+        .arg(&target.window);
+    command
+        .arg(";")
+        .arg("select-pane")
+        .arg("-t")
+        .arg(select_pane_target(target));
 }
 
 fn attach_command(target: &PaneTarget, readonly: bool) -> String {
@@ -104,19 +101,18 @@ fn attach_command(target: &PaneTarget, readonly: bool) -> String {
 }
 
 fn add_select_parts(parts: &mut Vec<String>, target: &PaneTarget) {
-    // Same correctness concern as `add_select_args`: always switch windows
-    // explicitly so we don't leave the client focused on the wrong one.
-    if let Some(pane_id) = target.pane_id.as_deref() {
-        parts.push("\\; select-window -t".to_string());
-        parts.push(tmux::shell_quote(pane_id));
-        parts.push("\\; select-pane -t".to_string());
-        parts.push(tmux::shell_quote(pane_id));
-    } else {
-        parts.push("\\; select-window -t".to_string());
-        parts.push(tmux::shell_quote(&target.window));
-        parts.push("\\; select-pane -t".to_string());
-        parts.push(tmux::shell_quote(&target.pane));
-    }
+    // Same correctness concern as `add_select_args`. `select-window` takes a
+    // target-window, so always use the window index.
+    parts.push("\\; select-window -t".to_string());
+    parts.push(tmux::shell_quote(&target.window));
+    parts.push("\\; select-pane -t".to_string());
+    parts.push(tmux::shell_quote(select_pane_target(target)));
+}
+
+/// Prefer the globally unique `%pane_id` for `select-pane` when known,
+/// falling back to the per-window pane index.
+fn select_pane_target(target: &PaneTarget) -> &str {
+    target.pane_id.as_deref().unwrap_or(&target.pane)
 }
 
 #[cfg(test)]
@@ -134,11 +130,17 @@ mod tests {
     }
 
     #[test]
-    fn attach_command_with_pane_id_switches_window_before_pane() {
+    fn attach_command_with_pane_id_uses_window_index_and_pane_id() {
         let cmd = attach_command(&pane_target(Some("%42")), false);
         assert!(cmd.contains("attach-session"));
         assert!(cmd.contains("-t 's'"));
-        let window_idx = cmd.find("select-window -t '%42'").expect("window select");
+        // select-window uses a window target (index), not the pane_id.
+        assert!(
+            cmd.contains("select-window -t '1'"),
+            "expected window index target: {cmd}"
+        );
+        // select-pane uses the globally unique pane_id.
+        let window_idx = cmd.find("select-window -t '1'").expect("window select");
         let pane_idx = cmd.find("select-pane -t '%42'").expect("pane select");
         assert!(
             window_idx < pane_idx,
