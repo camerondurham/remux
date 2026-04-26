@@ -18,7 +18,7 @@ pub struct HostSnapshot {
     pub errors: Vec<SnapshotError>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SnapshotStatus {
     Ok,
@@ -115,6 +115,7 @@ pub struct ProcessSnapshot {
 #[derive(Debug, Clone, Serialize)]
 pub struct OutputSnapshot {
     pub preview: String,
+    pub recent: String,
     pub hash: String,
     pub last_output_at: Option<DateTime<Utc>>,
 }
@@ -490,6 +491,7 @@ fn snapshot_for_pane(
                 state,
                 Some(OutputSnapshot {
                     preview: preview(&output),
+                    recent: recent_preview(&output, 12),
                     hash: output_hash,
                     last_output_at,
                 }),
@@ -717,6 +719,12 @@ fn preview(output: &str) -> String {
         .find(|line| !line.trim().is_empty())
         .unwrap_or("")
         .to_string()
+}
+
+fn recent_preview(output: &str, max_lines: usize) -> String {
+    let lines: Vec<&str> = output.lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].join("\n")
 }
 
 fn hash(output: &str) -> String {
