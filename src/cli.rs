@@ -27,37 +27,46 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// List configured sessions and discovered panes across all hosts.
+    /// List watches and discovered panes across all hosts.
     #[command(alias = "ls")]
     List {
         /// Emit structured JSON.
         #[arg(long)]
         json: bool,
     },
-    /// Inspect one configured session id or discovered pane target.
+    /// Inspect one watch id or discovered pane target.
     #[command(alias = "i")]
     Inspect {
-        /// Session id or <host>/<session>:<window>.<pane> target.
+        /// Watch id or <host>/<session>:<window>.<pane> target.
         id: String,
         /// Emit structured JSON.
         #[arg(long)]
         json: bool,
     },
-    /// Capture recent visible output from one session or pane.
+    /// Capture recent visible output from one watch or pane.
     Capture {
-        /// Session id or <host>/<session>:<window>.<pane> target.
+        /// Watch id or <host>/<session>:<window>.<pane> target.
         id: String,
         /// Number of recent lines to capture.
         #[arg(long, default_value_t = 120)]
         lines: usize,
     },
-    /// Attach interactively to a configured tmux session.
+    /// Attach interactively to a watch or pane.
     #[command(alias = "a")]
     Attach {
         /// Attach in tmux read-only mode.
         #[arg(long)]
         readonly: bool,
-        /// Configured session id.
+        /// Watch id or <host>/<session>:<window>.<pane> target.
         id: String,
+    },
+    /// Launch the interactive terminal viewer.
+    Tui {
+        /// Poll only one configured host.
+        #[arg(long)]
+        host: Option<String>,
+        /// Initial text filter.
+        #[arg(long)]
+        filter: Option<String>,
     },
 }

@@ -180,6 +180,98 @@ sessions:
     );
 }
 
+#[test]
+fn watches_resolve_drift_ambiguity_missing_and_shadowing() {
+    let env = TestEnv::new();
+    env.write_config(
+        r#"
+poll:
+  capture_lines: 2
+hosts:
+  - id: pi
+    type: ssh
+    ssh:
+      target: fake-pi
+watches:
+  - id: codex-live
+    host: pi
+    match:
+      command: node
+      cwd: /home/cam/work
+    agent_hint: codex
+  - id: node-ambiguous
+    host: pi
+    match:
+      command: node
+      cwd_prefix: /home/cam/work
+  - id: codex-shadow
+    host: pi
+    match:
+      command: node
+      cwd: /home/cam/work
+  - id: missing-kiro
+    host: pi
+    match:
+      command: kiro-cli
+      cwd: /home/cam
+"#,
+    );
+
+    let snapshot_json = env.remux(["--config", env.config_path(), "snapshot", "pi", "--json"]);
+    assert_success(&snapshot_json);
+    let snapshot: Value = serde_json::from_str(&stdout(&snapshot_json)).unwrap();
+    let sessions = snapshot["sessions"].as_array().unwrap();
+
+    let matched = find_session(sessions, "codex-live");
+    assert_eq!(matched["match_status"], "matched");
+    assert_eq!(matched["raw_target"], "pi/work:0.1");
+
+    let ambiguous = find_session(sessions, "node-ambiguous");
+    assert_eq!(ambiguous["match_status"], "ambiguous");
+    assert_eq!(ambiguous["candidate_targets"].as_array().unwrap().len(), 2);
+
+    let shadowed = find_session(sessions, "codex-shadow");
+    assert_eq!(shadowed["match_status"], "shadowed");
+    assert_eq!(shadowed["shadowed_by"], "codex-live");
+
+    let missing = find_session(sessions, "missing-kiro");
+    assert_eq!(missing["match_status"], "missing");
+
+    let orphan = find_session(sessions, "pi/work:0.2");
+    assert_eq!(orphan["match_status"], "orphan");
+
+    let capture = env.remux([
+        "--config",
+        env.config_path(),
+        "capture",
+        "codex-live",
+        "--lines",
+        "2",
+    ]);
+    assert_success(&capture);
+    assert_eq!(stdout(&capture), "line one\nhello-remux\n");
+
+    let ambiguous_capture = env.remux([
+        "--config",
+        env.config_path(),
+        "capture",
+        "node-ambiguous",
+        "--lines",
+        "2",
+    ]);
+    assert_failure(&ambiguous_capture);
+    assert!(stderr(&ambiguous_capture).contains("ambiguous"));
+
+    let attach = env.remux([
+        "--config",
+        env.config_path(),
+        "attach",
+        "--readonly",
+        "codex-live",
+    ]);
+    assert_success(&attach);
+}
+
 struct TestEnv {
     root: PathBuf,
     config: PathBuf,
@@ -292,6 +384,7 @@ remote="${@: -1}"
 
 if [[ "$remote" == tmux\ list-panes* ]]; then
   printf 'work\t0\t1\t%%3\t1234\tnode\t/home/cam/work\n'
+  printf 'work\t0\t2\t%%5\t1235\tnode\t/home/cam/work/sub\n'
   printf 'scratch\t2\t0\t%%4\t2222\tbash\t/tmp\n'
   exit 0
 fi
@@ -303,6 +396,11 @@ fi
 
 if [[ "$remote" == "tmux capture-pane -pt 'scratch:2.0' -S -"* ]]; then
   printf 'scratch output\n'
+  exit 0
+fi
+
+if [[ "$remote" == "tmux capture-pane -pt 'work:0.2' -S -"* ]]; then
+  printf 'second node output\n'
   exit 0
 fi
 
@@ -371,6 +469,22 @@ fn assert_success(output: &Output) {
         stdout(output),
         stderr(output)
     );
+}
+
+fn assert_failure(output: &Output) {
+    assert!(
+        !output.status.success(),
+        "command unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        stdout(output),
+        stderr(output)
+    );
+}
+
+fn find_session<'a>(sessions: &'a [Value], display_id: &str) -> &'a Value {
+    sessions
+        .iter()
+        .find(|session| session["display_id"] == display_id)
+        .unwrap_or_else(|| panic!("missing session {display_id} in {sessions:#?}"))
 }
 
 fn stdout(output: &Output) -> String {

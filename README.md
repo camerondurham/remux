@@ -13,7 +13,7 @@ mkdir -p ~/.config/remux
 cp examples/config.yaml ~/.config/remux/config.yaml
 ```
 
-Edit the hosts and sessions, then run:
+Edit the hosts and watches, then run:
 
 ```bash
 cargo run -- hosts
@@ -21,6 +21,7 @@ cargo run -- list
 cargo run -- snapshot pi
 cargo run -- inspect pi-agent
 cargo run -- capture pi-agent --lines 200
+cargo run -- tui
 ```
 
 For a direct discovered pane target, use:
@@ -64,19 +65,21 @@ hosts:
         ConnectTimeout: "5"
 ```
 
-Configured sessions get friendly IDs:
+Watches give live panes friendly IDs. Match fields are exact and are combined
+with AND semantics:
 
 ```yaml
-sessions:
+watches:
   - id: pi-agent
     host: pi
-    tmux:
-      session: work
-      window: 0
-      pane: 1
-    repo: /home/cam/openclaw
+    match:
+      command: node
+      cwd_prefix: /home/cam/openclaw
     agent_hint: codex
 ```
+
+Legacy `sessions` entries are still accepted and are treated as exact tmux
+coordinate watches.
 
 ## Commands
 
@@ -84,17 +87,18 @@ sessions:
 remux hosts
 remux snapshot <host> [--json]
 remux list [--json]
-remux inspect <session-id-or-pane-target> [--json]
-remux capture <session-id-or-pane-target> [--lines N]
-remux attach [--readonly] <session-id>
+remux inspect <watch-id-or-pane-target> [--json]
+remux capture <watch-id-or-pane-target> [--lines N]
+remux attach [--readonly] <watch-id-or-pane-target>
+remux tui [--host HOST] [--filter TEXT]
 ```
 
 Aliases:
 
 ```bash
 remux ls
-remux i <session-id>
-remux a <session-id>
+remux i <watch-id-or-pane-target>
+remux a <watch-id-or-pane-target>
 ```
 
 ## Development

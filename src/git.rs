@@ -14,13 +14,29 @@ pub struct RepoSnapshot {
     pub error: Option<String>,
 }
 
+pub fn infer(config: &Config, host_config: &HostConfig, cwd: &str) -> Option<RepoSnapshot> {
+    if cwd.trim().is_empty() {
+        return None;
+    }
+
+    let cwd_arg = path_arg(cwd, host_config.is_local());
+    let root = run_git(
+        config,
+        host_config,
+        &format!("git -C {cwd_arg} rev-parse --show-toplevel"),
+    )
+    .ok()?;
+    let root = root.trim();
+    if root.is_empty() {
+        return None;
+    }
+
+    Some(collect(config, host_config, root))
+}
+
 pub fn collect(config: &Config, host_config: &HostConfig, path: &str) -> RepoSnapshot {
     let expanded_path = expand_repo_path(path, host_config.is_local());
-    let path_arg = if host_config.is_local() {
-        tmux::shell_quote(&expanded_path)
-    } else {
-        tmux::shell_path(path)
-    };
+    let path_arg = path_arg(path, host_config.is_local());
     let branch = run_git(
         config,
         host_config,
@@ -72,6 +88,14 @@ fn expand_repo_path(path: &str, local: bool) -> String {
         return expand_home_path(path).to_string_lossy().into_owned();
     }
     path.to_string()
+}
+
+fn path_arg(path: &str, local: bool) -> String {
+    if local {
+        tmux::shell_quote(&expand_repo_path(path, true))
+    } else {
+        tmux::shell_path(path)
+    }
 }
 
 fn expand_home_path(path: &str) -> PathBuf {
