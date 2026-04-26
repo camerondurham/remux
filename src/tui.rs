@@ -656,7 +656,14 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         .constraints([
             Constraint::Length(3),
             Constraint::Min(8),
-            Constraint::Length(if app.help { 12 } else { 14 }),
+            if app.help {
+                Constraint::Length(12)
+            } else {
+                // Give the preview roughly half the remaining height so pane
+                // output is actually readable; it will still shrink cleanly
+                // on small terminals because of the `Min(8)` above.
+                Constraint::Percentage(50)
+            },
             Constraint::Length(1),
         ])
         .split(area);
@@ -862,10 +869,37 @@ fn draw_detail(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         Paragraph::new(Text::from(detail_meta_lines(row))).wrap(Wrap { trim: false }),
         chunks[0],
     );
+
+    // Right column: status notes pinned on top (fixed size based on content),
+    // preview fills the rest. Without this split a long preview would push
+    // status notes off-screen.
+    let right = chunks[1];
+    let status_lines = detail_status_lines(row);
+    let status_height = (status_lines.len() as u16).min(right.height.saturating_sub(3));
+    let right_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(status_height), Constraint::Min(1)])
+        .split(right);
+
+    if status_height > 0 {
+        frame.render_widget(
+            Paragraph::new(Text::from(status_lines)).wrap(Wrap { trim: false }),
+            right_chunks[0],
+        );
+    }
+
+    let preview_area = right_chunks[1];
+    // Header + trailing tail lines sized to actually fit the preview area.
+    let preview_body_rows = preview_area.height.saturating_sub(1) as usize;
     frame.render_widget(
-        Paragraph::new(Text::from(detail_preview_lines(app, selected, row)))
-            .wrap(Wrap { trim: false }),
-        chunks[1],
+        Paragraph::new(Text::from(detail_preview_lines(
+            app,
+            selected,
+            row,
+            preview_body_rows,
+        )))
+        .wrap(Wrap { trim: false }),
+        preview_area,
     );
 }
 
@@ -1021,6 +1055,7 @@ fn detail_preview_lines(
     app: &App,
     selected: &SessionSnapshot,
     row: &SessionSnapshot,
+    max_body_lines: usize,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(Span::styled(
         "Recent output preview",
@@ -1028,7 +1063,10 @@ fn detail_preview_lines(
     ))];
 
     if let Some(output) = selected_output(app, selected, row).filter(|output| !output.is_empty()) {
-        for line in tail_lines(output, 8) {
+        // Emit exactly as many tail lines as will fit in the preview pane so
+        // the most recent output is visible rather than clipped off-screen.
+        let tail_count = max_body_lines.max(1);
+        for line in tail_lines(output, tail_count) {
             lines.push(Line::from(line));
         }
     } else {
@@ -1038,9 +1076,14 @@ fn detail_preview_lines(
         )));
     }
 
+    lines
+}
+
+fn detail_status_lines(row: &SessionSnapshot) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
     if let Some(repo) = &row.repo {
         if !repo.changed_files.is_empty() {
-            lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 format!("Changed files ({})", repo.changed_files.len()),
                 Style::default().add_modifier(Modifier::BOLD),
@@ -1053,7 +1096,6 @@ fn detail_preview_lines(
             }
         }
         if let Some(error) = &repo.error {
-            lines.push(Line::from(""));
             lines.push(Line::from(vec![
                 Span::styled("Repo error: ", Style::default().fg(Color::Red)),
                 Span::raw(short_message(error)),
@@ -1062,7 +1104,9 @@ fn detail_preview_lines(
     }
 
     if !row.errors.is_empty() {
-        lines.push(Line::from(""));
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
         lines.push(Line::from(Span::styled(
             "Errors",
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
@@ -1077,7 +1121,9 @@ fn detail_preview_lines(
     }
 
     if !row.candidate_targets.is_empty() {
-        lines.push(Line::from(""));
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
         lines.push(Line::from(Span::styled(
             "Candidates",
             Style::default().add_modifier(Modifier::BOLD),
@@ -1088,7 +1134,9 @@ fn detail_preview_lines(
     }
 
     if let Some(shadowed_by) = &row.shadowed_by {
-        lines.push(Line::from(""));
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
         lines.push(Line::from(vec![
             Span::styled("Shadowed by: ", label_style()),
             Span::raw(shadowed_by.clone()),
