@@ -89,6 +89,9 @@ fn ssh_tracer_bullet_works_end_to_end() {
         "codex-agent",
     ]);
     assert_success(&attach);
+
+    let jump = env.remux(["--config", env.config_path(), "attach", "codex-agent"]);
+    assert_success(&jump);
 }
 
 #[test]
@@ -140,6 +143,9 @@ sessions:
         "local-agent",
     ]);
     assert_success(&attach);
+
+    let jump = env.remux(["--config", env.config_path(), "a", "local-agent"]);
+    assert_success(&jump);
 }
 
 #[test]
@@ -414,7 +420,19 @@ if [[ "$remote" == "git -C '/repo' status --porcelain=v1" ]]; then
   exit 0
 fi
 
+if [[ "$remote" == "tmux attach-session -r -t 'work' \\; select-window -t '0' \\; select-pane -t '%3'" ]]; then
+  exit 0
+fi
+
+if [[ "$remote" == "tmux attach-session -t 'work' \\; select-window -t '0' \\; select-pane -t '%3'" ]]; then
+  exit 0
+fi
+
 if [[ "$remote" == "tmux attach-session -r -t 'work' \\; select-window -t '0' \\; select-pane -t '1'" ]]; then
+  exit 0
+fi
+
+if [[ "$remote" == "tmux attach-session -t 'work' \\; select-window -t '0' \\; select-pane -t '1'" ]]; then
   exit 0
 fi
 
@@ -445,7 +463,17 @@ fi
 
 if [[ "${1:-}" == "attach-session" ]]; then
   args="$*"
-  if [[ "$args" == *"-r"* && "$args" == *"local"* ]]; then
+  if [[ "$args" == *"local"* && "$args" == *"select-pane -t %7"* ]]; then
+    exit 0
+  fi
+fi
+
+if [[ "${1:-}" == "switch-client" ]]; then
+  args="$*"
+  if [[ "$args" == *"-t %7"* ]]; then
+    exit 0
+  fi
+  if [[ "$args" == *"local"* && "$args" == *"select-pane -t %7"* ]]; then
     exit 0
   fi
 fi

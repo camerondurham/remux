@@ -471,6 +471,7 @@ fn snapshot_for_pane(
         session: pane.session.clone(),
         window: pane.window.clone(),
         pane: pane.pane.clone(),
+        pane_id: Some(pane.pane_id.clone()),
     };
     let display_id = row
         .watch
@@ -696,6 +697,7 @@ fn target_for_snapshot(snapshot: &SessionSnapshot) -> Result<PaneTarget> {
                 snapshot.display_id
             )
         })?,
+        pane_id: snapshot.tmux.pane_id.clone(),
     })
 }
 

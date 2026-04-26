@@ -11,6 +11,7 @@ pub struct PaneTarget {
     pub session: String,
     pub window: String,
     pub pane: String,
+    pub pane_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -47,6 +48,7 @@ impl PaneTarget {
             session: session.to_string(),
             window: window.to_string(),
             pane: pane.to_string(),
+            pane_id: None,
         })
     }
 

@@ -5,7 +5,7 @@ use crate::snapshot::{
     SnapshotStatus,
 };
 use crate::tmux::PaneTarget;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
@@ -554,17 +554,20 @@ fn attach_selected(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     readonly: bool,
 ) -> Result<()> {
-    let Some(target) = selected_attach_target(app) else {
-        app.status = "selected row cannot attach".to_string();
+    if app.selected_row().is_none() {
+        app.status = "no selected row".to_string();
         return Ok(());
-    };
-    let result = suspend_terminal(terminal, || {
+    }
+    let action = if readonly { "read-only attach" } else { "jump" };
+    let result = suspend_terminal(terminal, || -> Result<PaneTarget> {
+        let target = selected_attach_target(config, app, action)?;
         attach::attach_target(config, &target, readonly)
+            .with_context(|| format!("failed to {action} `{target}`"))?;
+        Ok(target)
     });
-    if let Err(err) = result {
-        app.status = format!("{err:#}");
-    } else {
-        app.status = format!("attached to {target}");
+    match result {
+        Ok(target) => app.status = format!("{action}ed {target}"),
+        Err(err) => app.status = format!("{err:#}"),
     }
     Ok(())
 }
@@ -597,11 +600,10 @@ fn inspect_selected(config: &Config, app: &mut App) -> Result<()> {
         return Ok(());
     };
     let display_id = row.display_id.clone();
-    let id = row
-        .watch_id
-        .clone()
-        .or_else(|| row.raw_target.clone())
-        .unwrap_or_else(|| row.display_id.clone());
+    let Some(id) = row.watch_id.clone().or_else(|| row.raw_target.clone()) else {
+        app.status = "selected row has no inspect target".to_string();
+        return Ok(());
+    };
 
     match snapshot::inspect(config, &id) {
         Ok(detail) => {
@@ -614,19 +616,37 @@ fn inspect_selected(config: &Config, app: &mut App) -> Result<()> {
     Ok(())
 }
 
-fn selected_attach_target(app: &App) -> Option<PaneTarget> {
-    let row = app.selected_row()?;
-    if matches!(
-        row.match_status,
-        MatchStatus::Ambiguous
-            | MatchStatus::Missing
-            | MatchStatus::Shadowed
-            | MatchStatus::Unreachable
-            | MatchStatus::Unknown
-    ) {
-        return None;
+fn selected_attach_target(config: &Config, app: &App, action: &str) -> Result<PaneTarget> {
+    let row = app
+        .selected_row()
+        .ok_or_else(|| anyhow!("no selected row"))?;
+    if let Some(reason) = attach_refusal_reason(row) {
+        bail!("selected row cannot attach: {reason}");
     }
-    PaneTarget::parse(row.raw_target.as_ref()?).ok()
+    if let Some(watch_id) = &row.watch_id {
+        return snapshot::target_for_action(config, watch_id, action);
+    }
+
+    let raw_target = row
+        .raw_target
+        .as_ref()
+        .ok_or_else(|| anyhow!("selected row has no live pane"))?;
+    PaneTarget::parse(raw_target)
+        .with_context(|| format!("selected row has invalid pane target `{raw_target}`"))
+}
+
+fn attach_refusal_reason(row: &SessionSnapshot) -> Option<String> {
+    match row.match_status {
+        MatchStatus::Matched | MatchStatus::Orphan => None,
+        MatchStatus::Missing => Some("missing live pane".to_string()),
+        MatchStatus::Ambiguous => Some("ambiguous candidates".to_string()),
+        MatchStatus::Shadowed => Some(format!(
+            "shadowed by {}",
+            row.shadowed_by.as_deref().unwrap_or("another watch")
+        )),
+        MatchStatus::Unreachable => Some("host unreachable".to_string()),
+        MatchStatus::Unknown => Some("unknown attach state".to_string()),
+    }
 }
 
 fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
@@ -636,7 +656,14 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         .constraints([
             Constraint::Length(3),
             Constraint::Min(8),
-            Constraint::Length(if app.help { 12 } else { 14 }),
+            if app.help {
+                Constraint::Length(12)
+            } else {
+                // Give the preview roughly half the remaining height so pane
+                // output is actually readable; it will still shrink cleanly
+                // on small terminals because of the `Min(8)` above.
+                Constraint::Percentage(50)
+            },
             Constraint::Length(1),
         ])
         .split(area);
@@ -814,8 +841,8 @@ fn draw_detail(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             Line::from("k/up select previous"),
             Line::from("r refresh now"),
             Line::from("/ filter"),
-            Line::from("enter attach read-only"),
-            Line::from("a attach read-write"),
+            Line::from("enter readonly attach"),
+            Line::from("a read-write jump"),
             Line::from("c capture into detail"),
             Line::from("i inspect and refresh detail"),
             Line::from("q quit"),
@@ -842,10 +869,37 @@ fn draw_detail(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         Paragraph::new(Text::from(detail_meta_lines(row))).wrap(Wrap { trim: false }),
         chunks[0],
     );
+
+    // Right column: status notes pinned on top (fixed size based on content),
+    // preview fills the rest. Without this split a long preview would push
+    // status notes off-screen.
+    let right = chunks[1];
+    let status_lines = detail_status_lines(row);
+    let status_height = (status_lines.len() as u16).min(right.height.saturating_sub(3));
+    let right_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(status_height), Constraint::Min(1)])
+        .split(right);
+
+    if status_height > 0 {
+        frame.render_widget(
+            Paragraph::new(Text::from(status_lines)).wrap(Wrap { trim: false }),
+            right_chunks[0],
+        );
+    }
+
+    let preview_area = right_chunks[1];
+    // Header + trailing tail lines sized to actually fit the preview area.
+    let preview_body_rows = preview_area.height.saturating_sub(1) as usize;
     frame.render_widget(
-        Paragraph::new(Text::from(detail_preview_lines(app, selected, row)))
-            .wrap(Wrap { trim: false }),
-        chunks[1],
+        Paragraph::new(Text::from(detail_preview_lines(
+            app,
+            selected,
+            row,
+            preview_body_rows,
+        )))
+        .wrap(Wrap { trim: false }),
+        preview_area,
     );
 }
 
@@ -859,7 +913,9 @@ fn draw_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     };
     let mut spans = vec![
         key_span("enter"),
-        Span::raw(" attach | "),
+        Span::raw(" readonly | "),
+        key_span("a"),
+        Span::raw(" jump | "),
         key_span("r"),
         Span::raw(" refresh | "),
         key_span("/"),
@@ -999,6 +1055,7 @@ fn detail_preview_lines(
     app: &App,
     selected: &SessionSnapshot,
     row: &SessionSnapshot,
+    max_body_lines: usize,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(Span::styled(
         "Recent output preview",
@@ -1006,7 +1063,10 @@ fn detail_preview_lines(
     ))];
 
     if let Some(output) = selected_output(app, selected, row).filter(|output| !output.is_empty()) {
-        for line in tail_lines(output, 8) {
+        // Emit exactly as many tail lines as will fit in the preview pane so
+        // the most recent output is visible rather than clipped off-screen.
+        let tail_count = max_body_lines.max(1);
+        for line in tail_lines(output, tail_count) {
             lines.push(Line::from(line));
         }
     } else {
@@ -1016,9 +1076,14 @@ fn detail_preview_lines(
         )));
     }
 
+    lines
+}
+
+fn detail_status_lines(row: &SessionSnapshot) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
     if let Some(repo) = &row.repo {
         if !repo.changed_files.is_empty() {
-            lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 format!("Changed files ({})", repo.changed_files.len()),
                 Style::default().add_modifier(Modifier::BOLD),
@@ -1031,7 +1096,6 @@ fn detail_preview_lines(
             }
         }
         if let Some(error) = &repo.error {
-            lines.push(Line::from(""));
             lines.push(Line::from(vec![
                 Span::styled("Repo error: ", Style::default().fg(Color::Red)),
                 Span::raw(short_message(error)),
@@ -1040,7 +1104,9 @@ fn detail_preview_lines(
     }
 
     if !row.errors.is_empty() {
-        lines.push(Line::from(""));
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
         lines.push(Line::from(Span::styled(
             "Errors",
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
@@ -1055,7 +1121,9 @@ fn detail_preview_lines(
     }
 
     if !row.candidate_targets.is_empty() {
-        lines.push(Line::from(""));
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
         lines.push(Line::from(Span::styled(
             "Candidates",
             Style::default().add_modifier(Modifier::BOLD),
@@ -1066,7 +1134,9 @@ fn detail_preview_lines(
     }
 
     if let Some(shadowed_by) = &row.shadowed_by {
-        lines.push(Line::from(""));
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
         lines.push(Line::from(vec![
             Span::styled("Shadowed by: ", label_style()),
             Span::raw(shadowed_by.clone()),
@@ -1194,21 +1264,16 @@ fn tmux_target(row: &SessionSnapshot) -> String {
 }
 
 fn attach_hint(row: &SessionSnapshot) -> String {
-    match row.match_status {
-        MatchStatus::Matched => format!("enter -> remux attach --readonly {}", row.display_id),
-        MatchStatus::Orphan => row
-            .raw_target
-            .as_ref()
-            .map(|target| format!("enter -> remux attach --readonly '{target}'"))
-            .unwrap_or_else(|| "unavailable".to_string()),
-        MatchStatus::Missing => "unavailable, missing live pane".to_string(),
-        MatchStatus::Ambiguous => "unavailable, ambiguous watch".to_string(),
-        MatchStatus::Shadowed => format!(
-            "unavailable, shadowed by {}",
-            row.shadowed_by.as_deref().unwrap_or("another watch")
-        ),
-        MatchStatus::Unreachable => "unavailable, host unreachable".to_string(),
-        MatchStatus::Unknown => "unavailable".to_string(),
+    if let Some(reason) = attach_refusal_reason(row) {
+        return format!("unavailable, {reason}");
+    }
+
+    if row.watch_id.is_some() {
+        format!("enter readonly | a jump -> remux attach {}", row.display_id)
+    } else if let Some(target) = &row.raw_target {
+        format!("enter readonly | a jump -> remux attach '{target}'")
+    } else {
+        "unavailable".to_string()
     }
 }
 
