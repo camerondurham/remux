@@ -10,6 +10,7 @@ mod render;
 mod snapshot;
 mod ssh;
 mod tmux;
+mod tui;
 
 use anyhow::Result;
 use clap::Parser;
@@ -51,5 +52,6 @@ fn run() -> Result<()> {
             Ok(())
         }
         Command::Attach { readonly, id } => attach::attach(&config, &id, readonly),
+        Command::Tui { host, filter } => tui::run(&config, host, filter),
     }
 }

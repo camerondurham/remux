@@ -20,21 +20,21 @@ hosts:
         BatchMode: "yes"
         ConnectTimeout: "5"
 
-sessions:
+watches:
   - id: local-shell
     host: local
-    tmux:
-      session: remux-local
-      window: 0
-      pane: 0
+    match:
+      tmux:
+        session: remux-local
+        window: 0
+        pane: 0
     repo: ~/code/remux
     agent_hint: shell
 
   - id: pi-agent
     host: pi
-    tmux:
-      session: work
-      window: 0
-      pane: 1
+    match:
+      command: node
+      cwd_prefix: /home/cam/openclaw
     repo: /home/cam/openclaw
     agent_hint: codex

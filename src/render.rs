@@ -74,8 +74,8 @@ pub fn list(snapshots: &[HostSnapshot], json: bool) -> Result<()> {
     }
 
     println!(
-        "{:<12} {:<22} {:<10} {:<10} {:<18} {:<12} {:<8}",
-        "HOST", "SESSION", "PANE", "CMD", "REPO", "STATE", "DIRTY"
+        "{:<12} {:<24} {:<11} {:<10} {:<10} {:<18} {:<12} {:<8} PREVIEW",
+        "HOST", "ID/SESSION", "MATCH", "PANE", "CMD", "REPO", "STATE", "DIRTY"
     );
     for snapshot in snapshots {
         for session in &snapshot.sessions {
@@ -102,15 +102,22 @@ pub fn list(snapshots: &[HostSnapshot], json: bool) -> Result<()> {
                 .and_then(|repo| repo.dirty_count)
                 .map(|dirty| dirty.to_string())
                 .unwrap_or_else(|| "-".to_string());
+            let preview = session
+                .output
+                .as_ref()
+                .map(|output| output.preview.as_str())
+                .unwrap_or_else(|| first_error_message(session).unwrap_or("-"));
             println!(
-                "{:<12} {:<22} {:<10} {:<10} {:<18} {:<12} {:<8}",
+                "{:<12} {:<24} {:<11} {:<10} {:<10} {:<18} {:<12} {:<8} {}",
                 session.host,
-                session.session_id,
+                session.display_id,
+                session.match_status.as_str(),
                 pane,
                 command,
                 basename(repo),
                 session.state.as_str(),
-                dirty
+                dirty,
+                preview
             );
         }
     }
@@ -125,9 +132,19 @@ pub fn inspect(detail: &PaneDetail, json: bool) -> Result<()> {
     }
 
     let session = &detail.session;
-    println!("Session:      {}", session.session_id);
-    println!("Target:       {}", session.target);
+    println!("Session:      {}", session.display_id);
+    println!(
+        "Target:       {}",
+        session.raw_target.as_deref().unwrap_or("-")
+    );
     println!("Host:         {}", session.host);
+    println!("Match:        {}", session.match_status.as_str());
+    if let Some(watch_id) = &session.watch_id {
+        println!("Watch:        {watch_id}");
+    }
+    if let Some(shadowed_by) = &session.shadowed_by {
+        println!("Shadowed by:  {shadowed_by}");
+    }
     println!("State:        {}", session.state.as_str());
     println!(
         "Tmux target:  {}:{}",
@@ -184,6 +201,12 @@ pub fn inspect(detail: &PaneDetail, json: bool) -> Result<()> {
     for error in &session.errors {
         println!("{} error: {}", titlecase(&error.kind), error.message);
     }
+    if !session.candidate_targets.is_empty() {
+        println!("Candidates:");
+        for target in &session.candidate_targets {
+            println!("  {target}");
+        }
+    }
     println!();
     println!("Recent output:");
     println!("{}", detail.recent_output);
@@ -196,10 +219,14 @@ pub fn inspect(detail: &PaneDetail, json: bool) -> Result<()> {
         }
     }
     println!("Commands:");
-    println!("  remux capture {} --lines 200", session.session_id);
-    if !session.session_id.contains('/') {
-        println!("  remux attach --readonly {}", session.session_id);
-        println!("  remux attach {}", session.session_id);
+    if session.match_status == crate::snapshot::MatchStatus::Matched {
+        println!("  remux capture {} --lines 200", session.display_id);
+        println!("  remux attach --readonly {}", session.display_id);
+        println!("  remux attach {}", session.display_id);
+    } else if let Some(raw_target) = &session.raw_target {
+        println!("  remux capture '{}' --lines 200", raw_target);
+        println!("  remux attach --readonly '{}'", raw_target);
+        println!("  remux attach '{}'", raw_target);
     }
 
     Ok(())
@@ -224,8 +251,8 @@ fn warn_snapshot_errors(snapshots: &[HostSnapshot]) {
 
 fn print_session_table(sessions: &[SessionSnapshot]) {
     println!(
-        "{:<24} {:<24} {:<10} {:<8} {:<10} CWD/PREVIEW",
-        "SESSION", "TARGET", "PANE_ID", "CMD", "STATE"
+        "{:<24} {:<11} {:<24} {:<10} {:<8} {:<10} CWD/PREVIEW",
+        "WATCH/SESSION", "MATCH", "TARGET", "PANE_ID", "CMD", "STATE"
     );
     for session in sessions {
         let command = session
@@ -234,9 +261,10 @@ fn print_session_table(sessions: &[SessionSnapshot]) {
             .map(|process| process.command.as_str())
             .unwrap_or("-");
         println!(
-            "{:<24} {:<24} {:<10} {:<8} {:<10} {}",
-            session.session_id,
-            session.target,
+            "{:<24} {:<11} {:<24} {:<10} {:<8} {:<10} {}",
+            session.display_id,
+            session.match_status.as_str(),
+            session.raw_target.as_deref().unwrap_or("-"),
             session.tmux.pane_id.as_deref().unwrap_or("-"),
             command,
             session.state.as_str(),
@@ -250,6 +278,13 @@ fn print_session_table(sessions: &[SessionSnapshot]) {
             && !output.preview.is_empty()
         {
             println!("{:<24} {}", "", output.preview);
+        }
+        if !session.candidate_targets.is_empty() {
+            println!(
+                "{:<24} candidates: {}",
+                "",
+                session.candidate_targets.join(", ")
+            );
         }
         for error in &session.errors {
             println!("{:<24} {}: {}", "", error.kind, error.message);
@@ -270,4 +305,8 @@ fn basename(path: &str) -> &str {
         .next()
         .filter(|value| !value.is_empty())
         .unwrap_or(path)
+}
+
+fn first_error_message(session: &SessionSnapshot) -> Option<&str> {
+    session.errors.first().map(|error| error.message.as_str())
 }

@@ -5,17 +5,19 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub poll: PollConfig,
     #[serde(default)]
     pub hosts: Vec<HostConfig>,
     #[serde(default)]
+    pub watches: Vec<WatchConfig>,
+    #[serde(default)]
     pub sessions: Vec<SessionConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct PollConfig {
     #[serde(
         default = "default_active_after",
@@ -39,9 +41,11 @@ pub struct PollConfig {
         deserialize_with = "deserialize_duration"
     )]
     pub command_timeout: Duration,
+    #[serde(default = "default_max_concurrency")]
+    pub max_concurrency: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct HostConfig {
     pub id: String,
     #[serde(rename = "type")]
@@ -56,7 +60,7 @@ pub enum HostKind {
     Ssh,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct SshConfig {
     pub target: Option<String>,
     pub host: Option<String>,
@@ -83,6 +87,39 @@ pub struct TmuxTarget {
     pub pane: Option<u32>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct WatchConfig {
+    pub id: String,
+    pub host: String,
+    #[serde(rename = "match")]
+    pub matcher: WatchMatchConfig,
+    pub repo: Option<String>,
+    pub agent_hint: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WatchMatchConfig {
+    pub command: Option<String>,
+    pub cwd: Option<String>,
+    pub cwd_prefix: Option<String>,
+    pub tmux: Option<TmuxTarget>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Watch {
+    pub id: String,
+    pub host: String,
+    pub matcher: WatchMatchConfig,
+    pub repo: Option<String>,
+    pub agent_hint: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexedWatch {
+    pub index: usize,
+    pub watch: Watch,
+}
+
 impl Default for PollConfig {
     fn default() -> Self {
         Self {
@@ -91,6 +128,7 @@ impl Default for PollConfig {
             capture_lines: default_capture_lines(),
             ssh_timeout: default_ssh_timeout(),
             command_timeout: default_command_timeout(),
+            max_concurrency: default_max_concurrency(),
         }
     }
 }
@@ -116,17 +154,33 @@ impl Config {
             .ok_or_else(|| anyhow!("unknown host `{id}`"))
     }
 
-    pub fn session(&self, id: &str) -> Result<&SessionConfig> {
-        self.sessions
-            .iter()
-            .find(|session| session.id == id)
-            .ok_or_else(|| anyhow!("unknown session `{id}`"))
+    pub fn watch(&self, id: &str) -> Result<IndexedWatch> {
+        self.indexed_watches()
+            .into_iter()
+            .find(|watch| watch.watch.id == id)
+            .ok_or_else(|| anyhow!("unknown watch `{id}`"))
     }
 
-    pub fn sessions_for_host(&self, host_id: &str) -> Vec<&SessionConfig> {
-        self.sessions
+    pub fn find_watch(&self, id: &str) -> Option<IndexedWatch> {
+        self.indexed_watches()
+            .into_iter()
+            .find(|watch| watch.watch.id == id)
+    }
+
+    pub fn watches_for_host(&self, host_id: &str) -> Vec<IndexedWatch> {
+        self.indexed_watches()
+            .into_iter()
+            .filter(|watch| watch.watch.host == host_id)
+            .collect()
+    }
+
+    pub fn indexed_watches(&self) -> Vec<IndexedWatch> {
+        self.watches
             .iter()
-            .filter(|session| session.host == host_id)
+            .map(Watch::from_watch_config)
+            .chain(self.sessions.iter().map(Watch::from_session_config))
+            .enumerate()
+            .map(|(index, watch)| IndexedWatch { index, watch })
             .collect()
     }
 
@@ -145,6 +199,9 @@ impl Config {
         }
         if self.poll.command_timeout.is_zero() {
             bail!("poll.command_timeout must be greater than zero");
+        }
+        if self.poll.max_concurrency == 0 {
+            bail!("poll.max_concurrency must be greater than zero");
         }
 
         let mut host_ids = HashSet::new();
@@ -176,6 +233,17 @@ impl Config {
             }
         }
 
+        let mut watch_ids = HashSet::new();
+        for watch in &self.watches {
+            validate_watch(
+                &mut watch_ids,
+                &host_ids,
+                &watch.id,
+                &watch.host,
+                &watch.matcher,
+            )?;
+        }
+
         let mut session_ids = HashSet::new();
         for session in &self.sessions {
             if session.id.trim().is_empty() {
@@ -194,9 +262,42 @@ impl Config {
             if session.tmux.session.trim().is_empty() {
                 bail!("session `{}` tmux.session must not be empty", session.id);
             }
+            if !watch_ids.insert(session.id.as_str()) {
+                bail!(
+                    "duplicate watch/session id `{}`; session ids and watch ids share one namespace",
+                    session.id
+                );
+            }
         }
 
         Ok(())
+    }
+}
+
+impl Watch {
+    fn from_watch_config(config: &WatchConfig) -> Self {
+        Self {
+            id: config.id.clone(),
+            host: config.host.clone(),
+            matcher: config.matcher.clone(),
+            repo: config.repo.clone(),
+            agent_hint: config.agent_hint.clone(),
+        }
+    }
+
+    fn from_session_config(config: &SessionConfig) -> Self {
+        Self {
+            id: config.id.clone(),
+            host: config.host.clone(),
+            matcher: WatchMatchConfig {
+                command: None,
+                cwd: None,
+                cwd_prefix: None,
+                tmux: Some(config.tmux.clone()),
+            },
+            repo: config.repo.clone(),
+            agent_hint: config.agent_hint.clone(),
+        }
     }
 }
 
@@ -274,6 +375,65 @@ fn default_command_timeout() -> Duration {
     Duration::from_secs(15)
 }
 
+fn default_max_concurrency() -> usize {
+    4
+}
+
+fn validate_watch<'a>(
+    seen_ids: &mut HashSet<&'a str>,
+    host_ids: &HashSet<&str>,
+    id: &'a str,
+    host: &str,
+    matcher: &WatchMatchConfig,
+) -> Result<()> {
+    if id.trim().is_empty() {
+        bail!("watch id must not be empty");
+    }
+    if !seen_ids.insert(id) {
+        bail!("duplicate watch id `{id}`");
+    }
+    if !host_ids.contains(host) {
+        bail!("watch `{id}` references missing host `{host}`");
+    }
+    if matcher.command.is_none()
+        && matcher.cwd.is_none()
+        && matcher.cwd_prefix.is_none()
+        && matcher.tmux.is_none()
+    {
+        bail!("watch `{id}` match must not be empty");
+    }
+    if matcher.cwd.is_some() && matcher.cwd_prefix.is_some() {
+        bail!("watch `{id}` must not set both match.cwd and match.cwd_prefix");
+    }
+    if matcher
+        .command
+        .as_ref()
+        .is_some_and(|command| command.trim().is_empty())
+    {
+        bail!("watch `{id}` match.command must not be empty");
+    }
+    if matcher
+        .cwd
+        .as_ref()
+        .is_some_and(|cwd| cwd.trim().is_empty())
+    {
+        bail!("watch `{id}` match.cwd must not be empty");
+    }
+    if matcher
+        .cwd_prefix
+        .as_ref()
+        .is_some_and(|cwd| cwd.trim().is_empty())
+    {
+        bail!("watch `{id}` match.cwd_prefix must not be empty");
+    }
+    if let Some(tmux) = &matcher.tmux
+        && tmux.session.trim().is_empty()
+    {
+        bail!("watch `{id}` match.tmux.session must not be empty");
+    }
+    Ok(())
+}
+
 fn deserialize_duration<'de, D>(deserializer: D) -> std::result::Result<Duration, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -318,6 +478,7 @@ poll:
   capture_lines: 80
   ssh_timeout: 7s
   command_timeout: 11s
+  max_concurrency: 3
 hosts:
   - id: local
     type: local
@@ -334,6 +495,13 @@ sessions:
       pane: 1
     repo: ~/work
     agent_hint: codex
+watches:
+  - id: pi-cwd-agent
+    host: pi
+    match:
+      command: node
+      cwd_prefix: /home/cam/work
+    agent_hint: codex
 "#,
         )
         .unwrap();
@@ -341,14 +509,16 @@ sessions:
         config.validate().unwrap();
         assert_eq!(config.poll.capture_lines, 80);
         assert_eq!(config.poll.command_timeout, Duration::from_secs(11));
+        assert_eq!(config.poll.max_concurrency, 3);
         assert_eq!(
             config.host("pi").unwrap().ssh().unwrap().target().unwrap(),
             "cam@192.168.0.197"
         );
         assert_eq!(
-            config.session("agent").unwrap().agent_hint.as_deref(),
+            config.watch("agent").unwrap().watch.agent_hint.as_deref(),
             Some("codex")
         );
+        assert_eq!(config.watches_for_host("pi").len(), 2);
     }
 
     #[test]
@@ -423,6 +593,32 @@ sessions:
                 .unwrap_err()
                 .to_string()
                 .contains("missing host")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_watch_match() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+hosts:
+  - id: local
+    type: local
+watches:
+  - id: agent
+    host: local
+    match:
+      cwd: /tmp
+      cwd_prefix: /tmp/work
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("must not set both")
         );
     }
 
