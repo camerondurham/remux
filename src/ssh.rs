@@ -11,7 +11,7 @@ pub fn run(
     command_timeout: Duration,
 ) -> Result<String> {
     let mut command = base_command(host, ssh_timeout, false)?;
-    command.arg(remote_command);
+    append_remote_command(&mut command, host, remote_command)?;
     let output = exec::output(
         &mut command,
         command_timeout,
@@ -42,8 +42,9 @@ pub fn run_interactive(
     remote_command: &str,
     default_timeout: Duration,
 ) -> Result<()> {
-    let status = base_command(host, default_timeout, true)?
-        .arg(remote_command)
+    let mut command = base_command(host, default_timeout, true)?;
+    append_remote_command(&mut command, host, remote_command)?;
+    let status = command
         .status()
         .with_context(|| format!("failed to start interactive ssh for host `{}`", host.id))?;
 
@@ -80,6 +81,50 @@ fn base_command(host: &HostConfig, default_timeout: Duration, tty: bool) -> Resu
     Ok(command)
 }
 
+fn append_remote_command(
+    command: &mut Command,
+    host: &HostConfig,
+    remote_command: &str,
+) -> Result<()> {
+    let ssh = host.ssh()?;
+    match &ssh.remote_shell {
+        Some(shell) if !shell.is_empty() => {
+            // SSH concatenates all post-target args with spaces on the remote
+            // side, so the shell invocation must be a single ssh argument with
+            // the command string properly quoted.
+            let mut joined = String::new();
+            for (i, part) in shell.iter().enumerate() {
+                if i > 0 {
+                    joined.push(' ');
+                }
+                joined.push_str(&shell_single_quote(part));
+            }
+            joined.push(' ');
+            joined.push_str(&shell_single_quote(remote_command));
+            command.arg(joined);
+        }
+        _ => {
+            command.arg(remote_command);
+        }
+    }
+    Ok(())
+}
+
+/// Wrap `input` in POSIX single quotes, escaping any existing single quotes.
+fn shell_single_quote(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 2);
+    out.push('\'');
+    for ch in input.chars() {
+        if ch == '\'' {
+            out.push_str(r"'\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use crate::config::{HostConfig, HostKind, SshConfig};
@@ -98,6 +143,7 @@ mod tests {
                 port: None,
                 config_file: None,
                 options: BTreeMap::new(),
+                remote_shell: None,
             }),
         };
 
