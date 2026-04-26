@@ -132,6 +132,7 @@ struct DashboardSummary {
     host_total: usize,
     host_unreachable: usize,
     sessions: usize,
+    matched: usize,
     active: usize,
     quiet: usize,
     idle: usize,
@@ -346,6 +347,10 @@ impl App {
                 .filter(|session| session.state == state)
                 .count()
         };
+        let matched = sessions
+            .iter()
+            .filter(|session| session.match_status == MatchStatus::Matched)
+            .count();
         let errors = self
             .snapshots
             .iter()
@@ -364,6 +369,7 @@ impl App {
             host_total,
             host_unreachable,
             sessions: sessions.len(),
+            matched,
             active: count_state(SessionState::Active),
             quiet: count_state(SessionState::Quiet),
             idle: count_state(SessionState::Idle),
@@ -644,55 +650,66 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
 fn draw_summary(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let summary = app.summary();
     let mut spans = vec![
-        Span::styled("Hosts: ", label_style()),
+        Span::styled("hosts ", label_style()),
         Span::styled(
             format!("{}/{} ok", summary.host_ok, summary.host_total),
             if summary.host_unreachable > 0 {
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
-                    .fg(Color::LightGreen)
+                    .fg(Color::LightCyan)
                     .add_modifier(Modifier::BOLD)
             },
         ),
-        Span::raw("   "),
-        Span::styled("Sessions: ", label_style()),
+        Span::raw(" | "),
+        Span::styled("panes ", label_style()),
         Span::styled(
             summary.sessions.to_string(),
             Style::default().fg(Color::White),
         ),
-        Span::raw("   "),
-        Span::styled("Active: ", label_style()),
+        Span::raw(" | "),
+        Span::styled("matched ", label_style()),
+        Span::styled(
+            summary.matched.to_string(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" | "),
+        Span::styled("active ", label_style()),
         Span::styled(
             summary.active.to_string(),
             state_style(SessionState::Active),
         ),
-        Span::raw("   "),
-        Span::styled("Quiet: ", label_style()),
+        Span::raw(" | "),
+        Span::styled("quiet ", label_style()),
         Span::styled(summary.quiet.to_string(), state_style(SessionState::Quiet)),
-        Span::raw("   "),
-        Span::styled("Idle: ", label_style()),
+        Span::raw(" | "),
+        Span::styled("idle ", label_style()),
         Span::styled(summary.idle.to_string(), state_style(SessionState::Idle)),
+        Span::raw(" | "),
+        Span::styled("filter: ", label_style()),
+        Span::styled(filter_label(app), Style::default().fg(Color::White)),
     ];
     if summary.missing > 0 {
-        spans.push(Span::raw("   "));
-        spans.push(Span::styled("Missing: ", label_style()));
+        spans.push(Span::raw(" | "));
+        spans.push(Span::styled("missing ", label_style()));
         spans.push(Span::styled(
             summary.missing.to_string(),
             state_style(SessionState::Missing),
         ));
     }
     if summary.host_unreachable > 0 {
-        spans.push(Span::raw("   "));
-        spans.push(Span::styled("Unreachable: ", label_style()));
+        spans.push(Span::raw(" | "));
+        spans.push(Span::styled("unreachable ", label_style()));
         spans.push(Span::styled(
             summary.host_unreachable.to_string(),
             state_style(SessionState::Unreachable),
         ));
     }
     if summary.errors > 0 {
-        spans.push(Span::raw("   "));
-        spans.push(Span::styled("Errors: ", label_style()));
+        spans.push(Span::raw(" | "));
+        spans.push(Span::styled("errors ", label_style()));
         spans.push(Span::styled(
             summary.errors.to_string(),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
@@ -700,7 +717,7 @@ fn draw_summary(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     }
 
     let paragraph = Paragraph::new(Line::from(spans))
-        .block(Block::default().borders(Borders::ALL).title("remux"));
+        .block(Block::default().borders(Borders::ALL).title("remux alpha"));
     frame.render_widget(paragraph, area);
 }
 
@@ -720,11 +737,22 @@ fn draw_sessions(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             .as_ref()
             .map(|repo| basename(&repo.path).to_string())
             .unwrap_or_else(|| "-".to_string());
-        let state = session.state.as_str();
+        let dirty = session
+            .repo
+            .as_ref()
+            .and_then(|repo| repo.dirty_count)
+            .map(|dirty| dirty.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let preview = session
+            .output
+            .as_ref()
+            .map(|output| short_message(&output.preview))
+            .unwrap_or_else(|| first_row_error(session).unwrap_or_else(|| "-".to_string()));
         Row::new(vec![
             Cell::from(session.host.clone()),
             Cell::from(session.display_id.clone()),
             Cell::from(session.match_status.as_str()).style(match_style(session.match_status)),
+            Cell::from(session.state.as_str()).style(state_style(session.state)),
             Cell::from(
                 session
                     .process
@@ -733,24 +761,29 @@ fn draw_sessions(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                     .unwrap_or_else(|| "-".to_string()),
             ),
             Cell::from(repo),
-            Cell::from(state).style(state_style(session.state)),
+            Cell::from(dirty.clone()).style(dirty_style(dirty.as_str())),
+            Cell::from(preview),
         ])
         .style(row_style(session))
     });
     let table = Table::new(
         table_rows,
         [
-            Constraint::Length(12),
-            Constraint::Min(18),
-            Constraint::Length(11),
-            Constraint::Length(12),
-            Constraint::Length(18),
             Constraint::Length(10),
+            Constraint::Min(16),
+            Constraint::Length(11),
+            Constraint::Length(9),
+            Constraint::Length(12),
+            Constraint::Length(16),
+            Constraint::Length(7),
+            Constraint::Min(20),
         ],
     )
     .header(
-        Row::new(["HOST", "ID", "MATCH", "CMD", "REPO", "STATE"])
-            .style(Style::default().add_modifier(Modifier::BOLD)),
+        Row::new([
+            "HOST", "ID", "MATCH", "STATE", "CMD", "REPO", "DIRTY", "PREVIEW",
+        ])
+        .style(Style::default().add_modifier(Modifier::BOLD)),
     )
     .block(Block::default().borders(Borders::ALL).title("sessions"))
     .row_highlight_style(
@@ -889,6 +922,8 @@ fn detail_meta_lines(row: &SessionSnapshot) -> Vec<Line<'static>> {
         .and_then(|repo| repo.dirty_count)
         .map(|dirty| dirty.to_string())
         .unwrap_or_else(|| "-".to_string());
+    let watch = row.watch_id.as_deref().unwrap_or("-");
+    let raw_target = row.raw_target.as_deref().unwrap_or("-");
 
     let mut lines = vec![
         Line::from(Span::styled(
@@ -898,31 +933,64 @@ fn detail_meta_lines(row: &SessionSnapshot) -> Vec<Line<'static>> {
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(vec![
-            Span::styled("State: ", label_style()),
+            Span::styled("activity: ", label_style()),
             Span::styled(row.state.as_str(), state_style(row.state)),
-            Span::raw("  "),
-            Span::styled("Match: ", label_style()),
+            Span::raw(" | "),
+            Span::styled("match: ", label_style()),
             Span::styled(row.match_status.as_str(), match_style(row.match_status)),
+            Span::raw(" | "),
+            Span::styled("watch: ", label_style()),
+            Span::raw(watch.to_string()),
         ]),
-        Line::from(format!(
-            "Host: {}  Target: {}",
-            row.host,
-            row.raw_target.as_deref().unwrap_or("-")
-        )),
-        Line::from(format!(
-            "tmux: {}  pane_id: {}",
-            tmux_target(row),
-            row.tmux.pane_id.as_deref().unwrap_or("-")
-        )),
-        Line::from(format!("Attach: {}", attach_hint(row))),
+        Line::from(vec![
+            Span::styled("target: ", label_style()),
+            Span::raw(raw_target.to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("tmux: ", label_style()),
+            Span::raw(tmux_target(row)),
+            Span::raw(" | "),
+            Span::styled("pane id: ", label_style()),
+            Span::raw(row.tmux.pane_id.as_deref().unwrap_or("-").to_string()),
+            Span::raw(" | "),
+            Span::styled("pid: ", label_style()),
+            Span::raw(pid.clone()),
+        ]),
         Line::from(""),
-        Line::from(format!("Command: {command}  PID: {pid}")),
-        Line::from(format!("CWD: {cwd}")),
-        Line::from(format!("Repo: {repo_path}")),
-        Line::from(format!("Branch: {branch}  Dirty: {dirty}")),
+        Line::from(vec![
+            Span::styled("command: ", label_style()),
+            Span::raw(command.to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("cwd: ", label_style()),
+            Span::raw(cwd.to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("repo: ", label_style()),
+            Span::raw(repo_path.to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("branch: ", label_style()),
+            Span::raw(branch.to_string()),
+            Span::raw(" | "),
+            Span::styled("dirty: ", label_style()),
+            Span::styled(dirty.clone(), dirty_style(dirty.as_str())),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("attach: ", label_style()),
+            Span::raw(attach_hint(row)),
+        ]),
+        Line::from(vec![
+            Span::styled("capture: ", label_style()),
+            Span::raw(capture_hint(row)),
+        ]),
     ];
     if let Some(agent) = &row.agent_hint {
-        lines.push(Line::from(format!("Agent: {agent}")));
+        lines.push(Line::from(vec![
+            Span::styled("hint: ", label_style()),
+            Span::raw(agent.clone()),
+        ]));
     }
     lines
 }
@@ -933,17 +1001,17 @@ fn detail_preview_lines(
     row: &SessionSnapshot,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(Span::styled(
-        "Recent output",
+        "Recent output preview",
         Style::default().add_modifier(Modifier::BOLD),
     ))];
 
     if let Some(output) = selected_output(app, selected, row).filter(|output| !output.is_empty()) {
-        for line in tail_lines(output, 6) {
+        for line in tail_lines(output, 8) {
             lines.push(Line::from(line));
         }
     } else {
         lines.push(Line::from(Span::styled(
-            "No recent output captured",
+            "No recent output in cache. Capture or inspect the selected pane to refresh this view.",
             muted_style(),
         )));
     }
@@ -1144,6 +1212,34 @@ fn attach_hint(row: &SessionSnapshot) -> String {
     }
 }
 
+fn capture_hint(row: &SessionSnapshot) -> String {
+    match row.match_status {
+        MatchStatus::Matched => format!("c -> remux capture {} --lines <n>", row.display_id),
+        MatchStatus::Orphan => row
+            .raw_target
+            .as_ref()
+            .map(|target| format!("c -> remux capture '{target}' --lines <n>"))
+            .unwrap_or_else(|| "unavailable".to_string()),
+        MatchStatus::Missing => "unavailable, missing live pane".to_string(),
+        MatchStatus::Ambiguous => "unavailable, ambiguous watch".to_string(),
+        MatchStatus::Shadowed => format!(
+            "unavailable, shadowed by {}",
+            row.shadowed_by.as_deref().unwrap_or("another watch")
+        ),
+        MatchStatus::Unreachable => "unavailable, host unreachable".to_string(),
+        MatchStatus::Unknown => "unavailable".to_string(),
+    }
+}
+
+fn filter_label(app: &App) -> String {
+    let trimmed = app.filter.trim();
+    if trimmed.is_empty() {
+        "-".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn label_style() -> Style {
     Style::default()
         .fg(Color::Gray)
@@ -1210,14 +1306,21 @@ fn row_style(session: &SessionSnapshot) -> Style {
     ) {
         return match_style(session.match_status);
     }
-    state_style(session.state)
+    match session.state {
+        SessionState::Idle => muted_style(),
+        SessionState::Quiet => Style::default().fg(Color::Gray),
+        SessionState::Missing | SessionState::Unreachable => state_style(session.state),
+        SessionState::Active | SessionState::Unknown => Style::default(),
+    }
 }
 
 fn match_style(status: MatchStatus) -> Style {
     match status {
-        MatchStatus::Matched => Style::default().fg(Color::Green),
+        MatchStatus::Matched => Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
         MatchStatus::Orphan => Style::default().fg(Color::White),
-        MatchStatus::Missing => Style::default().fg(Color::Yellow),
+        MatchStatus::Missing => Style::default().fg(Color::Red),
         MatchStatus::Ambiguous => Style::default().fg(Color::Magenta),
         MatchStatus::Shadowed => Style::default().fg(Color::Blue),
         MatchStatus::Unreachable => Style::default().fg(Color::Red),
@@ -1228,7 +1331,7 @@ fn match_style(status: MatchStatus) -> Style {
 fn state_style(state: SessionState) -> Style {
     match state {
         SessionState::Active => Style::default()
-            .fg(Color::LightGreen)
+            .fg(Color::LightCyan)
             .add_modifier(Modifier::BOLD),
         SessionState::Quiet => Style::default()
             .fg(Color::Yellow)
@@ -1237,6 +1340,15 @@ fn state_style(state: SessionState) -> Style {
         SessionState::Missing => Style::default().fg(Color::Yellow),
         SessionState::Unreachable => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         SessionState::Unknown => Style::default().fg(Color::Gray),
+    }
+}
+
+fn dirty_style(value: &str) -> Style {
+    match value {
+        "-" | "0" => Style::default().fg(Color::DarkGray),
+        _ => Style::default()
+            .fg(Color::LightYellow)
+            .add_modifier(Modifier::BOLD),
     }
 }
 
@@ -1263,4 +1375,11 @@ fn basename(path: &str) -> &str {
         .next()
         .filter(|value| !value.is_empty())
         .unwrap_or(path)
+}
+
+fn first_row_error(session: &SessionSnapshot) -> Option<String> {
+    session
+        .errors
+        .first()
+        .map(|error| short_message(&error.message))
 }

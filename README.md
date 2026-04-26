@@ -2,17 +2,38 @@
 
 `remux` is a local-first CLI/TUI for finding, inspecting, and attaching to tmux panes across local and SSH hosts.
 
-**Project status: alpha.** `remux` is usable for dogfooding, but the config format, TUI layout, and command behavior may still change.
+**Status: alpha.** Built for personal/local use first. Tested with local and SSH tmux hosts. Expect rough edges.
 
-It is for people who keep coding agents, shells, builds, and debug sessions alive in tmux across several machines. `remux` shows which panes exist, what they are running, where they live on disk, whether output is still changing, and how to attach to the right pane.
+It is for engineers who keep coding agents, shells, builds, bots, and debug sessions alive in tmux across multiple machines. `remux` gives you one factual index of those panes: command, cwd, repo, output activity, match state, and attach/capture targets.
 
-https://github.com/user-attachments/assets/7f6a95a3-522d-4037-9db0-697b388cd6d8
+It does not summarize, score, orchestrate, spawn agents, install a daemon, or sync to the cloud.
 
-## Use Case
+![remux TUI showing local and SSH tmux sessions](docs/assets/remux-tui.png)
 
-`remux` is a live index for tmux work spread across machines. It maps panes to names, process/cwd/repo/output state, and attach/capture commands.
+![remux TUI demo filtering and inspecting panes](docs/assets/remux-tui-demo.gif)
 
-Scope: inventory and jump surface only. No AI summaries, remote daemons, cloud sync, or agent orchestration.
+## Why
+
+When running multiple coding agents or long-running tasks in tmux across local and remote machines, it is easy to lose track of what is running where.
+
+`remux` gives you a single factual view over those sessions without requiring a daemon, cloud account, new agent framework, or custom workflow. It reuses tmux and SSH.
+
+## How is this different?
+
+| Tool type | Examples | Focus | remux difference |
+| --- | --- | --- | --- |
+| AI-agent monitors | `abtop` | Local Claude Code/Codex telemetry: tokens, context, rate limits, ports, child processes | `remux` is process-agnostic tmux inventory across local and SSH hosts. |
+| Claude tmux dashboards | `recon` | Managing Claude Code sessions in tmux, including switching/spawning/killing/resume workflows | `remux` does not manage agents; it inventories any tmux pane and gives attach/capture targets. |
+| Agent orchestrators | Gas Town | Coordinating multiple AI coding agents and persistent multi-agent work state | `remux` does not orchestrate. It observes existing sessions and helps you jump into them. |
+| Local tmux agent helpers | `amux`, fzf scripts, shell scripts | Local organization or launching of agent sessions | `remux` adds SSH hosts, watches, match states, repo metadata, capture, and activity aging. |
+| Generic tmux wrappers | tmux aliases/wrappers | Shorter tmux commands | `remux` builds a remote session index over tmux panes instead of replacing tmux. |
+
+## Requirements
+
+- tmux on each monitored host
+- ssh for remote hosts
+- git only if repo metadata is configured
+- Rust only when building from source
 
 ## Quick Start
 
@@ -108,6 +129,17 @@ Watch match state:
 | `unreachable` | The host for this row could not be polled. |
 
 State aging is based on captured output hashes cached at `~/.local/share/remux/cache.json`.
+
+## Known Limitations
+
+- Alpha-quality TUI.
+- No remote daemon; polling uses generated SSH commands.
+- No Windows support claimed.
+- Activity state is based on captured output hash changes, not semantic task state.
+- Pane capture may write recent terminal output into the local cache.
+- No token/context tracking.
+- No AI summaries or risk scoring.
+- The name `remux` may need reconsideration before crates.io publishing.
 
 ## SSH And Security
 
