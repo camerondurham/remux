@@ -26,19 +26,26 @@ pub fn attach_target(config: &Config, target: &PaneTarget, readonly: bool) -> Re
 fn attach_local(target: &PaneTarget, readonly: bool) -> Result<()> {
     let mut command = Command::new("tmux");
     if inside_tmux() {
+        // Inside an existing tmux client, `switch-client -t <pane-target>`
+        // is the documented way to change session/window/pane atomically —
+        // tmux special-cases a target containing `:`, `.`, or `%`.
+        //
+        // `switch-client -r` toggles the client's read-only flag, so calling
+        // it twice would flip back to writable. Use `-f read-only,ignore-size`
+        // to set the flags deterministically instead.
         command.arg("switch-client");
         if readonly {
-            command.arg("-r");
+            command.arg("-f").arg("read-only,ignore-size");
         }
-        command.arg("-t").arg(&target.session);
+        command.arg("-t").arg(switch_client_target(target));
     } else {
         command.arg("attach-session");
         if readonly {
             command.arg("-r");
         }
         command.arg("-t").arg(&target.session);
+        add_select_args(&mut command, target);
     }
-    add_select_args(&mut command, target);
 
     let status = command
         .status()
@@ -54,13 +61,23 @@ fn inside_tmux() -> bool {
     env::var_os("TMUX").is_some()
 }
 
+/// Build a single-target string for `switch-client -t` that selects
+/// session, window, and pane. Prefers the global `%pane_id` when known,
+/// otherwise falls back to `session:window.pane`.
+fn switch_client_target(target: &PaneTarget) -> String {
+    target
+        .pane_id
+        .clone()
+        .unwrap_or_else(|| target.tmux_target())
+}
+
 fn add_select_args(command: &mut Command, target: &PaneTarget) {
-    if target.pane_id.is_some() {
-        command
-            .arg(";")
-            .arg("select-pane")
-            .arg("-t")
-            .arg(target.pane_selector());
+    // `select-pane -t %id` only activates the pane *inside its window*; it
+    // does not switch the client's current window. Always issue an explicit
+    // `select-window` so the attach ends up focused on the right window.
+    if let Some(pane_id) = target.pane_id.as_deref() {
+        command.arg(";").arg("select-window").arg("-t").arg(pane_id);
+        command.arg(";").arg("select-pane").arg("-t").arg(pane_id);
     } else {
         command
             .arg(";")
@@ -87,13 +104,59 @@ fn attach_command(target: &PaneTarget, readonly: bool) -> String {
 }
 
 fn add_select_parts(parts: &mut Vec<String>, target: &PaneTarget) {
-    if target.pane_id.is_some() {
+    // Same correctness concern as `add_select_args`: always switch windows
+    // explicitly so we don't leave the client focused on the wrong one.
+    if let Some(pane_id) = target.pane_id.as_deref() {
+        parts.push("\\; select-window -t".to_string());
+        parts.push(tmux::shell_quote(pane_id));
         parts.push("\\; select-pane -t".to_string());
-        parts.push(tmux::shell_quote(target.pane_selector()));
+        parts.push(tmux::shell_quote(pane_id));
     } else {
         parts.push("\\; select-window -t".to_string());
         parts.push(tmux::shell_quote(&target.window));
         parts.push("\\; select-pane -t".to_string());
         parts.push(tmux::shell_quote(&target.pane));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pane_target(pane_id: Option<&str>) -> PaneTarget {
+        PaneTarget {
+            host: "h".to_string(),
+            session: "s".to_string(),
+            window: "1".to_string(),
+            pane: "2".to_string(),
+            pane_id: pane_id.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn attach_command_with_pane_id_switches_window_before_pane() {
+        let cmd = attach_command(&pane_target(Some("%42")), false);
+        assert!(cmd.contains("attach-session"));
+        assert!(cmd.contains("-t 's'"));
+        let window_idx = cmd.find("select-window -t '%42'").expect("window select");
+        let pane_idx = cmd.find("select-pane -t '%42'").expect("pane select");
+        assert!(
+            window_idx < pane_idx,
+            "select-window must precede select-pane: {cmd}"
+        );
+    }
+
+    #[test]
+    fn attach_command_without_pane_id_uses_window_and_pane_indices() {
+        let cmd = attach_command(&pane_target(None), true);
+        assert!(cmd.contains("attach-session -r"));
+        assert!(cmd.contains("select-window -t '1'"));
+        assert!(cmd.contains("select-pane -t '2'"));
+    }
+
+    #[test]
+    fn switch_client_target_prefers_pane_id() {
+        assert_eq!(switch_client_target(&pane_target(Some("%9"))), "%9");
+        assert_eq!(switch_client_target(&pane_target(None)), "s:1.2");
     }
 }

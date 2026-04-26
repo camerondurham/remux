@@ -420,11 +420,11 @@ if [[ "$remote" == "git -C '/repo' status --porcelain=v1" ]]; then
   exit 0
 fi
 
-if [[ "$remote" == "tmux attach-session -r -t 'work' \\; select-pane -t '%3'" ]]; then
+if [[ "$remote" == "tmux attach-session -r -t 'work' \\; select-window -t '%3' \\; select-pane -t '%3'" ]]; then
   exit 0
 fi
 
-if [[ "$remote" == "tmux attach-session -t 'work' \\; select-pane -t '%3'" ]]; then
+if [[ "$remote" == "tmux attach-session -t 'work' \\; select-window -t '%3' \\; select-pane -t '%3'" ]]; then
   exit 0
 fi
 

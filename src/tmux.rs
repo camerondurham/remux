@@ -55,10 +55,6 @@ impl PaneTarget {
     pub fn tmux_target(&self) -> String {
         format!("{}:{}.{}", self.session, self.window, self.pane)
     }
-
-    pub fn pane_selector(&self) -> &str {
-        self.pane_id.as_deref().unwrap_or(&self.pane)
-    }
 }
 
 impl fmt::Display for PaneTarget {
