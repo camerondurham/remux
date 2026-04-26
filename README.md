@@ -2,6 +2,8 @@
 
 `remux` is a local-first CLI/TUI for finding, inspecting, and attaching to tmux panes across local and SSH hosts.
 
+**Project status: alpha.** `remux` is usable for dogfooding, but the config format, TUI layout, and command behavior may still change.
+
 It is for people who keep coding agents, shells, builds, and debug sessions alive in tmux across several machines. `remux` shows which panes exist, what they are running, where they live on disk, whether output is still changing, and how to attach to the right pane.
 
 https://github.com/user-attachments/assets/7f6a95a3-522d-4037-9db0-697b388cd6d8
