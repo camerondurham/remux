@@ -470,6 +470,9 @@ fi
 
 if [[ "${1:-}" == "switch-client" ]]; then
   args="$*"
+  if [[ "$args" == *"-t %7"* ]]; then
+    exit 0
+  fi
   if [[ "$args" == *"local"* && "$args" == *"select-pane -t %7"* ]]; then
     exit 0
   fi
