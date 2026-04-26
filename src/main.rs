@@ -2,6 +2,7 @@ mod attach;
 mod cache;
 mod cli;
 mod config;
+mod exec;
 mod git;
 mod host;
 mod local;

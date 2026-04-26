@@ -3,6 +3,7 @@ poll:
   idle_after: 60m
   capture_lines: 120
   ssh_timeout: 5s
+  command_timeout: 15s
 
 hosts:
   - id: local

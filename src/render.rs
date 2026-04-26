@@ -4,7 +4,11 @@ use crate::snapshot::{HostSnapshot, PaneDetail, SessionSnapshot, SnapshotStatus}
 use anyhow::Result;
 
 pub fn hosts(config: &Config) -> Result<()> {
-    let cache = Cache::load();
+    let cache_load = Cache::load_with_warning();
+    if let Some(warning) = &cache_load.warning {
+        eprintln!("warning: cache: {warning}");
+    }
+    let cache = cache_load.cache;
     println!(
         "{:<14} {:<6} {:<24} {:<12} LAST POLL",
         "HOST", "TYPE", "TARGET", "STATUS"
@@ -45,15 +49,14 @@ pub fn snapshot(snapshot: &HostSnapshot, json: bool) -> Result<()> {
         SnapshotStatus::Ok => {
             println!("Host: {}", snapshot.host);
             println!("Collected: {}", snapshot.collected_at);
+            print_snapshot_errors(snapshot);
             println!();
             print_session_table(&snapshot.sessions);
         }
         SnapshotStatus::Unreachable => {
             println!("Host: {}", snapshot.host);
             println!("Status: unreachable");
-            for error in &snapshot.errors {
-                println!("{}: {}", error.kind, error.message);
-            }
+            print_snapshot_errors(snapshot);
             if !snapshot.sessions.is_empty() {
                 println!();
                 print_session_table(&snapshot.sessions);
@@ -111,6 +114,7 @@ pub fn list(snapshots: &[HostSnapshot], json: bool) -> Result<()> {
             );
         }
     }
+    warn_snapshot_errors(snapshots);
     Ok(())
 }
 
@@ -177,6 +181,9 @@ pub fn inspect(detail: &PaneDetail, json: bool) -> Result<()> {
                 .unwrap_or_else(|| "-".to_string())
         );
     }
+    for error in &session.errors {
+        println!("{} error: {}", titlecase(&error.kind), error.message);
+    }
     println!();
     println!("Recent output:");
     println!("{}", detail.recent_output);
@@ -196,6 +203,23 @@ pub fn inspect(detail: &PaneDetail, json: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn print_snapshot_errors(snapshot: &HostSnapshot) {
+    for error in &snapshot.errors {
+        println!("{}: {}", error.kind, error.message);
+    }
+}
+
+fn warn_snapshot_errors(snapshots: &[HostSnapshot]) {
+    for snapshot in snapshots {
+        for error in &snapshot.errors {
+            eprintln!(
+                "warning: {}: {}: {}",
+                snapshot.host, error.kind, error.message
+            );
+        }
+    }
 }
 
 fn print_session_table(sessions: &[SessionSnapshot]) {
@@ -230,6 +254,14 @@ fn print_session_table(sessions: &[SessionSnapshot]) {
         for error in &session.errors {
             println!("{:<24} {}: {}", "", error.kind, error.message);
         }
+    }
+}
+
+fn titlecase(value: &str) -> String {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
 }
 

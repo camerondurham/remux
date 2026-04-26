@@ -291,6 +291,7 @@ poll:
   idle_after: 60m
   capture_lines: 80
   ssh_timeout: 5s
+  command_timeout: 15s
 
 hosts:
   - id: local
@@ -358,6 +359,7 @@ struct PollConfig {
     idle_after: Duration,
     capture_lines: usize,
     ssh_timeout: Duration,
+    command_timeout: Duration,
 }
 
 struct HostConfig {

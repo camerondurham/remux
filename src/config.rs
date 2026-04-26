@@ -34,6 +34,11 @@ pub struct PollConfig {
         deserialize_with = "deserialize_duration"
     )]
     pub ssh_timeout: Duration,
+    #[serde(
+        default = "default_command_timeout",
+        deserialize_with = "deserialize_duration"
+    )]
+    pub command_timeout: Duration,
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,6 +90,7 @@ impl Default for PollConfig {
             idle_after: default_idle_after(),
             capture_lines: default_capture_lines(),
             ssh_timeout: default_ssh_timeout(),
+            command_timeout: default_command_timeout(),
         }
     }
 }
@@ -136,6 +142,9 @@ impl Config {
         }
         if self.poll.ssh_timeout.is_zero() {
             bail!("poll.ssh_timeout must be greater than zero");
+        }
+        if self.poll.command_timeout.is_zero() {
+            bail!("poll.command_timeout must be greater than zero");
         }
 
         let mut host_ids = HashSet::new();
@@ -261,6 +270,10 @@ fn default_ssh_timeout() -> Duration {
     Duration::from_secs(5)
 }
 
+fn default_command_timeout() -> Duration {
+    Duration::from_secs(15)
+}
+
 fn deserialize_duration<'de, D>(deserializer: D) -> std::result::Result<Duration, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -304,6 +317,7 @@ poll:
   idle_after: 60m
   capture_lines: 80
   ssh_timeout: 7s
+  command_timeout: 11s
 hosts:
   - id: local
     type: local
@@ -326,6 +340,7 @@ sessions:
 
         config.validate().unwrap();
         assert_eq!(config.poll.capture_lines, 80);
+        assert_eq!(config.poll.command_timeout, Duration::from_secs(11));
         assert_eq!(
             config.host("pi").unwrap().ssh().unwrap().target().unwrap(),
             "cam@192.168.0.197"

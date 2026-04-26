@@ -3,7 +3,7 @@ use crate::config::{Config, HostConfig, SessionConfig};
 use crate::git::{self, RepoSnapshot};
 use crate::host;
 use crate::tmux::{self, Pane, PaneTarget};
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -99,19 +99,25 @@ pub struct PaneDetail {
 }
 
 pub fn snapshot_host(config: &Config, host_id: &str) -> Result<HostSnapshot> {
-    let mut cache = Cache::load();
-    let snapshot = snapshot_host_with_cache(config, host_id, &mut cache)?;
-    let _ = cache.save();
+    let cache_load = Cache::load_with_warning();
+    let mut cache = cache_load.cache;
+    let mut snapshot = snapshot_host_with_cache(config, host_id, &mut cache)?;
+    append_cache_warning(&mut snapshot, cache_load.warning);
+    append_cache_save_error(&mut snapshot, cache.save().err());
     Ok(snapshot)
 }
 
 pub fn snapshot_all(config: &Config) -> Result<Vec<HostSnapshot>> {
-    let mut cache = Cache::load();
+    let cache_load = Cache::load_with_warning();
+    let mut cache = cache_load.cache;
     let mut snapshots = Vec::new();
     for host in &config.hosts {
         snapshots.push(snapshot_host_with_cache(config, &host.id, &mut cache)?);
     }
-    let _ = cache.save();
+    if let Some(first) = snapshots.first_mut() {
+        append_cache_warning(first, cache_load.warning);
+        append_cache_save_error(first, cache.save().err());
+    }
     Ok(snapshots)
 }
 
@@ -121,10 +127,12 @@ pub fn inspect(config: &Config, id_or_target: &str) -> Result<PaneDetail> {
     }
 
     let session = config.session(id_or_target)?;
-    let mut cache = Cache::load();
-    let host_snapshot = snapshot_host_with_cache(config, &session.host, &mut cache)?;
-    let _ = cache.save();
-    let snapshot = host_snapshot
+    let cache_load = Cache::load_with_warning();
+    let mut cache = cache_load.cache;
+    let mut host_snapshot = snapshot_host_with_cache(config, &session.host, &mut cache)?;
+    append_cache_warning(&mut host_snapshot, cache_load.warning);
+    append_cache_save_error(&mut host_snapshot, cache.save().err());
+    let mut snapshot = host_snapshot
         .sessions
         .into_iter()
         .find(|snapshot| snapshot.session_id == session.id)
@@ -138,7 +146,7 @@ pub fn inspect(config: &Config, id_or_target: &str) -> Result<PaneDetail> {
     }
 
     let target = target_for_snapshot(&snapshot)?;
-    let recent_output = capture_pane(config, &target, config.poll.capture_lines)?;
+    let recent_output = capture_for_inspect(config, &target, &mut snapshot)?;
     Ok(PaneDetail {
         session: snapshot,
         recent_output,
@@ -156,16 +164,21 @@ pub fn capture(config: &Config, id_or_target: &str, lines: usize) -> Result<Stri
 }
 
 pub fn capture_pane(config: &Config, target: &PaneTarget, lines: usize) -> Result<String> {
+    if lines == 0 {
+        bail!("capture lines must be greater than zero");
+    }
     let host_config = config.host(&target.host)?;
     let command = tmux::capture_command(target, lines);
     host::run(config, host_config, &command)
 }
 
 fn inspect_target(config: &Config, target: &PaneTarget) -> Result<PaneDetail> {
-    let mut cache = Cache::load();
-    let host_snapshot = snapshot_host_with_cache(config, &target.host, &mut cache)?;
-    let _ = cache.save();
-    let snapshot = host_snapshot
+    let cache_load = Cache::load_with_warning();
+    let mut cache = cache_load.cache;
+    let mut host_snapshot = snapshot_host_with_cache(config, &target.host, &mut cache)?;
+    append_cache_warning(&mut host_snapshot, cache_load.warning);
+    append_cache_save_error(&mut host_snapshot, cache.save().err());
+    let mut snapshot = host_snapshot
         .sessions
         .into_iter()
         .find(|snapshot| {
@@ -174,7 +187,7 @@ fn inspect_target(config: &Config, target: &PaneTarget) -> Result<PaneDetail> {
                 && snapshot.tmux.pane.as_deref() == Some(target.pane.as_str())
         })
         .ok_or_else(|| anyhow!("pane `{target}` was not found on host `{}`", target.host))?;
-    let recent_output = capture_pane(config, target, config.poll.capture_lines)?;
+    let recent_output = capture_for_inspect(config, target, &mut snapshot)?;
     Ok(PaneDetail {
         session: snapshot,
         recent_output,
@@ -285,20 +298,39 @@ fn snapshot_for_pane(
         window: pane.window.clone(),
         pane: pane.pane.clone(),
     };
-    let output = capture_pane(config, &target, config.poll.capture_lines)
-        .unwrap_or_else(|err| format!("failed to capture pane output: {err:#}\n"));
-    let output_hash = hash(&output);
     let session_id = session
         .map(|session| session.id.clone())
         .unwrap_or_else(|| pane.target.clone());
     let cache_key = format!("{}/{}", host_config.id, session_id);
-    let (state, last_output_at) = cache.update_output(
-        &cache_key,
-        Some(pane.pane_id.clone()),
-        &output_hash,
-        now,
-        &config.poll,
-    );
+    let (state, output, errors) = match capture_pane(config, &target, config.poll.capture_lines) {
+        Ok(output) => {
+            let output_hash = hash(&output);
+            let (state, last_output_at) = cache.update_output(
+                &cache_key,
+                Some(pane.pane_id.clone()),
+                &output_hash,
+                now,
+                &config.poll,
+            );
+            (
+                state,
+                Some(OutputSnapshot {
+                    preview: preview(&output),
+                    hash: output_hash,
+                    last_output_at,
+                }),
+                Vec::new(),
+            )
+        }
+        Err(err) => (
+            SessionState::Unknown,
+            None,
+            vec![SnapshotError {
+                kind: "capture".to_string(),
+                message: format!("{err:#}"),
+            }],
+        ),
+    };
 
     SessionSnapshot {
         session_id,
@@ -320,12 +352,8 @@ fn snapshot_for_pane(
         repo: session
             .and_then(|session| session.repo.as_deref())
             .map(|repo| git::collect(config, host_config, repo)),
-        output: Some(OutputSnapshot {
-            preview: preview(&output),
-            hash: output_hash,
-            last_output_at,
-        }),
-        errors: Vec::new(),
+        output,
+        errors,
     }
 }
 
@@ -383,9 +411,11 @@ fn unreachable_sessions(config: &Config, host_id: &str, message: &str) -> Vec<Se
 }
 
 fn target_for_session(config: &Config, session: &SessionConfig) -> Result<PaneTarget> {
-    let mut cache = Cache::load();
-    let host_snapshot = snapshot_host_with_cache(config, &session.host, &mut cache)?;
-    let _ = cache.save();
+    let cache_load = Cache::load_with_warning();
+    let mut cache = cache_load.cache;
+    let mut host_snapshot = snapshot_host_with_cache(config, &session.host, &mut cache)?;
+    append_cache_warning(&mut host_snapshot, cache_load.warning);
+    append_cache_save_error(&mut host_snapshot, cache.save().err());
     let snapshot = host_snapshot
         .sessions
         .into_iter()
@@ -439,4 +469,46 @@ fn hash(output: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(output.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+fn capture_for_inspect(
+    config: &Config,
+    target: &PaneTarget,
+    snapshot: &mut SessionSnapshot,
+) -> Result<String> {
+    match capture_pane(config, target, config.poll.capture_lines) {
+        Ok(output) => Ok(output),
+        Err(err) => {
+            let message = format!("{err:#}");
+            if !snapshot
+                .errors
+                .iter()
+                .any(|error| error.kind == "capture" && error.message == message)
+            {
+                snapshot.errors.push(SnapshotError {
+                    kind: "capture".to_string(),
+                    message,
+                });
+            }
+            Ok(String::new())
+        }
+    }
+}
+
+fn append_cache_warning(snapshot: &mut HostSnapshot, warning: Option<String>) {
+    if let Some(message) = warning {
+        snapshot.errors.push(SnapshotError {
+            kind: "cache".to_string(),
+            message,
+        });
+    }
+}
+
+fn append_cache_save_error(snapshot: &mut HostSnapshot, error: Option<anyhow::Error>) {
+    if let Some(error) = error {
+        snapshot.errors.push(SnapshotError {
+            kind: "cache".to_string(),
+            message: format!("{error:#}"),
+        });
+    }
 }

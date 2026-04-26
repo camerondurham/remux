@@ -142,6 +142,44 @@ sessions:
     assert_success(&attach);
 }
 
+#[test]
+fn capture_failures_are_reported_without_fake_output() {
+    let env = TestEnv::new();
+    env.write_config(
+        r#"
+hosts:
+  - id: local
+    type: local
+sessions:
+  - id: broken-agent
+    host: local
+    tmux:
+      session: broken
+      window: 0
+      pane: 0
+"#,
+    );
+
+    let snapshot = env.remux(["--config", env.config_path(), "snapshot", "local", "--json"]);
+    assert_success(&snapshot);
+    let snapshot: Value = serde_json::from_str(&stdout(&snapshot)).unwrap();
+    let session = snapshot["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["session_id"] == "broken-agent")
+        .unwrap();
+
+    assert_eq!(session["state"], "unknown");
+    assert!(session["output"].is_null());
+    assert_eq!(session["errors"][0]["kind"], "capture");
+    assert!(
+        !serde_json::to_string(session)
+            .unwrap()
+            .contains("failed to capture pane output")
+    );
+}
+
 struct TestEnv {
     root: PathBuf,
     config: PathBuf,
@@ -293,12 +331,18 @@ set -euo pipefail
 
 if [[ "${1:-}" == "list-panes" ]]; then
   printf 'local\t0\t0\t%%7\t4321\tbash\t/tmp/local\n'
+  printf 'broken\t0\t0\t%%8\t5555\tbash\t/tmp/broken\n'
   exit 0
 fi
 
 if [[ "${1:-}" == "capture-pane" && "${3:-}" == "local:0.0" ]]; then
   printf 'local line\nlocal-remux\n'
   exit 0
+fi
+
+if [[ "${1:-}" == "capture-pane" && "${3:-}" == "broken:0.0" ]]; then
+  echo "capture failed" >&2
+  exit 45
 fi
 
 if [[ "${1:-}" == "attach-session" ]]; then

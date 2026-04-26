@@ -47,6 +47,10 @@ remux --config ./examples/config.yaml list
 Hosts can be local or SSH. SSH uses the system `ssh` command and defaults to non-interactive behavior:
 
 ```yaml
+poll:
+  ssh_timeout: 5s
+  command_timeout: 15s
+
 hosts:
   - id: local
     type: local

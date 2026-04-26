@@ -1,13 +1,22 @@
 use crate::config::HostConfig;
+use crate::exec;
 use anyhow::{Context, Result, anyhow};
 use std::process::Command;
 use std::time::Duration;
 
-pub fn run(host: &HostConfig, remote_command: &str, default_timeout: Duration) -> Result<String> {
-    let output = base_command(host, default_timeout, false)?
-        .arg(remote_command)
-        .output()
-        .with_context(|| format!("failed to start ssh for host `{}`", host.id))?;
+pub fn run(
+    host: &HostConfig,
+    remote_command: &str,
+    ssh_timeout: Duration,
+    command_timeout: Duration,
+) -> Result<String> {
+    let mut command = base_command(host, ssh_timeout, false)?;
+    command.arg(remote_command);
+    let output = exec::output(
+        &mut command,
+        command_timeout,
+        format!("ssh command for host `{}`", host.id),
+    )?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();

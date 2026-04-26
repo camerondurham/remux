@@ -5,7 +5,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Cache {
@@ -29,13 +30,43 @@ pub struct HostCacheEntry {
     pub last_poll_at: DateTime<Utc>,
 }
 
+pub struct CacheLoad {
+    pub cache: Cache,
+    pub warning: Option<String>,
+}
+
 impl Cache {
-    pub fn load() -> Self {
-        let path = cache_path();
-        let Ok(raw) = fs::read_to_string(path) else {
-            return Self::default();
+    pub fn load_with_warning() -> CacheLoad {
+        Self::load_from_path(&cache_path())
+    }
+
+    fn load_from_path(path: &Path) -> CacheLoad {
+        let raw = match fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                return CacheLoad {
+                    cache: Self::default(),
+                    warning: None,
+                };
+            }
+            Err(err) => {
+                return CacheLoad {
+                    cache: Self::default(),
+                    warning: Some(format!("failed to read cache {}: {err}", path.display())),
+                };
+            }
         };
-        serde_json::from_str(&raw).unwrap_or_default()
+
+        match serde_json::from_str(&raw) {
+            Ok(cache) => CacheLoad {
+                cache,
+                warning: None,
+            },
+            Err(err) => CacheLoad {
+                cache: Self::default(),
+                warning: Some(format!("failed to parse cache {}: {err}", path.display())),
+            },
+        }
     }
 
     pub fn save(&self) -> Result<()> {
@@ -127,4 +158,67 @@ pub fn cache_path() -> PathBuf {
     }
     let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
     PathBuf::from(home).join(".local/share/remux/cache.json")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::PollConfig;
+    use std::time::Duration;
+
+    #[test]
+    fn corrupt_cache_returns_default_with_warning() {
+        let path = std::env::temp_dir().join(format!(
+            "remux-corrupt-cache-{}-{}.json",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::write(&path, "{not-json").unwrap();
+
+        let loaded = Cache::load_from_path(&path);
+        assert!(loaded.cache.entries.is_empty());
+        assert!(
+            loaded
+                .warning
+                .as_deref()
+                .unwrap_or_default()
+                .contains("failed to parse cache")
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn unchanged_output_ages_from_prior_observed_output() {
+        let mut cache = Cache::default();
+        let poll = PollConfig {
+            active_after: Duration::from_secs(5),
+            idle_after: Duration::from_secs(60),
+            capture_lines: 10,
+            ssh_timeout: Duration::from_secs(5),
+            command_timeout: Duration::from_secs(15),
+        };
+        let start = Utc::now();
+
+        let (first_state, first_output_at) = cache.update_output(
+            "local/session",
+            Some("%1".to_string()),
+            "same",
+            start,
+            &poll,
+        );
+        assert_eq!(first_state, SessionState::Unknown);
+        assert_eq!(first_output_at, Some(start));
+
+        let later = start + chrono::Duration::seconds(30);
+        let (second_state, second_output_at) = cache.update_output(
+            "local/session",
+            Some("%1".to_string()),
+            "same",
+            later,
+            &poll,
+        );
+        assert_eq!(second_state, SessionState::Quiet);
+        assert_eq!(second_output_at, Some(start));
+    }
 }
