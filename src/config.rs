@@ -69,6 +69,12 @@ pub struct SshConfig {
     pub config_file: Option<PathBuf>,
     #[serde(default)]
     pub options: BTreeMap<String, String>,
+    /// Wrap the remote command in this shell invocation, e.g.
+    /// `["bash", "-lc"]` to run via a login shell so `~/.bashrc`/`~/.zprofile`
+    /// PATH tweaks are picked up. The remote command is appended as the final
+    /// argument.
+    #[serde(default)]
+    pub remote_shell: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
