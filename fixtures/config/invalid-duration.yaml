@@ -1,0 +1,5 @@
+poll:
+  active_after: soon
+hosts:
+  - id: local
+    type: local

@@ -36,8 +36,18 @@ jobs:
       - name: Run Tests
         run: cargo test --locked --all-targets --all-features
 
+      - name: Build Release
+        run: cargo build --release --locked
+
       - name: Check CLI Help
         run: cargo run --locked -- --help
 
       - name: Check Fixture Config
         run: cargo run --locked -- --config fixtures/config/pi.yaml hosts
+
+      - name: Check Validation Errors
+        run: |
+          ! cargo run --locked -- --config fixtures/config/duplicate-host.yaml hosts
+          ! cargo run --locked -- --config fixtures/config/duplicate-session.yaml hosts
+          ! cargo run --locked -- --config fixtures/config/missing-host-ref.yaml hosts
+          ! cargo run --locked -- --config fixtures/config/invalid-duration.yaml hosts

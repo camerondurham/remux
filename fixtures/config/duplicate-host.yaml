@@ -1,0 +1,5 @@
+hosts:
+  - id: local
+    type: local
+  - id: local
+    type: local

@@ -1,0 +1,39 @@
+poll:
+  active_after: 5m
+  idle_after: 60m
+  capture_lines: 120
+  ssh_timeout: 5s
+
+hosts:
+  - id: local
+    type: local
+
+  - id: pi
+    type: ssh
+    ssh:
+      target: cam@192.168.0.197
+      # Optional escape hatch for environments with broken system SSH config.
+      # Omit this to reuse normal ~/.ssh/config behavior.
+      config_file: /dev/null
+      options:
+        BatchMode: "yes"
+        ConnectTimeout: "5"
+
+sessions:
+  - id: local-shell
+    host: local
+    tmux:
+      session: remux-local
+      window: 0
+      pane: 0
+    repo: ~/code/remux
+    agent_hint: shell
+
+  - id: pi-agent
+    host: pi
+    tmux:
+      session: work
+      window: 0
+      pane: 1
+    repo: /home/cam/openclaw
+    agent_hint: codex

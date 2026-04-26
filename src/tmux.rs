@@ -1,3 +1,4 @@
+use crate::config::TmuxTarget;
 use anyhow::{Result, anyhow, bail};
 use serde::Serialize;
 use std::fmt;
@@ -106,8 +107,35 @@ pub fn capture_command(target: &PaneTarget, lines: usize) -> String {
     )
 }
 
-fn shell_quote(value: &str) -> String {
+pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+pub fn shell_path(value: &str) -> String {
+    if value == "~" {
+        return "$HOME".to_string();
+    }
+    if let Some(rest) = value.strip_prefix("~/") {
+        return format!("$HOME/{}", shell_quote(rest));
+    }
+    shell_quote(value)
+}
+
+pub fn matches_target(pane: &Pane, target: &TmuxTarget) -> bool {
+    if pane.session != target.session {
+        return false;
+    }
+    if let Some(window) = target.window
+        && pane.window != window.to_string()
+    {
+        return false;
+    }
+    if let Some(pane_index) = target.pane
+        && pane.pane != pane_index.to_string()
+    {
+        return false;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -140,5 +168,11 @@ mod tests {
             capture_command(&target, 120),
             "tmux capture-pane -pt 'codex:0.1' -S -120"
         );
+    }
+
+    #[test]
+    fn shell_path_expands_remote_home() {
+        assert_eq!(shell_path("~/work/repo"), "$HOME/'work/repo'");
+        assert_eq!(shell_path("/tmp/repo"), "'/tmp/repo'");
     }
 }

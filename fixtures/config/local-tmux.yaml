@@ -1,0 +1,11 @@
+hosts:
+  - id: local
+    type: local
+
+sessions:
+  - id: remux-test
+    host: local
+    tmux:
+      session: remux-test
+      window: 0
+      pane: 0

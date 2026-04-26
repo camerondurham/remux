@@ -1,26 +1,11 @@
 use crate::config::HostConfig;
 use anyhow::{Context, Result, anyhow};
 use std::process::Command;
+use std::time::Duration;
 
-pub fn run(host: &HostConfig, remote_command: &str) -> Result<String> {
-    let ssh = host.ssh()?;
-    let target = ssh
-        .target()
-        .ok_or_else(|| anyhow!("host `{}` is missing ssh target", host.id))?;
-
-    let mut command = Command::new("ssh");
-    if let Some(config_file) = &ssh.config_file {
-        command.arg("-F").arg(config_file);
-    }
-    for (key, value) in ssh.ssh_options() {
-        command.arg("-o").arg(format!("{key}={value}"));
-    }
-    if let Some(port) = ssh.port {
-        command.arg("-p").arg(port.to_string());
-    }
-    command.arg(target).arg(remote_command);
-
-    let output = command
+pub fn run(host: &HostConfig, remote_command: &str, default_timeout: Duration) -> Result<String> {
+    let output = base_command(host, default_timeout, false)?
+        .arg(remote_command)
         .output()
         .with_context(|| format!("failed to start ssh for host `{}`", host.id))?;
 
@@ -34,17 +19,63 @@ pub fn run(host: &HostConfig, remote_command: &str) -> Result<String> {
         return Err(anyhow!(
             "failed to run remote command on host `{}`: {message}\nhint: verify `ssh {}` works non-interactively",
             host.id,
-            ssh.target().unwrap_or_else(|| "<target>".to_string())
+            host.ssh()?
+                .target()
+                .unwrap_or_else(|| "<target>".to_string())
         ));
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+pub fn run_interactive(
+    host: &HostConfig,
+    remote_command: &str,
+    default_timeout: Duration,
+) -> Result<()> {
+    let status = base_command(host, default_timeout, true)?
+        .arg(remote_command)
+        .status()
+        .with_context(|| format!("failed to start interactive ssh for host `{}`", host.id))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "interactive ssh for host `{}` exited with status {status}",
+            host.id
+        ))
+    }
+}
+
+fn base_command(host: &HostConfig, default_timeout: Duration, tty: bool) -> Result<Command> {
+    let ssh = host.ssh()?;
+    let target = ssh
+        .target()
+        .ok_or_else(|| anyhow!("host `{}` is missing ssh target", host.id))?;
+
+    let mut command = Command::new("ssh");
+    if let Some(config_file) = &ssh.config_file {
+        command.arg("-F").arg(config_file);
+    }
+    for (key, value) in ssh.ssh_options(default_timeout) {
+        command.arg("-o").arg(format!("{key}={value}"));
+    }
+    if let Some(port) = ssh.port {
+        command.arg("-p").arg(port.to_string());
+    }
+    if tty {
+        command.arg("-t");
+    }
+    command.arg(target);
+    Ok(command)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::config::{HostConfig, HostKind, SshConfig};
     use std::collections::BTreeMap;
+    use std::time::Duration;
 
     #[test]
     fn ssh_options_default_to_non_interactive_timeout() {
@@ -61,7 +92,7 @@ mod tests {
             }),
         };
 
-        let options = host.ssh.unwrap().ssh_options();
+        let options = host.ssh.unwrap().ssh_options(Duration::from_secs(5));
         assert_eq!(options.get("BatchMode").unwrap(), "yes");
         assert_eq!(options.get("ConnectTimeout").unwrap(), "5");
     }

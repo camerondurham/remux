@@ -1,0 +1,8 @@
+hosts:
+  - id: local
+    type: local
+sessions:
+  - id: agent
+    host: missing
+    tmux:
+      session: one

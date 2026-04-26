@@ -1,5 +1,10 @@
+mod attach;
+mod cache;
 mod cli;
 mod config;
+mod git;
+mod host;
+mod local;
 mod render;
 mod snapshot;
 mod ssh;
@@ -24,18 +29,26 @@ fn run() -> Result<()> {
         Command::Hosts => render::hosts(&config),
         Command::Snapshot { host, json } => {
             let snapshot = snapshot::snapshot_host(&config, &host)?;
-            render::snapshot(&snapshot, json)
+            let unreachable = matches!(&snapshot.status, snapshot::SnapshotStatus::Unreachable);
+            render::snapshot(&snapshot, json)?;
+            if unreachable {
+                anyhow::bail!("failed to poll host `{host}`")
+            }
+            Ok(())
         }
-        Command::Inspect { pane_target, json } => {
-            let target = tmux::PaneTarget::parse(&pane_target)?;
-            let detail = snapshot::inspect_pane(&config, &target)?;
+        Command::List { json } => {
+            let snapshots = snapshot::snapshot_all(&config)?;
+            render::list(&snapshots, json)
+        }
+        Command::Inspect { id, json } => {
+            let detail = snapshot::inspect(&config, &id)?;
             render::inspect(&detail, json)
         }
-        Command::Capture { pane_target, lines } => {
-            let target = tmux::PaneTarget::parse(&pane_target)?;
-            let output = snapshot::capture_pane(&config, &target, lines)?;
+        Command::Capture { id, lines } => {
+            let output = snapshot::capture(&config, &id, lines)?;
             print!("{output}");
             Ok(())
         }
+        Command::Attach { readonly, id } => attach::attach(&config, &id, readonly),
     }
 }
