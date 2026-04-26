@@ -4,6 +4,11 @@
 
 It is intentionally factual: it inventories tmux panes, captures recent visible output, shows configured repo metadata, and gives you a reliable jump target. It does not summarize, score, orchestrate, or run arbitrary remote commands.
 
+## Demo
+
+https://github.com/user-attachments/assets/7f6a95a3-522d-4037-9db0-697b388cd6d8
+
+
 ## Quick Start
 
 Create a config:
