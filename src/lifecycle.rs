@@ -45,12 +45,7 @@ pub fn new_session(
 pub fn kill(config: &Config, target: &str, yes: bool, verbose: bool) -> Result<()> {
     let target = resolve_kill_target(config, target)?;
     confirm_kill(&target, yes)?;
-    let (host_id, command) = match &target {
-        KillTarget::Session { host, session } => {
-            (host.as_str(), tmux::kill_session_command(session))
-        }
-        KillTarget::Pane(target) => (target.host.as_str(), tmux::kill_pane_command(target)),
-    };
+    let (host_id, command) = target.command();
     run_lifecycle_command(config, host_id, &command, verbose)
 }
 
@@ -107,8 +102,12 @@ fn resolve_live_pane(config: &Config, target: PaneTarget) -> Result<PaneTarget> 
 }
 
 fn resolve_live_session(config: &Config, host: &str, session: &str) -> Result<KillTarget> {
-    let snapshot = snapshot::snapshot_host(config, host)
-        .with_context(|| format!("failed to resolve session `{host}/{session}`"))?;
+    let snapshot = snapshot::snapshot_host(config, host).map_err(|err| {
+        ExitFailure::new(
+            3,
+            format!("session `{host}/{session}` could not be resolved: {err:#}"),
+        )
+    })?;
     let found = snapshot
         .sessions
         .iter()
@@ -167,6 +166,13 @@ fn run_lifecycle_command(
 }
 
 impl KillTarget {
+    fn command(&self) -> (&str, String) {
+        match self {
+            KillTarget::Session { host, session } => (host, tmux::kill_session_command(session)),
+            KillTarget::Pane(target) => (&target.host, tmux::kill_pane_command(target)),
+        }
+    }
+
     fn display(&self) -> String {
         match self {
             KillTarget::Session { host, session } => format!("{host}/{session}"),

@@ -266,7 +266,7 @@ fn print_snapshot_errors(snapshot: &HostSnapshot) {
     }
 }
 
-fn warn_snapshot_errors(snapshots: &[HostSnapshot]) {
+pub fn warn_snapshot_errors(snapshots: &[HostSnapshot]) {
     for snapshot in snapshots {
         for error in &snapshot.errors {
             eprintln!(

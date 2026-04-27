@@ -55,19 +55,12 @@ fn run() -> Result<()> {
             let snapshots = snapshot::snapshot_all(&config)?;
             match group {
                 ListGroup::Panes => render::list(&snapshots, json),
-                ListGroup::Sessions => {
-                    let rollups = sessions::rollups_from_snapshots(&snapshots);
-                    render::sessions(&rollups, json)
-                }
+                ListGroup::Sessions => render_session_rollups(&snapshots, json),
             }
         }
         Command::Sessions { host, json } => {
-            let snapshots = match host {
-                Some(host) => vec![snapshot::snapshot_host(&config, &host)?],
-                None => snapshot::snapshot_all(&config)?,
-            };
-            let rollups = sessions::rollups_from_snapshots(&snapshots);
-            render::sessions(&rollups, json)
+            let snapshots = snapshot::snapshot_selected(&config, host.as_deref())?;
+            render_session_rollups(&snapshots, json)
         }
         Command::Pick {
             host,
@@ -112,4 +105,13 @@ fn run() -> Result<()> {
         ),
         Command::Kill { target, yes } => lifecycle::kill(&config, &target, yes, verbose),
     }
+}
+
+fn render_session_rollups(snapshots: &[snapshot::HostSnapshot], json: bool) -> Result<()> {
+    let rollups = sessions::rollups_from_snapshots(snapshots);
+    render::sessions(&rollups, json)?;
+    if !json {
+        render::warn_snapshot_errors(snapshots);
+    }
+    Ok(())
 }

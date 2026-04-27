@@ -22,6 +22,7 @@ struct RollupBuilder {
     session: String,
     target: Option<String>,
     windows: BTreeSet<String>,
+    pane_targets: BTreeSet<String>,
     panes: usize,
     attached: bool,
     state: Option<SessionState>,
@@ -56,6 +57,13 @@ pub fn rollups_from_snapshots(snapshots: &[HostSnapshot]) -> Vec<SessionRollup> 
 
 impl RollupBuilder {
     fn push(&mut self, row: &SessionSnapshot) {
+        let Some(raw_target) = &row.raw_target else {
+            return;
+        };
+        if !self.pane_targets.insert(raw_target.clone()) {
+            return;
+        }
+
         if self.target.is_none() || is_more_active(row.state, self.state.unwrap_or(row.state)) {
             self.target = row.raw_target.clone();
             self.active_cmd = row.process.as_ref().map(|process| process.command.clone());

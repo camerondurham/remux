@@ -32,10 +32,7 @@ pub fn run(config: &Config, config_path: Option<&Path>, options: PickOptions) ->
 }
 
 fn picker_rows(config: &Config, host: Option<&str>, sessions_mode: bool) -> Result<Vec<String>> {
-    let snapshots = match host {
-        Some(host) => vec![snapshot::snapshot_host(config, host)?],
-        None => snapshot::snapshot_all(config)?,
-    };
+    let snapshots = snapshot::snapshot_selected(config, host)?;
 
     if sessions_mode {
         return Ok(sessions::rollups_from_snapshots(&snapshots)
@@ -117,10 +114,9 @@ fn fzf_missing() -> Result<bool> {
 }
 
 fn print_fzf_remediation() {
-    eprintln!("fzf is not available; install it with one of:");
-    eprintln!("  macOS:  brew install fzf");
-    eprintln!("  Debian: sudo apt-get install fzf");
-    eprintln!("  Arch:   sudo pacman -S fzf");
+    eprintln!(
+        "fzf is not available; install it with one of:\n  macOS:  brew install fzf\n  Debian: sudo apt-get install fzf\n  Arch:   sudo pacman -S fzf"
+    );
 }
 
 fn print_rows(rows: &[String]) -> Result<()> {

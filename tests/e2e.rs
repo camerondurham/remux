@@ -178,6 +178,41 @@ fn lifecycle_new_and_kill_route_to_tmux_commands() {
 
     let kill_session = env.remux(["--config", env.config_path(), "kill", "pi/scratch", "--yes"]);
     assert_success(&kill_session);
+
+    let missing_host = env.remux([
+        "--config",
+        env.config_path(),
+        "kill",
+        "missing/work",
+        "--yes",
+    ]);
+    assert_code(&missing_host, 3);
+    assert!(stderr(&missing_host).contains("could not be resolved"));
+}
+
+#[test]
+fn session_grouped_list_warns_about_unreachable_hosts() {
+    let env = TestEnv::new();
+    env.write_config(
+        r#"
+poll:
+  capture_lines: 2
+hosts:
+  - id: pi
+    type: ssh
+    ssh:
+      target: fake-pi
+  - id: bad
+    type: ssh
+    ssh:
+      target: fake-bad
+"#,
+    );
+
+    let grouped = env.remux(["--config", env.config_path(), "list", "--group", "sessions"]);
+    assert_success(&grouped);
+    assert!(stdout(&grouped).contains("work"));
+    assert!(stderr(&grouped).contains("warning: bad: poll"));
 }
 
 #[test]
@@ -362,6 +397,17 @@ watches:
         "codex-live",
     ]);
     assert_success(&attach);
+
+    let rollups = env.remux(["--config", env.config_path(), "sessions", "--json"]);
+    assert_success(&rollups);
+    let rollups: Value = serde_json::from_str(&stdout(&rollups)).unwrap();
+    let work = rollups
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["session"] == "work")
+        .unwrap();
+    assert_eq!(work["panes"], 2);
 }
 
 struct TestEnv {

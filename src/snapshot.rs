@@ -173,6 +173,13 @@ pub fn snapshot_all(config: &Config) -> Result<Vec<HostSnapshot>> {
     Ok(snapshots)
 }
 
+pub fn snapshot_selected(config: &Config, host: Option<&str>) -> Result<Vec<HostSnapshot>> {
+    match host {
+        Some(host) => Ok(vec![snapshot_host(config, host)?]),
+        None => snapshot_all(config),
+    }
+}
+
 pub fn inspect(config: &Config, id_or_target: &str) -> Result<PaneDetail> {
     inspect_with_color(config, id_or_target, false)
 }
