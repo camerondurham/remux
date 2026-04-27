@@ -31,6 +31,7 @@ When running multiple coding agents or long-running tasks in tmux across local a
 ## Requirements
 
 - tmux on each monitored host
+- fzf only for `remux pick`
 - ssh for remote hosts
 - git only if repo metadata is configured
 - Rust only when building from source
@@ -50,6 +51,8 @@ Edit `~/.config/remux/config.yaml`, then run:
 ```bash
 remux hosts
 remux list
+remux sessions
+remux pick
 remux attach --readonly pi-agent
 remux attach pi-agent
 remux tui
@@ -60,9 +63,11 @@ Useful commands:
 ```bash
 remux snapshot <host> [--json]
 remux inspect <watch-id-or-pane-target> [--json]
-remux capture <watch-id-or-pane-target> [--lines N]
+remux capture <watch-id-or-pane-target> [--lines N] [--color]
 remux attach --readonly <watch-id-or-pane-target>
 remux attach <watch-id-or-pane-target>
+remux new <host> <session-name> [--cwd PATH] [--window-name NAME]
+remux kill <watch-id-or-pane-target> --yes
 ```
 
 Pane targets look like:
@@ -121,11 +126,15 @@ Legacy `sessions` entries are still accepted as exact tmux-coordinate watches.
 ```bash
 remux hosts
 remux snapshot <host> [--json]
-remux list [--json]
-remux inspect <watch-id-or-pane-target> [--json]
-remux capture <watch-id-or-pane-target> [--lines N]
+remux list [--json] [--group panes|sessions]
+remux sessions [--host HOST] [--json]
+remux pick [--host HOST] [--filter TEXT] [--sessions] [--color] [--no-fzf]
+remux inspect <watch-id-or-pane-target> [--json] [--color]
+remux capture <watch-id-or-pane-target> [--lines N] [--color]
 remux attach --readonly <watch-id-or-pane-target>
 remux attach <watch-id-or-pane-target>
+remux new <host> <session-name> [--cwd PATH] [--window-name NAME]
+remux kill <watch-id-or-pane-target> [--yes]
 remux tui [--host HOST] [--filter TEXT]
 ```
 
@@ -133,12 +142,14 @@ Aliases:
 
 ```bash
 remux ls
+remux p
 remux i <watch-id-or-pane-target>
 remux a [--readonly] <watch-id-or-pane-target>
 ```
 
 `attach --readonly` is a peek. `attach` without `--readonly` is an explicit
-read-write jump.
+read-write jump. `pick` uses fzf when available; without fzf, `pick --no-fzf`
+prints the same tab-separated rows and exits `2`.
 
 ## Status Semantics
 
@@ -191,16 +202,20 @@ SSH polling defaults to `BatchMode=yes`, `ConnectTimeout=<poll.ssh_timeout>`, an
 
 Attach is always explicit. `remux attach --readonly ...` uses `tmux attach-session -r`; read-write attach only happens when requested.
 
+Lifecycle commands are explicit mutations. `remux new` creates a detached tmux
+session. `remux kill` kills a resolved session or pane, requires confirmation on
+a TTY, and requires `--yes` from non-interactive scripts.
+
 ## TUI Keys
 
 ```text
-enter readonly attach | a read-write jump | r refresh | / filter | c capture | i inspect | q quit
+enter readonly attach | a read-write jump | r refresh | / filter | c capture | i inspect | k kill | q quit
 ```
 
 Passive discovery commands stay read-only: `hosts`, `list`, `snapshot`,
 `inspect`, `capture`, and TUI polling do not enter a remote session. Read-write
 attach only happens from intentional CLI attach/jump actions or the TUI `a`
-key.
+key. Kill only happens from `remux kill` or a confirmed TUI `k` prompt.
 
 ## Development
 

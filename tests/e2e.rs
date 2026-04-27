@@ -81,6 +81,18 @@ fn ssh_tracer_bullet_works_end_to_end() {
     assert_success(&capture);
     assert_eq!(stdout(&capture), "line one\nhello-remux\n");
 
+    let color_capture = env.remux([
+        "--config",
+        env.config_path(),
+        "capture",
+        "codex-agent",
+        "--lines",
+        "2",
+        "--color",
+    ]);
+    assert_success(&color_capture);
+    assert!(stdout(&color_capture).contains("\x1b[31mhello-remux\x1b[0m"));
+
     let attach = env.remux([
         "--config",
         env.config_path(),
@@ -92,6 +104,80 @@ fn ssh_tracer_bullet_works_end_to_end() {
 
     let jump = env.remux(["--config", env.config_path(), "attach", "codex-agent"]);
     assert_success(&jump);
+}
+
+#[test]
+fn sessions_roll_up_panes_by_tmux_session() {
+    let env = TestEnv::new();
+
+    let sessions = env.remux(["--config", env.config_path(), "sessions", "--json"]);
+    assert_success(&sessions);
+    let sessions: Value = serde_json::from_str(&stdout(&sessions)).unwrap();
+    let sessions = sessions.as_array().unwrap();
+    let work = sessions
+        .iter()
+        .find(|session| session["session"] == "work")
+        .unwrap();
+    assert_eq!(work["host"], "pi");
+    assert_eq!(work["windows"], 1);
+    assert_eq!(work["panes"], 2);
+    assert_eq!(work["attached"], true);
+    assert_eq!(work["match_status"], "matched");
+
+    let grouped = env.remux(["--config", env.config_path(), "list", "--group", "sessions"]);
+    assert_success(&grouped);
+    assert!(stdout(&grouped).contains("work"));
+}
+
+#[test]
+fn picker_no_fzf_falls_back_to_rows_and_exit_two() {
+    let env = TestEnv::new();
+
+    let pick = env.remux(["--config", env.config_path(), "pick", "--no-fzf"]);
+    assert_code(&pick, 2);
+    assert!(stderr(&pick).contains("fzf is not available"));
+    let first_row = stdout(&pick).lines().next().unwrap().to_string();
+    let first_target = first_row.split('\t').next().unwrap();
+    assert!(first_target.starts_with("pi/"));
+    assert!(first_target.contains(':'));
+}
+
+#[test]
+fn lifecycle_new_and_kill_route_to_tmux_commands() {
+    let env = TestEnv::new();
+
+    let create = env.remux([
+        "--config",
+        env.config_path(),
+        "new",
+        "pi",
+        "new-work",
+        "--cwd",
+        "/tmp/new-work",
+        "--window-name",
+        "main",
+    ]);
+    assert_success(&create);
+
+    let duplicate = env.remux(["--config", env.config_path(), "new", "pi", "work"]);
+    assert_code(&duplicate, 2);
+    assert!(stderr(&duplicate).contains("already exists"));
+
+    let refuse = env.remux(["--config", env.config_path(), "kill", "pi/work:0.1"]);
+    assert_code(&refuse, 2);
+    assert!(stderr(&refuse).contains("without --yes"));
+
+    let kill_pane = env.remux([
+        "--config",
+        env.config_path(),
+        "kill",
+        "pi/work:0.1",
+        "--yes",
+    ]);
+    assert_success(&kill_pane);
+
+    let kill_session = env.remux(["--config", env.config_path(), "kill", "pi/scratch", "--yes"]);
+    assert_success(&kill_session);
 }
 
 #[test]
@@ -389,9 +475,14 @@ fi
 remote="${@: -1}"
 
 if [[ "$remote" == tmux\ list-panes* ]]; then
-  printf 'work\t0\t1\t%%3\t1234\tnode\t/home/cam/work\n'
-  printf 'work\t0\t2\t%%5\t1235\tnode\t/home/cam/work/sub\n'
-  printf 'scratch\t2\t0\t%%4\t2222\tbash\t/tmp\n'
+  printf 'work\t0\t1\t%%3\t1234\tnode\t/home/cam/work\t1\n'
+  printf 'work\t0\t2\t%%5\t1235\tnode\t/home/cam/work/sub\t1\n'
+  printf 'scratch\t2\t0\t%%4\t2222\tbash\t/tmp\t0\n'
+  exit 0
+fi
+
+if [[ "$remote" == "tmux capture-pane -e -pt 'work:0.1' -S -"* ]]; then
+  printf 'line one\n\x1b[31mhello-remux\x1b[0m\n'
   exit 0
 fi
 
@@ -436,6 +527,18 @@ if [[ "$remote" == "tmux attach-session -t 'work' \\; select-window -t '0' \\; s
   exit 0
 fi
 
+if [[ "$remote" == "tmux new-session -d -s 'new-work' -c '/tmp/new-work' -n 'main'" ]]; then
+  exit 0
+fi
+
+if [[ "$remote" == "tmux kill-pane -t 'work:0.1'" ]]; then
+  exit 0
+fi
+
+if [[ "$remote" == "tmux kill-session -t 'scratch'" ]]; then
+  exit 0
+fi
+
 echo "unexpected remote command: $remote" >&2
 exit 43
 "#
@@ -446,8 +549,8 @@ fn fake_tmux_script() -> &'static str {
 set -euo pipefail
 
 if [[ "${1:-}" == "list-panes" ]]; then
-  printf 'local\t0\t0\t%%7\t4321\tbash\t/tmp/local\n'
-  printf 'broken\t0\t0\t%%8\t5555\tbash\t/tmp/broken\n'
+  printf 'local\t0\t0\t%%7\t4321\tbash\t/tmp/local\t0\n'
+  printf 'broken\t0\t0\t%%8\t5555\tbash\t/tmp/broken\t0\n'
   exit 0
 fi
 
@@ -503,6 +606,17 @@ fn assert_failure(output: &Output) {
     assert!(
         !output.status.success(),
         "command unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        stdout(output),
+        stderr(output)
+    );
+}
+
+fn assert_code(output: &Output, code: i32) {
+    assert_eq!(
+        output.status.code(),
+        Some(code),
+        "unexpected exit code\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
         stdout(output),
         stderr(output)
     );
