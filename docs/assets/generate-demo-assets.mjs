@@ -39,7 +39,7 @@ const rows = [
     "codex",
     "remux",
     "1",
-    "updated pane preview and footer",
+    "added picker and lifecycle commands",
   ],
   ["local", "local-build", "matched", "active", "cargo", "remux", "1", "Finished dev profile"],
   ["local", "local/ops:1.0", "orphan", "active", "bash", "-", "-", "last deploy succeeded"],
@@ -261,15 +261,15 @@ function detailData(kind) {
     command: "codex",
     cwd: "/home/nixos/remux",
     repo: "/home/nixos/remux",
-    branch: "feature/public-readiness-tui-polish",
+    branch: "spec/picker-lifecycle-sessions",
     dirty: "1",
     output: [
-      "codex check --locked",
-      "reading src/tui.rs",
-      "updated pane preview and footer",
+      "just ci",
+      "reviewing src/lifecycle.rs",
+      "added picker and lifecycle commands",
       "",
       "Changed files (1)",
-      " M src/tui.rs",
+      " M src/lifecycle.rs",
     ],
   };
 }
@@ -387,7 +387,7 @@ function drawDetailPane(kind) {
     yy += 20;
   }
 
-  output += text(rightX, y + h - 22, `enter attach readonly | c capture | i inspect ${detail.id}`, {
+  output += text(rightX, y + h - 22, `enter readonly | a jump | k kill | c capture | i inspect ${detail.id}`, {
     color: palette.muted,
     size: 15,
     weight: 700,
@@ -399,11 +399,13 @@ function drawDetailPane(kind) {
 function drawFooter(status, filter = "-") {
   let output = rect(0, 710, width, 50, { fill: palette.footerBg });
   const keys = [
-    ["enter", " attach | "],
+    ["enter", " readonly | "],
+    ["a", " jump | "],
     ["r", " refresh | "],
     ["/", " filter | "],
     ["c", " capture | "],
     ["i", " inspect | "],
+    ["k", " kill | "],
     ["q", " quit"],
   ];
 
@@ -411,17 +413,17 @@ function drawFooter(status, filter = "-") {
   for (const [key, label] of keys) {
     output += text(x, 738, key, {
       color: palette.active,
-      size: 16,
+      size: 15,
       weight: 700,
     });
-    x += key.length * 9.8;
-    output += text(x, 738, label, { color: palette.text, size: 16 });
-    x += label.length * 9.2;
+    x += key.length * 10 + 5;
+    output += text(x, 738, label, { color: palette.text, size: 15 });
+    x += label.length * 8.3;
   }
-  output += text(680, 738, status, { color: palette.text, size: 16 });
-  output += text(1100, 738, `filter: ${filter}`, {
+  output += text(840, 738, status, { color: palette.text, size: 15 });
+  output += text(1160, 738, `filter: ${filter}`, {
     color: palette.text,
-    size: 16,
+    size: 15,
   });
   return output;
 }
@@ -449,7 +451,7 @@ async function writeSources() {
     selectedId: "local-codex",
     summary: summaryAll,
     detail: "local",
-    status: "ready | scan complete: 3/3 hosts | elapsed 287ms",
+    status: "ready | scan complete: 3/3 hosts",
   });
   await writeFile(join(workDir, "remux-tui.svg"), screenshot);
 
