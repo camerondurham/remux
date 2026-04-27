@@ -1,5 +1,6 @@
 use crate::attach;
 use crate::config::Config;
+use crate::lifecycle;
 use crate::snapshot::{
     self, HostSnapshot, MatchStatus, PaneDetail, SessionSnapshot, SessionState, SnapshotError,
     SnapshotStatus,
@@ -107,7 +108,12 @@ struct App {
     captured_output: Option<String>,
     inspected_for: Option<String>,
     inspected_detail: Option<PaneDetail>,
+    kill_prompt: Option<KillPrompt>,
     last_refresh: Option<Instant>,
+}
+
+struct KillPrompt {
+    target: String,
 }
 
 #[derive(Clone)]
@@ -156,6 +162,7 @@ impl App {
             captured_output: None,
             inspected_for: None,
             inspected_detail: None,
+            kill_prompt: None,
             last_refresh: None,
         }
     }
@@ -487,6 +494,26 @@ fn handle_key(
         return Ok(true);
     }
 
+    if app.kill_prompt.is_some() {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let prompt = app.kill_prompt.take().expect("prompt exists");
+                match lifecycle::kill(config, &prompt.target, true, false) {
+                    Ok(()) => {
+                        app.status = format!("killed {}", prompt.target);
+                        spawn_refresh(config, host, tx, app)?;
+                    }
+                    Err(err) => app.status = format!("{err:#}"),
+                }
+            }
+            _ => {
+                app.kill_prompt = None;
+                app.status = "kill cancelled".to_string();
+            }
+        }
+        return Ok(false);
+    }
+
     if app.editing_filter {
         match key.code {
             KeyCode::Esc | KeyCode::Enter => app.editing_filter = false,
@@ -524,8 +551,12 @@ fn handle_key(
             }
             Ok(false)
         }
-        KeyCode::Up | KeyCode::Char('k') => {
+        KeyCode::Up => {
             app.selected = app.selected.saturating_sub(1);
+            Ok(false)
+        }
+        KeyCode::Char('k') => {
+            begin_kill_prompt(config, app)?;
             Ok(false)
         }
         KeyCode::Enter => {
@@ -546,6 +577,35 @@ fn handle_key(
         }
         _ => Ok(false),
     }
+}
+
+fn begin_kill_prompt(config: &Config, app: &mut App) -> Result<()> {
+    let Some(row) = app.selected_row() else {
+        app.status = "no selected row".to_string();
+        return Ok(());
+    };
+    if let Some(reason) = attach_refusal_reason(row) {
+        app.status = format!("selected row cannot be killed: {reason}");
+        return Ok(());
+    }
+
+    let target = if let Some(watch_id) = &row.watch_id {
+        match snapshot::target_for_action(config, watch_id, "kill") {
+            Ok(target) => target.to_string(),
+            Err(err) => {
+                app.status = format!("{err:#}");
+                return Ok(());
+            }
+        }
+    } else if let Some(raw_target) = &row.raw_target {
+        raw_target.clone()
+    } else {
+        app.status = "selected row has no live kill target".to_string();
+        return Ok(());
+    };
+
+    app.kill_prompt = Some(KillPrompt { target });
+    Ok(())
 }
 
 fn attach_selected(
@@ -583,7 +643,7 @@ fn capture_selected(config: &Config, app: &mut App) -> Result<()> {
     };
     let display_id = row.display_id.clone();
     let target = PaneTarget::parse(raw_target)?;
-    match snapshot::capture_pane(config, &target, config.poll.capture_lines) {
+    match snapshot::capture_pane(config, &target, config.poll.capture_lines, false) {
         Ok(output) => {
             app.captured_for = Some(display_id);
             app.captured_output = Some(output);
@@ -838,13 +898,14 @@ fn draw_detail(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     if app.help {
         let text = Text::from(vec![
             Line::from("j/down select next"),
-            Line::from("k/up select previous"),
+            Line::from("up select previous"),
             Line::from("r refresh now"),
             Line::from("/ filter"),
             Line::from("enter readonly attach"),
             Line::from("a read-write jump"),
             Line::from("c capture into detail"),
             Line::from("i inspect and refresh detail"),
+            Line::from("k kill selected pane"),
             Line::from("q quit"),
         ]);
         frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
@@ -904,6 +965,17 @@ fn draw_detail(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    if let Some(prompt) = &app.kill_prompt {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("confirm ", Style::default().fg(Color::Yellow)),
+                Span::raw(format!("kill {}? (y/N)", prompt.target)),
+            ])),
+            area,
+        );
+        return;
+    }
+
     let mode = if app.editing_filter {
         "filter"
     } else if app.polling {
@@ -924,6 +996,8 @@ fn draw_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         Span::raw(" capture | "),
         key_span("i"),
         Span::raw(" inspect | "),
+        key_span("k"),
+        Span::raw(" kill | "),
         key_span("q"),
         Span::raw(" quit"),
         Span::raw("   "),

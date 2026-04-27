@@ -1,0 +1,182 @@
+use crate::config::{Config, HostKind};
+use crate::exit::ExitFailure;
+use crate::host;
+use crate::snapshot::{self, MatchStatus};
+use crate::tmux::{self, PaneTarget};
+use anyhow::{Context, Result};
+use std::io::{self, IsTerminal, Write};
+
+enum KillTarget {
+    Session { host: String, session: String },
+    Pane(PaneTarget),
+}
+
+pub fn new_session(
+    config: &Config,
+    host_id: &str,
+    session_name: &str,
+    cwd: Option<&str>,
+    window_name: Option<&str>,
+    verbose: bool,
+) -> Result<()> {
+    config.host(host_id)?;
+    let snapshot = snapshot::snapshot_host(config, host_id)?;
+    if snapshot.sessions.iter().any(|row| {
+        row.raw_target.is_some()
+            && row.host == host_id
+            && row.tmux.session == session_name
+            && !matches!(
+                row.match_status,
+                MatchStatus::Missing | MatchStatus::Unreachable
+            )
+    }) {
+        return Err(ExitFailure::new(
+            2,
+            format!("session `{host_id}/{session_name}` already exists"),
+        )
+        .into());
+    }
+
+    let command = tmux::new_session_command(session_name, cwd, window_name);
+    run_lifecycle_command(config, host_id, &command, verbose)
+        .with_context(|| format!("failed to create session `{host_id}/{session_name}`"))
+}
+
+pub fn kill(config: &Config, target: &str, yes: bool, verbose: bool) -> Result<()> {
+    let target = resolve_kill_target(config, target)?;
+    confirm_kill(&target, yes)?;
+    let (host_id, command) = target.command();
+    run_lifecycle_command(config, host_id, &command, verbose)
+}
+
+fn resolve_kill_target(config: &Config, target: &str) -> Result<KillTarget> {
+    if config.find_watch(target).is_some() {
+        return snapshot::target_for_action(config, target, "kill")
+            .map(KillTarget::Pane)
+            .map_err(|err| {
+                ExitFailure::new(3, format!("cannot kill watch `{target}`: {err:#}")).into()
+            });
+    }
+
+    if let Ok(pane) = PaneTarget::parse(target) {
+        let resolved = resolve_live_pane(config, pane)?;
+        return Ok(KillTarget::Pane(resolved));
+    }
+
+    if let Some((host, session)) = parse_session_target(target) {
+        let session = resolve_live_session(config, host, session)?;
+        return Ok(session);
+    }
+
+    Err(ExitFailure::new(
+        3,
+        format!("target `{target}` was not found or is ambiguous"),
+    )
+    .into())
+}
+
+fn resolve_live_pane(config: &Config, target: PaneTarget) -> Result<PaneTarget> {
+    let snapshot = snapshot::snapshot_host(config, &target.host)?;
+    let target_string = target.to_string();
+    let row = snapshot
+        .sessions
+        .into_iter()
+        .find(|row| row.raw_target.as_deref() == Some(target_string.as_str()))
+        .ok_or_else(|| {
+            ExitFailure::new(
+                3,
+                format!("pane `{target_string}` was not found in latest snapshot"),
+            )
+        })?;
+    Ok(PaneTarget {
+        host: row.host,
+        session: row.tmux.session,
+        window: row.tmux.window.ok_or_else(|| {
+            ExitFailure::new(3, format!("pane `{target_string}` has no resolved window"))
+        })?,
+        pane: row.tmux.pane.ok_or_else(|| {
+            ExitFailure::new(3, format!("pane `{target_string}` has no resolved pane"))
+        })?,
+        pane_id: row.tmux.pane_id,
+    })
+}
+
+fn resolve_live_session(config: &Config, host: &str, session: &str) -> Result<KillTarget> {
+    let snapshot = snapshot::snapshot_host(config, host).map_err(|err| {
+        ExitFailure::new(
+            3,
+            format!("session `{host}/{session}` could not be resolved: {err:#}"),
+        )
+    })?;
+    let found = snapshot
+        .sessions
+        .iter()
+        .any(|row| row.raw_target.is_some() && row.tmux.session == session);
+    if found {
+        Ok(KillTarget::Session {
+            host: host.to_string(),
+            session: session.to_string(),
+        })
+    } else {
+        Err(ExitFailure::new(3, format!("session `{host}/{session}` was not found")).into())
+    }
+}
+
+fn parse_session_target(target: &str) -> Option<(&str, &str)> {
+    let (host, session) = target.split_once('/')?;
+    if host.is_empty() || session.is_empty() || session.contains(':') {
+        return None;
+    }
+    Some((host, session))
+}
+
+fn confirm_kill(target: &KillTarget, yes: bool) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+    if !io::stdin().is_terminal() {
+        return Err(ExitFailure::new(2, "refusing to kill without --yes on non-TTY stdin").into());
+    }
+
+    eprint!("kill {}? [y/N] ", target.display());
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if matches!(answer.trim(), "y" | "Y") {
+        Ok(())
+    } else {
+        Err(ExitFailure::new(2, "kill cancelled").into())
+    }
+}
+
+fn run_lifecycle_command(
+    config: &Config,
+    host_id: &str,
+    command: &str,
+    verbose: bool,
+) -> Result<()> {
+    let host_config = config.host(host_id)?;
+    if verbose {
+        match host_config.kind {
+            HostKind::Local => eprintln!("{command}"),
+            HostKind::Ssh => eprintln!("ssh {} -- {command}", host_id),
+        }
+    }
+    host::run(config, host_config, command).map(|_| ())
+}
+
+impl KillTarget {
+    fn command(&self) -> (&str, String) {
+        match self {
+            KillTarget::Session { host, session } => (host, tmux::kill_session_command(session)),
+            KillTarget::Pane(target) => (&target.host, tmux::kill_pane_command(target)),
+        }
+    }
+
+    fn display(&self) -> String {
+        match self {
+            KillTarget::Session { host, session } => format!("{host}/{session}"),
+            KillTarget::Pane(target) => target.to_string(),
+        }
+    }
+}

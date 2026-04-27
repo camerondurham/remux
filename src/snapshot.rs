@@ -103,6 +103,7 @@ pub struct TmuxSnapshot {
     pub window: Option<String>,
     pub pane: Option<String>,
     pub pane_id: Option<String>,
+    pub session_attached: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -172,31 +173,47 @@ pub fn snapshot_all(config: &Config) -> Result<Vec<HostSnapshot>> {
     Ok(snapshots)
 }
 
+pub fn snapshot_selected(config: &Config, host: Option<&str>) -> Result<Vec<HostSnapshot>> {
+    match host {
+        Some(host) => Ok(vec![snapshot_host(config, host)?]),
+        None => snapshot_all(config),
+    }
+}
+
 pub fn inspect(config: &Config, id_or_target: &str) -> Result<PaneDetail> {
+    inspect_with_color(config, id_or_target, false)
+}
+
+pub fn inspect_with_color(config: &Config, id_or_target: &str, color: bool) -> Result<PaneDetail> {
     if config.find_watch(id_or_target).is_some() {
-        return inspect_watch(config, id_or_target);
+        return inspect_watch(config, id_or_target, color);
     }
     if let Ok(target) = PaneTarget::parse(id_or_target) {
-        return inspect_target(config, &target);
+        return inspect_target(config, &target, color);
     }
 
     bail!("unknown watch or pane target `{id_or_target}`")
 }
 
-pub fn capture(config: &Config, id_or_target: &str, lines: usize) -> Result<String> {
+pub fn capture(config: &Config, id_or_target: &str, lines: usize, color: bool) -> Result<String> {
     if lines == 0 {
         bail!("capture lines must be greater than zero");
     }
     let target = target_for_action(config, id_or_target, "capture")?;
-    capture_pane(config, &target, lines)
+    capture_pane(config, &target, lines, color)
 }
 
-pub fn capture_pane(config: &Config, target: &PaneTarget, lines: usize) -> Result<String> {
+pub fn capture_pane(
+    config: &Config,
+    target: &PaneTarget,
+    lines: usize,
+    color: bool,
+) -> Result<String> {
     if lines == 0 {
         bail!("capture lines must be greater than zero");
     }
     let host_config = config.host(&target.host)?;
-    let command = tmux::capture_command(target, lines);
+    let command = tmux::capture_command(target, lines, color);
     host::run(config, host_config, &command)
 }
 
@@ -211,7 +228,7 @@ pub fn target_for_action(config: &Config, id_or_target: &str, action: &str) -> R
     bail!("unknown watch or pane target `{id_or_target}`")
 }
 
-fn inspect_watch(config: &Config, watch_id: &str) -> Result<PaneDetail> {
+fn inspect_watch(config: &Config, watch_id: &str, color: bool) -> Result<PaneDetail> {
     let watch = config.watch(watch_id)?;
     let cache_load = Cache::load_with_warning();
     let mut cache = cache_load.cache;
@@ -232,14 +249,14 @@ fn inspect_watch(config: &Config, watch_id: &str) -> Result<PaneDetail> {
     }
 
     let target = target_for_snapshot(&snapshot)?;
-    let recent_output = capture_for_inspect(config, &target, &mut snapshot)?;
+    let recent_output = capture_for_inspect(config, &target, &mut snapshot, color)?;
     Ok(PaneDetail {
         session: snapshot,
         recent_output,
     })
 }
 
-fn inspect_target(config: &Config, target: &PaneTarget) -> Result<PaneDetail> {
+fn inspect_target(config: &Config, target: &PaneTarget, color: bool) -> Result<PaneDetail> {
     let cache_load = Cache::load_with_warning();
     let mut cache = cache_load.cache;
     let mut host_snapshot = snapshot_host_with_cache(config, &target.host, &mut cache)?;
@@ -251,7 +268,7 @@ fn inspect_target(config: &Config, target: &PaneTarget) -> Result<PaneDetail> {
         .into_iter()
         .find(|snapshot| snapshot.raw_target.as_deref() == Some(target_string.as_str()))
         .ok_or_else(|| anyhow!("pane `{target}` was not found on host `{}`", target.host))?;
-    let recent_output = capture_for_inspect(config, target, &mut snapshot)?;
+    let recent_output = capture_for_inspect(config, target, &mut snapshot, color)?;
     Ok(PaneDetail {
         session: snapshot,
         recent_output,
@@ -478,36 +495,37 @@ fn snapshot_for_pane(
         .map(|watch| watch.watch.id.clone())
         .unwrap_or_else(|| pane.target.clone());
     let cache_key = format!("{}/{}", host_config.id, display_id);
-    let (state, output, errors) = match capture_pane(config, &target, config.poll.capture_lines) {
-        Ok(output) => {
-            let output_hash = hash(&output);
-            let (state, last_output_at) = cache.update_output(
-                &cache_key,
-                Some(pane.pane_id.clone()),
-                &output_hash,
-                now,
-                &config.poll,
-            );
-            (
-                state,
-                Some(OutputSnapshot {
-                    preview: preview(&output),
-                    recent: recent_preview(&output, 12),
-                    hash: output_hash,
-                    last_output_at,
-                }),
-                Vec::new(),
-            )
-        }
-        Err(err) => (
-            SessionState::Unknown,
-            None,
-            vec![SnapshotError {
-                kind: "capture".to_string(),
-                message: format!("{err:#}"),
-            }],
-        ),
-    };
+    let (state, output, errors) =
+        match capture_pane(config, &target, config.poll.capture_lines, false) {
+            Ok(output) => {
+                let output_hash = hash(&output);
+                let (state, last_output_at) = cache.update_output(
+                    &cache_key,
+                    Some(pane.pane_id.clone()),
+                    &output_hash,
+                    now,
+                    &config.poll,
+                );
+                (
+                    state,
+                    Some(OutputSnapshot {
+                        preview: preview(&output),
+                        recent: recent_preview(&output, 12),
+                        hash: output_hash,
+                        last_output_at,
+                    }),
+                    Vec::new(),
+                )
+            }
+            Err(err) => (
+                SessionState::Unknown,
+                None,
+                vec![SnapshotError {
+                    kind: "capture".to_string(),
+                    message: format!("{err:#}"),
+                }],
+            ),
+        };
 
     let configured_repo = row.watch.and_then(|watch| watch.watch.repo.as_deref());
     let repo = configured_repo
@@ -532,6 +550,7 @@ fn snapshot_for_pane(
             window: Some(pane.window.clone()),
             pane: Some(pane.pane.clone()),
             pane_id: Some(pane.pane_id.clone()),
+            session_attached: Some(pane.session_attached),
         },
         process: Some(ProcessSnapshot {
             pid: pane.pid,
@@ -612,6 +631,7 @@ fn watch_without_pane_snapshot(
                 .as_ref()
                 .and_then(|tmux| tmux.pane.map(|pane| pane.to_string())),
             pane_id: None,
+            session_attached: None,
         },
         process: None,
         repo: None,
@@ -739,8 +759,9 @@ fn capture_for_inspect(
     config: &Config,
     target: &PaneTarget,
     snapshot: &mut SessionSnapshot,
+    color: bool,
 ) -> Result<String> {
-    match capture_pane(config, target, config.poll.capture_lines) {
+    match capture_pane(config, target, config.poll.capture_lines, color) {
         Ok(output) => Ok(output),
         Err(err) => {
             let message = format!("{err:#}");
@@ -911,6 +932,7 @@ mod tests {
             pid: Some(1),
             command: command.to_string(),
             cwd: cwd.to_string(),
+            session_attached: false,
         }
     }
 }

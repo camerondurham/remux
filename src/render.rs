@@ -1,5 +1,6 @@
 use crate::cache::Cache;
 use crate::config::{Config, HostKind};
+use crate::sessions::SessionRollup;
 use crate::snapshot::{HostSnapshot, PaneDetail, SessionSnapshot, SnapshotStatus};
 use anyhow::Result;
 
@@ -125,6 +126,33 @@ pub fn list(snapshots: &[HostSnapshot], json: bool) -> Result<()> {
     Ok(())
 }
 
+pub fn sessions(sessions: &[SessionRollup], json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(sessions)?);
+        return Ok(());
+    }
+
+    println!(
+        "{:<12} {:<24} {:<7} {:<6} {:<8} {:<12} {:<9} {:<12} REPO",
+        "HOST", "SESSION", "WINDOWS", "PANES", "ATTACHED", "STATE", "MATCH", "ACTIVE CMD"
+    );
+    for session in sessions {
+        println!(
+            "{:<12} {:<24} {:<7} {:<6} {:<8} {:<12} {:<9} {:<12} {}",
+            session.host,
+            session.session,
+            session.windows,
+            session.panes,
+            session.attached,
+            session.state.as_str(),
+            session.match_status.as_str(),
+            session.active_cmd.as_deref().unwrap_or("-"),
+            session.repo.as_deref().map(basename).unwrap_or("-")
+        );
+    }
+    Ok(())
+}
+
 pub fn inspect(detail: &PaneDetail, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(detail)?);
@@ -238,7 +266,7 @@ fn print_snapshot_errors(snapshot: &HostSnapshot) {
     }
 }
 
-fn warn_snapshot_errors(snapshots: &[HostSnapshot]) {
+pub fn warn_snapshot_errors(snapshots: &[HostSnapshot]) {
     for snapshot in snapshots {
         for error in &snapshot.errors {
             eprintln!(
