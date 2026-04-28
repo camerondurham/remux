@@ -888,12 +888,7 @@ fn draw_live_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             .unwrap_or_else(|| first_row_error(session).unwrap_or_else(|| "-".to_string()));
         Row::new(vec![
             Cell::from(session.display_id.clone()),
-            Cell::from(
-                session
-                    .raw_target
-                    .clone()
-                    .unwrap_or_else(|| "-".to_string()),
-            ),
+            Cell::from(table_target(session)),
             Cell::from(session.match_status.as_str()).style(match_style(session.match_status)),
             Cell::from(session.state.as_str()).style(state_style(session.state)),
             Cell::from(last_output_age(session)),
@@ -1582,6 +1577,19 @@ fn row_search_text(row: &SessionSnapshot) -> String {
         repo_text,
         output_text
     )
+}
+
+fn table_target(row: &SessionSnapshot) -> String {
+    row.raw_target
+        .clone()
+        .or_else(|| {
+            if row.target.trim().is_empty() {
+                None
+            } else {
+                Some(row.target.clone())
+            }
+        })
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn row_style(session: &SessionSnapshot) -> Style {
