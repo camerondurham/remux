@@ -5,7 +5,10 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn unique_temp_dir(name: &str) -> PathBuf {
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let dir = std::env::temp_dir().join(format!("{name}-{ts}"));
     fs::create_dir_all(&dir).unwrap();
     dir
@@ -27,7 +30,8 @@ fn kill_legacy_session_id_targets_tmux_session_not_stale_pane_coordinates() {
 
     write_exe(
         &bin.join("tmux"),
-        &format!(r#"#!/usr/bin/env bash
+        &format!(
+            r#"#!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >> '{}'
 if [[ "$1" == "list-panes" ]]; then
@@ -46,7 +50,9 @@ if [[ "$1" == "kill-session" ]]; then
   exit 97
 fi
 exit 0
-"#, log.display()),
+"#,
+            log.display()
+        ),
     );
 
     let config = root.join("config.yaml");
@@ -74,13 +80,24 @@ sessions:
         .arg(&config)
         .args(["kill", "agent", "--yes"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()))
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let log_contents = fs::read_to_string(&log).unwrap();
-    assert!(log_contents.contains("kill-session -t work") || log_contents.contains("kill-session -t 'work'"), "log:\n{log_contents}");
+    assert!(
+        log_contents.contains("kill-session -t work")
+            || log_contents.contains("kill-session -t 'work'"),
+        "log:\n{log_contents}"
+    );
     assert!(!log_contents.contains("kill-pane"), "log:\n{log_contents}");
 }
 
@@ -130,11 +147,23 @@ watches:
         .arg(&config)
         .args(["inspect", "node-agent", "--json"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()))
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("\"match_status\": " ) || stdout.contains("\"match_status\":\"matched\"") || stdout.contains("\"match_status\": \"matched\""), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("\"match_status\": ")
+            || stdout.contains("\"match_status\":\"matched\"")
+            || stdout.contains("\"match_status\": \"matched\""),
+        "stdout:\n{stdout}"
+    );
 }
