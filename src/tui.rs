@@ -19,6 +19,8 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::io::{self, Stdout};
 use std::sync::{Arc, Mutex, mpsc};
@@ -110,6 +112,15 @@ struct App {
     inspected_detail: Option<PaneDetail>,
     kill_prompt: Option<KillPrompt>,
     last_refresh: Option<Instant>,
+    sort_mode: SortMode,
+}
+
+#[derive(Clone, Copy)]
+enum SortMode {
+    Attention,
+    LastOutput,
+    State,
+    Id,
 }
 
 struct KillPrompt {
@@ -138,12 +149,14 @@ struct DashboardSummary {
     host_total: usize,
     host_unreachable: usize,
     sessions: usize,
-    matched: usize,
     active: usize,
     quiet: usize,
     idle: usize,
     missing: usize,
+    ambiguous: usize,
+    shadowed: usize,
     errors: usize,
+    attention: usize,
 }
 
 impl App {
@@ -164,12 +177,14 @@ impl App {
             inspected_detail: None,
             kill_prompt: None,
             last_refresh: None,
+            sort_mode: SortMode::Attention,
         }
     }
 
     fn rows(&self) -> Vec<&SessionSnapshot> {
         let filter = self.filter.trim().to_lowercase();
-        self.snapshots
+        let mut rows: Vec<&SessionSnapshot> = self
+            .snapshots
             .iter()
             .flat_map(|snapshot| snapshot.sessions.iter())
             .filter(|session| {
@@ -178,7 +193,9 @@ impl App {
                         .to_lowercase()
                         .contains(filter.as_str())
             })
-            .collect()
+            .collect();
+        rows.sort_by(|left, right| compare_rows(left, right, self.sort_mode));
+        rows
     }
 
     fn selected_row(&self) -> Option<&SessionSnapshot> {
@@ -354,9 +371,13 @@ impl App {
                 .filter(|session| session.state == state)
                 .count()
         };
-        let matched = sessions
+        let ambiguous = sessions
             .iter()
-            .filter(|session| session.match_status == MatchStatus::Matched)
+            .filter(|session| session.match_status == MatchStatus::Ambiguous)
+            .count();
+        let shadowed = sessions
+            .iter()
+            .filter(|session| session.match_status == MatchStatus::Shadowed)
             .count();
         let errors = self
             .snapshots
@@ -370,25 +391,50 @@ impl App {
                         .sum::<usize>()
             })
             .sum();
+        let missing = count_state(SessionState::Missing);
+        let attention = host_unreachable + missing + ambiguous + errors;
 
         DashboardSummary {
             host_ok,
             host_total,
             host_unreachable,
             sessions: sessions.len(),
-            matched,
             active: count_state(SessionState::Active),
             quiet: count_state(SessionState::Quiet),
             idle: count_state(SessionState::Idle),
-            missing: count_state(SessionState::Missing),
+            missing,
+            ambiguous,
+            shadowed,
             errors,
+            attention,
         }
+    }
+
+    fn cycle_sort_mode(&mut self) {
+        self.sort_mode = match self.sort_mode {
+            SortMode::Attention => SortMode::LastOutput,
+            SortMode::LastOutput => SortMode::State,
+            SortMode::State => SortMode::Id,
+            SortMode::Id => SortMode::Attention,
+        };
+        self.clamp_selection();
     }
 }
 
 impl HostProgressState {
     fn is_finished(self) -> bool {
         matches!(self, HostProgressState::Ok | HostProgressState::Unreachable)
+    }
+}
+
+impl SortMode {
+    fn label(self) -> &'static str {
+        match self {
+            SortMode::Attention => "attention",
+            SortMode::LastOutput => "last-output",
+            SortMode::State => "state",
+            SortMode::Id => "id",
+        }
     }
 }
 
@@ -538,6 +584,11 @@ fn handle_key(
         }
         KeyCode::Char('?') => {
             app.help = !app.help;
+            Ok(false)
+        }
+        KeyCode::Char('s') => {
+            app.cycle_sort_mode();
+            app.status = format!("sort: {}", app.sort_mode.label());
             Ok(false)
         }
         KeyCode::Char('r') => {
@@ -714,54 +765,42 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
-            Constraint::Min(8),
-            if app.help {
-                Constraint::Length(12)
-            } else {
-                // Give the preview roughly half the remaining height so pane
-                // output is actually readable; it will still shrink cleanly
-                // on small terminals because of the `Min(8)` above.
-                Constraint::Percentage(50)
-            },
+            Constraint::Length(4),
+            Constraint::Min(10),
             Constraint::Length(1),
         ])
         .split(area);
 
     draw_summary(frame, chunks[0], app);
-    draw_sessions(frame, chunks[1], app);
-    draw_detail(frame, chunks[2], app);
-    draw_status(frame, chunks[3], app);
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(24),
+            Constraint::Percentage(42),
+            Constraint::Percentage(34),
+        ])
+        .split(chunks[1]);
+    draw_topology_tree(frame, body[0], app);
+    draw_live_table(frame, body[1], app);
+    draw_inspector(frame, body[2], app);
+    draw_status(frame, chunks[2], app);
 }
 
 fn draw_summary(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let summary = app.summary();
-    let mut spans = vec![
+    let top = Line::from(vec![
         Span::styled("hosts ", label_style()),
         Span::styled(
-            format!("{}/{} ok", summary.host_ok, summary.host_total),
+            format!("{}/{} up", summary.host_ok, summary.host_total),
             if summary.host_unreachable > 0 {
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+                state_style(SessionState::Unreachable)
             } else {
-                Style::default()
-                    .fg(Color::LightCyan)
-                    .add_modifier(Modifier::BOLD)
+                state_style(SessionState::Active)
             },
         ),
         Span::raw(" | "),
         Span::styled("panes ", label_style()),
-        Span::styled(
-            summary.sessions.to_string(),
-            Style::default().fg(Color::White),
-        ),
-        Span::raw(" | "),
-        Span::styled("matched ", label_style()),
-        Span::styled(
-            summary.matched.to_string(),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::raw(summary.sessions.to_string()),
         Span::raw(" | "),
         Span::styled("active ", label_style()),
         Span::styled(
@@ -775,44 +814,56 @@ fn draw_summary(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         Span::styled("idle ", label_style()),
         Span::styled(summary.idle.to_string(), state_style(SessionState::Idle)),
         Span::raw(" | "),
-        Span::styled("filter: ", label_style()),
-        Span::styled(filter_label(app), Style::default().fg(Color::White)),
-    ];
-    if summary.missing > 0 {
-        spans.push(Span::raw(" | "));
-        spans.push(Span::styled("missing ", label_style()));
-        spans.push(Span::styled(
+        Span::styled("missing ", label_style()),
+        Span::styled(
             summary.missing.to_string(),
             state_style(SessionState::Missing),
-        ));
-    }
-    if summary.host_unreachable > 0 {
-        spans.push(Span::raw(" | "));
-        spans.push(Span::styled("unreachable ", label_style()));
-        spans.push(Span::styled(
-            summary.host_unreachable.to_string(),
-            state_style(SessionState::Unreachable),
-        ));
-    }
-    if summary.errors > 0 {
-        spans.push(Span::raw(" | "));
-        spans.push(Span::styled("errors ", label_style()));
-        spans.push(Span::styled(
+        ),
+        Span::raw(" | "),
+        Span::styled("ambiguous ", label_style()),
+        Span::styled(
+            summary.ambiguous.to_string(),
+            match_style(MatchStatus::Ambiguous),
+        ),
+        Span::raw(" | "),
+        Span::styled("shadowed ", label_style()),
+        Span::styled(
+            summary.shadowed.to_string(),
+            match_style(MatchStatus::Shadowed),
+        ),
+    ]);
+
+    let bottom = Line::from(vec![
+        Span::styled("attention ", label_style()),
+        Span::styled(
+            summary.attention.to_string(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" | "),
+        Span::styled("errors ", label_style()),
+        Span::styled(
             summary.errors.to_string(),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ));
-    }
-
-    let paragraph = Paragraph::new(Line::from(spans))
-        .block(Block::default().borders(Borders::ALL).title("remux alpha"));
+        ),
+        Span::raw(" | "),
+        Span::styled("sort ", label_style()),
+        Span::raw(app.sort_mode.label()),
+        Span::raw(" | "),
+        Span::styled("filter ", label_style()),
+        Span::raw(filter_label(app)),
+    ]);
+    let paragraph = Paragraph::new(Text::from(vec![top, bottom]))
+        .block(Block::default().borders(Borders::ALL).title("kpi"));
     frame.render_widget(paragraph, area);
 }
 
-fn draw_sessions(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+fn draw_live_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let rows = app.rows();
     if rows.is_empty() {
         let paragraph = Paragraph::new(Text::from(empty_state_lines(app)))
-            .block(Block::default().borders(Borders::ALL).title("sessions"))
+            .block(Block::default().borders(Borders::ALL).title("live table"))
             .wrap(Wrap { trim: false });
         frame.render_widget(paragraph, area);
         return;
@@ -836,10 +887,16 @@ fn draw_sessions(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             .map(|output| short_message(&output.preview))
             .unwrap_or_else(|| first_row_error(session).unwrap_or_else(|| "-".to_string()));
         Row::new(vec![
-            Cell::from(session.host.clone()),
             Cell::from(session.display_id.clone()),
+            Cell::from(
+                session
+                    .raw_target
+                    .clone()
+                    .unwrap_or_else(|| "-".to_string()),
+            ),
             Cell::from(session.match_status.as_str()).style(match_style(session.match_status)),
             Cell::from(session.state.as_str()).style(state_style(session.state)),
+            Cell::from(last_output_age(session)),
             Cell::from(
                 session
                     .process
@@ -849,30 +906,31 @@ fn draw_sessions(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             ),
             Cell::from(repo),
             Cell::from(dirty.clone()).style(dirty_style(dirty.as_str())),
-            Cell::from(preview),
+            Cell::from(preview).style(muted_style()),
         ])
         .style(row_style(session))
     });
     let table = Table::new(
         table_rows,
         [
-            Constraint::Length(10),
             Constraint::Min(16),
+            Constraint::Min(18),
             Constraint::Length(11),
             Constraint::Length(9),
+            Constraint::Length(8),
             Constraint::Length(12),
-            Constraint::Length(16),
+            Constraint::Length(12),
             Constraint::Length(7),
-            Constraint::Min(20),
+            Constraint::Min(16),
         ],
     )
     .header(
         Row::new([
-            "HOST", "ID", "MATCH", "STATE", "CMD", "REPO", "DIRTY", "PREVIEW",
+            "ID", "TARGET", "MATCH", "STATE", "LAST", "CMD", "REPO", "DIRTY", "PREVIEW",
         ])
         .style(Style::default().add_modifier(Modifier::BOLD)),
     )
-    .block(Block::default().borders(Borders::ALL).title("sessions"))
+    .block(Block::default().borders(Borders::ALL).title("live table"))
     .row_highlight_style(
         Style::default()
             .fg(Color::Black)
@@ -886,12 +944,97 @@ fn draw_sessions(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     frame.render_stateful_widget(table, area, &mut state);
 }
 
-fn draw_detail(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let block = Block::default().borders(Borders::ALL).title(if app.help {
-        "keys"
+fn draw_topology_tree(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let rows = app.rows();
+    let selected = rows.get(app.selected).copied();
+    let mut hosts: BTreeMap<String, Vec<&SessionSnapshot>> = BTreeMap::new();
+    for row in rows {
+        hosts.entry(row.host.clone()).or_default().push(row);
+    }
+
+    let mut lines = Vec::new();
+    if hosts.is_empty() {
+        lines.push(Line::from("No topology rows"));
     } else {
-        "pane preview"
-    });
+        for (host, host_rows) in hosts {
+            let status = app
+                .snapshots
+                .iter()
+                .find(|snapshot| snapshot.host == host)
+                .map(|snapshot| snapshot.status)
+                .unwrap_or(SnapshotStatus::Ok);
+            lines.push(Line::from(vec![
+                Span::styled("▸ ", muted_style()),
+                Span::styled(host.clone(), Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(" "),
+                Span::styled(
+                    match status {
+                        SnapshotStatus::Ok => "(ok)",
+                        SnapshotStatus::Unreachable => "(unreachable)",
+                    },
+                    if status == SnapshotStatus::Ok {
+                        state_style(SessionState::Active)
+                    } else {
+                        state_style(SessionState::Unreachable)
+                    },
+                ),
+            ]));
+
+            let mut sessions: BTreeMap<String, Vec<&SessionSnapshot>> = BTreeMap::new();
+            for row in host_rows {
+                sessions
+                    .entry(row.tmux.session.clone())
+                    .or_default()
+                    .push(row);
+            }
+            for (session, session_rows) in sessions {
+                lines.push(Line::from(format!("  ▸ session {session}")));
+                for row in session_rows {
+                    let marker = if selected.map(|item| item.display_id.as_str())
+                        == Some(row.display_id.as_str())
+                    {
+                        ">"
+                    } else {
+                        " "
+                    };
+                    let pane = row
+                        .tmux
+                        .window
+                        .as_ref()
+                        .zip(row.tmux.pane.as_ref())
+                        .map(|(window, pane)| format!("{window}.{pane}"))
+                        .unwrap_or_else(|| "-".to_string());
+                    let command = row
+                        .process
+                        .as_ref()
+                        .map(|process| process.command.as_str())
+                        .unwrap_or("-");
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("    {marker} "), muted_style()),
+                        Span::styled(pane, muted_style()),
+                        Span::raw(" "),
+                        Span::styled(command.to_string(), Style::default().fg(Color::White)),
+                        Span::raw(" "),
+                        Span::styled(row.state.as_str(), state_style(row.state)),
+                    ]));
+                }
+            }
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(Block::default().borders(Borders::ALL).title("topology"))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn draw_inspector(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let block =
+        Block::default()
+            .borders(Borders::ALL)
+            .title(if app.help { "keys" } else { "inspector" });
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -900,6 +1043,7 @@ fn draw_detail(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             Line::from("j/down select next"),
             Line::from("up select previous"),
             Line::from("r refresh now"),
+            Line::from("s cycle table sort"),
             Line::from("/ filter"),
             Line::from("enter readonly attach"),
             Line::from("a read-write jump"),
@@ -990,6 +1134,8 @@ fn draw_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         Span::raw(" jump | "),
         key_span("r"),
         Span::raw(" refresh | "),
+        key_span("s"),
+        Span::raw(" sort | "),
         key_span("/"),
         Span::raw(" filter | "),
         key_span("c"),
@@ -1450,6 +1596,77 @@ fn row_style(session: &SessionSnapshot) -> Style {
         SessionState::Quiet => Style::default().fg(Color::Gray),
         SessionState::Missing | SessionState::Unreachable => state_style(session.state),
         SessionState::Active | SessionState::Unknown => Style::default(),
+    }
+}
+
+fn compare_rows(left: &SessionSnapshot, right: &SessionSnapshot, mode: SortMode) -> Ordering {
+    match mode {
+        SortMode::Attention => attention_score(right)
+            .cmp(&attention_score(left))
+            .then_with(|| state_rank(right.state).cmp(&state_rank(left.state)))
+            .then_with(|| left.display_id.cmp(&right.display_id)),
+        SortMode::LastOutput => last_output_timestamp(right)
+            .cmp(&last_output_timestamp(left))
+            .then_with(|| left.display_id.cmp(&right.display_id)),
+        SortMode::State => state_rank(right.state)
+            .cmp(&state_rank(left.state))
+            .then_with(|| left.display_id.cmp(&right.display_id)),
+        SortMode::Id => left.display_id.cmp(&right.display_id),
+    }
+}
+
+fn attention_score(row: &SessionSnapshot) -> usize {
+    let mut score = 0;
+    score += match row.match_status {
+        MatchStatus::Unreachable => 6,
+        MatchStatus::Missing => 5,
+        MatchStatus::Ambiguous => 4,
+        MatchStatus::Shadowed => 3,
+        MatchStatus::Unknown => 2,
+        MatchStatus::Orphan => 1,
+        MatchStatus::Matched => 0,
+    };
+    score += row.errors.len();
+    score += match row.state {
+        SessionState::Unreachable => 4,
+        SessionState::Missing => 3,
+        SessionState::Unknown => 1,
+        SessionState::Idle | SessionState::Quiet | SessionState::Active => 0,
+    };
+    score
+}
+
+fn last_output_timestamp(row: &SessionSnapshot) -> i64 {
+    row.output
+        .as_ref()
+        .and_then(|output| output.last_output_at.map(|timestamp| timestamp.timestamp()))
+        .unwrap_or(i64::MIN)
+}
+
+fn last_output_age(row: &SessionSnapshot) -> String {
+    let Some(last_output_at) = row.output.as_ref().and_then(|output| output.last_output_at) else {
+        return "-".to_string();
+    };
+    let age = Utc::now().signed_duration_since(last_output_at);
+    if age.num_seconds() < 60 {
+        format!("{}s", age.num_seconds().max(0))
+    } else if age.num_minutes() < 60 {
+        format!("{}m", age.num_minutes())
+    } else if age.num_hours() < 24 {
+        format!("{}h", age.num_hours())
+    } else {
+        format!("{}d", age.num_days())
+    }
+}
+
+fn state_rank(state: SessionState) -> u8 {
+    match state {
+        SessionState::Active => 6,
+        SessionState::Quiet => 5,
+        SessionState::Idle => 4,
+        SessionState::Unknown => 3,
+        SessionState::Missing => 2,
+        SessionState::Unreachable => 1,
     }
 }
 
