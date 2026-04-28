@@ -99,6 +99,7 @@ fn suspend_terminal<T>(
 struct App {
     snapshots: Vec<HostSnapshot>,
     selected: usize,
+    selected_identity: Option<String>,
     filter: String,
     editing_filter: bool,
     help: bool,
@@ -164,6 +165,7 @@ impl App {
         Self {
             snapshots: Vec::new(),
             selected: 0,
+            selected_identity: None,
             filter,
             editing_filter: false,
             help: false,
@@ -203,13 +205,35 @@ impl App {
         rows.get(self.selected).copied()
     }
 
-    fn clamp_selection(&mut self) {
-        let len = self.rows().len();
-        if len == 0 {
+    fn selected_row_identity(&self) -> Option<String> {
+        self.selected_row().map(row_identity)
+    }
+
+    fn restore_selection(&mut self, preferred_identity: Option<String>) {
+        let preferred_identity = preferred_identity.or_else(|| self.selected_identity.clone());
+        let (selected, selected_identity) = {
+            let rows = self.rows();
+            if rows.is_empty() {
+                self.selected = 0;
+                self.selected_identity = None;
+                return;
+            }
+            let selected = if let Some(identity) = preferred_identity {
+                rows.iter()
+                    .position(|row| row_identity(row) == identity)
+                    .unwrap_or_else(|| self.selected.min(rows.len() - 1))
+            } else {
+                self.selected.min(rows.len() - 1)
+            };
+            (selected, rows.get(selected).map(|row| row_identity(row)))
+        };
+        if selected_identity.is_none() {
             self.selected = 0;
-        } else if self.selected >= len {
-            self.selected = len - 1;
+            self.selected_identity = None;
+            return;
         }
+        self.selected = selected;
+        self.selected_identity = selected_identity;
     }
 
     fn begin_refresh(&mut self, host_ids: Vec<String>) {
@@ -239,9 +263,10 @@ impl App {
                 self.status = self.progress_summary();
             }
             RefreshMessage::HostFinished { snapshot } => {
+                let selected_identity = self.selected_row_identity();
                 self.update_host_finished(&snapshot);
                 self.upsert_snapshot(snapshot);
-                self.clamp_selection();
+                self.restore_selection(selected_identity);
                 self.status = self.progress_summary();
             }
             RefreshMessage::Complete => {
@@ -411,13 +436,14 @@ impl App {
     }
 
     fn cycle_sort_mode(&mut self) {
+        let selected_identity = self.selected_row_identity();
         self.sort_mode = match self.sort_mode {
             SortMode::Attention => SortMode::LastOutput,
             SortMode::LastOutput => SortMode::State,
             SortMode::State => SortMode::Id,
             SortMode::Id => SortMode::Attention,
         };
-        self.clamp_selection();
+        self.restore_selection(selected_identity);
     }
 }
 
@@ -564,12 +590,14 @@ fn handle_key(
         match key.code {
             KeyCode::Esc | KeyCode::Enter => app.editing_filter = false,
             KeyCode::Backspace => {
+                let selected_identity = app.selected_row_identity();
                 app.filter.pop();
-                app.clamp_selection();
+                app.restore_selection(selected_identity);
             }
             KeyCode::Char(ch) => {
+                let selected_identity = app.selected_row_identity();
                 app.filter.push(ch);
-                app.clamp_selection();
+                app.restore_selection(selected_identity);
             }
             _ => {}
         }
@@ -600,10 +628,12 @@ fn handle_key(
             if app.selected + 1 < len {
                 app.selected += 1;
             }
+            app.selected_identity = app.selected_row_identity();
             Ok(false)
         }
         KeyCode::Up => {
             app.selected = app.selected.saturating_sub(1);
+            app.selected_identity = app.selected_row_identity();
             Ok(false)
         }
         KeyCode::Char('k') => {
@@ -1590,6 +1620,18 @@ fn table_target(row: &SessionSnapshot) -> String {
             }
         })
         .unwrap_or_else(|| "-".to_string())
+}
+
+fn row_identity(row: &SessionSnapshot) -> String {
+    row.watch_id
+        .as_ref()
+        .map(|watch_id| format!("watch:{watch_id}"))
+        .or_else(|| {
+            row.raw_target
+                .as_ref()
+                .map(|target| format!("target:{target}"))
+        })
+        .unwrap_or_else(|| format!("display:{}|{}", row.display_id, row.target))
 }
 
 fn row_style(session: &SessionSnapshot) -> Style {
