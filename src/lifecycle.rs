@@ -109,6 +109,10 @@ pub fn new_pane(config: &Config, host_id: &str, session: &str, verbose: bool) ->
 }
 
 fn resolve_kill_target(config: &Config, target: &str) -> Result<KillTarget> {
+    if let Some(session) = config.sessions.iter().find(|session| session.id == target) {
+        return resolve_live_session(config, &session.host, &session.tmux.session);
+    }
+
     if config.find_watch(target).is_some() {
         return snapshot::target_for_action(config, target, "kill")
             .map(KillTarget::Pane)

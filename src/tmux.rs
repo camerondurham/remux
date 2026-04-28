@@ -83,9 +83,9 @@ pub fn parse_inventory(host: &str, output: &str) -> Result<Vec<Pane>> {
                 fields.len()
             );
         }
-        let session = fields[0].to_string();
-        let window = fields[1].to_string();
-        let pane = fields[2].to_string();
+        let session = fields[0].trim().to_string();
+        let window = fields[1].trim().to_string();
+        let pane = fields[2].trim().to_string();
         let target = format!("{host}/{session}:{window}.{pane}");
         panes.push(Pane {
             target,
@@ -93,11 +93,11 @@ pub fn parse_inventory(host: &str, output: &str) -> Result<Vec<Pane>> {
             session,
             window,
             pane,
-            pane_id: fields[3].to_string(),
-            pid: fields[4].parse().ok(),
-            command: fields[5].to_string(),
-            cwd: fields[6].to_string(),
-            session_attached: parse_tmux_bool(fields[7]),
+            pane_id: fields[3].trim().to_string(),
+            pid: fields[4].trim().parse().ok(),
+            command: fields[5].trim().to_string(),
+            cwd: fields[6].trim().to_string(),
+            session_attached: parse_tmux_bool(fields[7].trim()),
         });
     }
     Ok(panes)
