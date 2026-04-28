@@ -2,6 +2,7 @@ mod attach;
 mod cache;
 mod cli;
 mod config;
+mod doctor;
 mod exec;
 mod exit;
 mod git;
@@ -42,6 +43,7 @@ fn run() -> Result<()> {
 
     match cli.command {
         Command::Hosts => render::hosts(&config),
+        Command::Doctor { json } => doctor::run(&config, json),
         Command::Snapshot { host, json } => {
             let snapshot = snapshot::snapshot_host(&config, &host)?;
             let unreachable = matches!(&snapshot.status, snapshot::SnapshotStatus::Unreachable);

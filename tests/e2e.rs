@@ -7,6 +7,30 @@ use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
+fn doctor_checks_local_tools_and_hosts() {
+    let env = TestEnv::new();
+
+    let doctor = env.remux(["--config", env.config_path(), "doctor"]);
+    assert_failure(&doctor);
+    let out = stdout(&doctor);
+    assert!(out.contains("remux doctor"));
+    assert!(out.contains("local tmux"));
+    assert!(out.contains("local git"));
+    assert!(out.contains("local fzf"));
+    assert!(out.contains("ssh access"));
+    assert!(out.contains("remote tmux"));
+    assert!(out.contains("remote git"));
+    assert!(out.contains("overall: fail"));
+    assert!(stderr(&doctor).contains("doctor found issues"));
+
+    let doctor_json = env.remux(["--config", env.config_path(), "doctor", "--json"]);
+    assert_failure(&doctor_json);
+    let report: Value = serde_json::from_str(&stdout(&doctor_json)).unwrap();
+    assert_eq!(report["hosts"][0]["host"], "pi");
+    assert_eq!(report["hosts"][0]["checks"][0]["name"], "ssh access");
+}
+
+#[test]
 fn ssh_tracer_bullet_works_end_to_end() {
     let env = TestEnv::new();
 
@@ -519,6 +543,19 @@ if [[ "$args" != *"fake-pi"* ]]; then
 fi
 
 remote="${@: -1}"
+
+if [[ "$remote" == "printf ok" ]]; then
+  printf 'ok\n'
+  exit 0
+fi
+
+if [[ "$remote" == "command -v tmux >/dev/null 2>&1" ]]; then
+  exit 0
+fi
+
+if [[ "$remote" == "command -v git >/dev/null 2>&1" ]]; then
+  exit 0
+fi
 
 if [[ "$remote" == tmux\ list-panes* ]]; then
   printf 'work\t0\t1\t%%3\t1234\tnode\t/home/cam/work\t1\n'

@@ -23,6 +23,12 @@ pub struct Cli {
 pub enum Command {
     /// Show configured hosts.
     Hosts,
+    /// Validate local tools and host connectivity.
+    Doctor {
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Discover tmux panes on a host.
     Snapshot {
         /// Configured host id.
