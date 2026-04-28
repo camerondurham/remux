@@ -694,7 +694,7 @@ fn handle_input_prompt_key(
 
 fn execute_input_prompt(
     config: &Config,
-    host: Option<String>,
+    scoped_host: Option<String>,
     tx: mpsc::Sender<RefreshMessage>,
     app: &mut App,
 ) -> Result<()> {
@@ -719,7 +719,7 @@ fn execute_input_prompt(
             match lifecycle::rename_session(config, &host_id, &current, new_name, false) {
                 Ok(()) => {
                     app.status = format!("renamed {host_id}/{current} -> {new_name}");
-                    spawn_refresh(config, host, tx, app)?;
+                    spawn_refresh(config, Some(host_id), tx, app)?;
                 }
                 Err(err) => app.status = format!("{err:#}"),
             }
@@ -729,10 +729,18 @@ fn execute_input_prompt(
                 app.status = "new session expects <host>/<session>".to_string();
                 return Ok(());
             };
+            if let Some(scope) = scoped_host.as_deref()
+                && scope != host_id
+            {
+                app.status = format!(
+                    "new session blocked in scoped view: expected host `{scope}`, got `{host_id}`"
+                );
+                return Ok(());
+            }
             match lifecycle::new_session(config, host_id, session_name, None, None, false) {
                 Ok(()) => {
                     app.status = format!("created session {host_id}/{session_name}");
-                    spawn_refresh(config, host, tx, app)?;
+                    spawn_refresh(config, Some(host_id.to_string()), tx, app)?;
                 }
                 Err(err) => app.status = format!("{err:#}"),
             }
@@ -742,10 +750,18 @@ fn execute_input_prompt(
                 app.status = "new pane expects <host>/<session>".to_string();
                 return Ok(());
             };
+            if let Some(scope) = scoped_host.as_deref()
+                && scope != host_id
+            {
+                app.status = format!(
+                    "new pane blocked in scoped view: expected host `{scope}`, got `{host_id}`"
+                );
+                return Ok(());
+            }
             match lifecycle::new_pane(config, host_id, session_name, false) {
                 Ok(()) => {
                     app.status = format!("spawned pane in {host_id}/{session_name}");
-                    spawn_refresh(config, host, tx, app)?;
+                    spawn_refresh(config, Some(host_id.to_string()), tx, app)?;
                 }
                 Err(err) => app.status = format!("{err:#}"),
             }
