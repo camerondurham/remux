@@ -49,8 +49,18 @@ struct CheckResult {
 impl DoctorReport {
     fn collect(config: &Config) -> Self {
         let local_tools = vec![
-            check_local_binary("local tmux", LOCAL_TMUX_CHECK, "tmux found", "tmux not found in PATH"),
-            check_local_binary("local git", LOCAL_GIT_CHECK, "git found", "git not found in PATH"),
+            check_local_binary(
+                "local tmux",
+                LOCAL_TMUX_CHECK,
+                "tmux found",
+                "tmux not found in PATH",
+            ),
+            check_local_binary(
+                "local git",
+                LOCAL_GIT_CHECK,
+                "git found",
+                "git not found in PATH",
+            ),
             check_fzf(),
         ];
 
@@ -75,9 +85,30 @@ impl DoctorReport {
                         .ok()
                         .and_then(|ssh| ssh.target())
                         .unwrap_or_else(|| "-".to_string());
-                    let access = check_ssh_command(config, host, "ssh access", "printf ok", "ssh reachable", "ssh failed");
-                    let tmux = check_ssh_command(config, host, "remote tmux", SSH_TMUX_CHECK, "tmux found", "tmux not found on remote PATH");
-                    let git = check_ssh_command(config, host, "remote git", SSH_GIT_CHECK, "git found", "git not found on remote PATH");
+                    let access = check_ssh_command(
+                        config,
+                        host,
+                        "ssh access",
+                        "printf ok",
+                        "ssh reachable",
+                        "ssh failed",
+                    );
+                    let tmux = check_ssh_command(
+                        config,
+                        host,
+                        "remote tmux",
+                        SSH_TMUX_CHECK,
+                        "tmux found",
+                        "tmux not found on remote PATH",
+                    );
+                    let git = check_ssh_command(
+                        config,
+                        host,
+                        "remote git",
+                        SSH_GIT_CHECK,
+                        "git found",
+                        "git not found on remote PATH",
+                    );
                     let checks = vec![access, tmux, git];
                     let ok = checks.iter().all(|check| check.ok);
                     HostDoctorReport {
@@ -139,7 +170,12 @@ fn check_ssh_command(
     success: &str,
     failure: &str,
 ) -> CheckResult {
-    match ssh::run(host, command, config.poll.ssh_timeout, config.poll.command_timeout) {
+    match ssh::run(
+        host,
+        command,
+        config.poll.ssh_timeout,
+        config.poll.command_timeout,
+    ) {
         Ok(output) => {
             let trimmed = output.trim();
             let detail = if trimmed.is_empty() {
@@ -173,7 +209,10 @@ fn render_text(report: &DoctorReport) {
     println!("HOSTS");
     for host in &report.hosts {
         let status = if host.ok { "ok" } else { "fail" };
-        println!("- {} [{}] {} ({})", host.host, host.kind, host.target, status);
+        println!(
+            "- {} [{}] {} ({})",
+            host.host, host.kind, host.target, status
+        );
         for check in &host.checks {
             print_check(check);
         }
