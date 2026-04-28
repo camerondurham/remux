@@ -49,6 +49,65 @@ pub fn kill(config: &Config, target: &str, yes: bool, verbose: bool) -> Result<(
     run_lifecycle_command(config, host_id, &command, verbose)
 }
 
+pub fn rename_session(
+    config: &Config,
+    host_id: &str,
+    old_name: &str,
+    new_name: &str,
+    verbose: bool,
+) -> Result<()> {
+    config.host(host_id)?;
+    let snapshot = snapshot::snapshot_host(config, host_id)?;
+    let old_exists = snapshot
+        .sessions
+        .iter()
+        .any(|row| row.raw_target.is_some() && row.tmux.session == old_name);
+    if !old_exists {
+        return Err(
+            ExitFailure::new(3, format!("session `{host_id}/{old_name}` was not found")).into(),
+        );
+    }
+    let new_exists = snapshot
+        .sessions
+        .iter()
+        .any(|row| row.raw_target.is_some() && row.tmux.session == new_name);
+    if new_exists {
+        return Err(
+            ExitFailure::new(2, format!("session `{host_id}/{new_name}` already exists")).into(),
+        );
+    }
+
+    run_lifecycle_command(
+        config,
+        host_id,
+        &tmux::rename_session_command(old_name, new_name),
+        verbose,
+    )
+    .with_context(|| format!("failed to rename `{host_id}/{old_name}` to `{new_name}`"))
+}
+
+pub fn new_pane(config: &Config, host_id: &str, session: &str, verbose: bool) -> Result<()> {
+    config.host(host_id)?;
+    let snapshot = snapshot::snapshot_host(config, host_id)?;
+    let session_exists = snapshot
+        .sessions
+        .iter()
+        .any(|row| row.raw_target.is_some() && row.tmux.session == session);
+    if !session_exists {
+        return Err(
+            ExitFailure::new(3, format!("session `{host_id}/{session}` was not found")).into(),
+        );
+    }
+
+    run_lifecycle_command(
+        config,
+        host_id,
+        &tmux::split_window_command(session),
+        verbose,
+    )
+    .with_context(|| format!("failed to spawn pane in `{host_id}/{session}`"))
+}
+
 fn resolve_kill_target(config: &Config, target: &str) -> Result<KillTarget> {
     if config.find_watch(target).is_some() {
         return snapshot::target_for_action(config, target, "kill")

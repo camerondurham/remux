@@ -134,6 +134,18 @@ pub fn kill_pane_command(target: &PaneTarget) -> String {
     format!("tmux kill-pane -t {}", shell_quote(&target.tmux_target()))
 }
 
+pub fn rename_session_command(old_name: &str, new_name: &str) -> String {
+    format!(
+        "tmux rename-session -t {} {}",
+        shell_quote(old_name),
+        shell_quote(new_name)
+    )
+}
+
+pub fn split_window_command(session: &str) -> String {
+    format!("tmux split-window -d -t {}", shell_quote(session))
+}
+
 fn parse_tmux_bool(value: &str) -> bool {
     matches!(value, "1" | "true" | "yes" | "on")
 }
@@ -218,6 +230,14 @@ mod tests {
             "tmux new-session -d -s 'work' -c $HOME/'repo' -n 'main'"
         );
         assert_eq!(kill_session_command("work"), "tmux kill-session -t 'work'");
+        assert_eq!(
+            rename_session_command("work", "work-next"),
+            "tmux rename-session -t 'work' 'work-next'"
+        );
+        assert_eq!(
+            split_window_command("work"),
+            "tmux split-window -d -t 'work'"
+        );
     }
 
     #[test]

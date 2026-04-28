@@ -109,11 +109,24 @@ struct App {
     inspected_for: Option<String>,
     inspected_detail: Option<PaneDetail>,
     kill_prompt: Option<KillPrompt>,
+    input_prompt: Option<InputPrompt>,
     last_refresh: Option<Instant>,
 }
 
 struct KillPrompt {
     target: String,
+}
+
+struct InputPrompt {
+    kind: InputPromptKind,
+    value: String,
+}
+
+#[derive(Clone)]
+enum InputPromptKind {
+    RenameSession { host: String, current: String },
+    NewSession,
+    NewPane,
 }
 
 #[derive(Clone)]
@@ -163,6 +176,7 @@ impl App {
             inspected_for: None,
             inspected_detail: None,
             kill_prompt: None,
+            input_prompt: None,
             last_refresh: None,
         }
     }
@@ -514,6 +528,11 @@ fn handle_key(
         return Ok(false);
     }
 
+    if app.input_prompt.is_some() {
+        handle_input_prompt_key(key, config, host, tx, app)?;
+        return Ok(false);
+    }
+
     if app.editing_filter {
         match key.code {
             KeyCode::Esc | KeyCode::Enter => app.editing_filter = false,
@@ -557,6 +576,26 @@ fn handle_key(
         }
         KeyCode::Char('k') => {
             begin_kill_prompt(config, app)?;
+            Ok(false)
+        }
+        KeyCode::Char('e') => {
+            begin_rename_prompt(app);
+            Ok(false)
+        }
+        KeyCode::Char('n') => {
+            app.input_prompt = Some(InputPrompt {
+                kind: InputPromptKind::NewSession,
+                value: String::new(),
+            });
+            app.status = "new session: enter <host>/<session>".to_string();
+            Ok(false)
+        }
+        KeyCode::Char('p') => {
+            app.input_prompt = Some(InputPrompt {
+                kind: InputPromptKind::NewPane,
+                value: String::new(),
+            });
+            app.status = "new pane: enter <host>/<session>".to_string();
             Ok(false)
         }
         KeyCode::Enter => {
@@ -606,6 +645,137 @@ fn begin_kill_prompt(config: &Config, app: &mut App) -> Result<()> {
 
     app.kill_prompt = Some(KillPrompt { target });
     Ok(())
+}
+
+fn begin_rename_prompt(app: &mut App) {
+    let Some(row) = app.selected_row() else {
+        app.status = "no selected row".to_string();
+        return;
+    };
+    app.input_prompt = Some(InputPrompt {
+        kind: InputPromptKind::RenameSession {
+            host: row.host.clone(),
+            current: row.tmux.session.clone(),
+        },
+        value: row.tmux.session.clone(),
+    });
+    app.status = "rename session: edit name and press enter".to_string();
+}
+
+fn handle_input_prompt_key(
+    key: KeyEvent,
+    config: &Config,
+    host: Option<String>,
+    tx: mpsc::Sender<RefreshMessage>,
+    app: &mut App,
+) -> Result<()> {
+    let Some(prompt) = app.input_prompt.as_mut() else {
+        return Ok(());
+    };
+
+    match key.code {
+        KeyCode::Esc => {
+            app.input_prompt = None;
+            app.status = "action cancelled".to_string();
+        }
+        KeyCode::Backspace => {
+            prompt.value.pop();
+        }
+        KeyCode::Enter => {
+            execute_input_prompt(config, host, tx, app)?;
+        }
+        KeyCode::Char(ch) => {
+            prompt.value.push(ch);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn execute_input_prompt(
+    config: &Config,
+    scoped_host: Option<String>,
+    tx: mpsc::Sender<RefreshMessage>,
+    app: &mut App,
+) -> Result<()> {
+    let Some(prompt) = app.input_prompt.take() else {
+        return Ok(());
+    };
+
+    match prompt.kind {
+        InputPromptKind::RenameSession {
+            host: host_id,
+            current,
+        } => {
+            let new_name = prompt.value.trim();
+            if new_name.is_empty() {
+                app.status = "rename cancelled: empty name".to_string();
+                return Ok(());
+            }
+            if new_name == current {
+                app.status = "rename skipped: unchanged".to_string();
+                return Ok(());
+            }
+            match lifecycle::rename_session(config, &host_id, &current, new_name, false) {
+                Ok(()) => {
+                    app.status = format!("renamed {host_id}/{current} -> {new_name}");
+                    spawn_refresh(config, Some(host_id), tx, app)?;
+                }
+                Err(err) => app.status = format!("{err:#}"),
+            }
+        }
+        InputPromptKind::NewSession => {
+            let Some((host_id, session_name)) = parse_host_session(prompt.value.trim()) else {
+                app.status = "new session expects <host>/<session>".to_string();
+                return Ok(());
+            };
+            if let Some(scope) = scoped_host.as_deref()
+                && scope != host_id
+            {
+                app.status = format!(
+                    "new session blocked in scoped view: expected host `{scope}`, got `{host_id}`"
+                );
+                return Ok(());
+            }
+            match lifecycle::new_session(config, host_id, session_name, None, None, false) {
+                Ok(()) => {
+                    app.status = format!("created session {host_id}/{session_name}");
+                    spawn_refresh(config, Some(host_id.to_string()), tx, app)?;
+                }
+                Err(err) => app.status = format!("{err:#}"),
+            }
+        }
+        InputPromptKind::NewPane => {
+            let Some((host_id, session_name)) = parse_host_session(prompt.value.trim()) else {
+                app.status = "new pane expects <host>/<session>".to_string();
+                return Ok(());
+            };
+            if let Some(scope) = scoped_host.as_deref()
+                && scope != host_id
+            {
+                app.status = format!(
+                    "new pane blocked in scoped view: expected host `{scope}`, got `{host_id}`"
+                );
+                return Ok(());
+            }
+            match lifecycle::new_pane(config, host_id, session_name, false) {
+                Ok(()) => {
+                    app.status = format!("spawned pane in {host_id}/{session_name}");
+                    spawn_refresh(config, Some(host_id.to_string()), tx, app)?;
+                }
+                Err(err) => app.status = format!("{err:#}"),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_host_session(input: &str) -> Option<(&str, &str)> {
+    let (host, session) = input.split_once('/')?;
+    if host.is_empty() || session.is_empty() || session.contains(':') {
+        return None;
+    }
+    Some((host, session))
 }
 
 fn attach_selected(
@@ -906,6 +1076,9 @@ fn draw_detail(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             Line::from("c capture into detail"),
             Line::from("i inspect and refresh detail"),
             Line::from("k kill selected pane"),
+            Line::from("e rename selected session"),
+            Line::from("n create session (<host>/<session>)"),
+            Line::from("p spawn pane (<host>/<session>)"),
             Line::from("q quit"),
         ]);
         frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
@@ -975,6 +1148,10 @@ fn draw_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         );
         return;
     }
+    if let Some(prompt) = &app.input_prompt {
+        frame.render_widget(Paragraph::new(input_prompt_line(prompt)), area);
+        return;
+    }
 
     let mode = if app.editing_filter {
         "filter"
@@ -998,6 +1175,12 @@ fn draw_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         Span::raw(" inspect | "),
         key_span("k"),
         Span::raw(" kill | "),
+        key_span("e"),
+        Span::raw(" rename | "),
+        key_span("n"),
+        Span::raw(" new-session | "),
+        key_span("p"),
+        Span::raw(" new-pane | "),
         key_span("q"),
         Span::raw(" quit"),
         Span::raw("   "),
@@ -1017,6 +1200,30 @@ fn inspected_row<'a>(app: &'a App, selected: &'a SessionSnapshot) -> &'a Session
         return &detail.session;
     }
     selected
+}
+
+fn input_prompt_line(prompt: &InputPrompt) -> Line<'static> {
+    let (label, hint) = match &prompt.kind {
+        InputPromptKind::RenameSession { host, current } => (
+            format!("rename {host}/{current} -> "),
+            "enter new session name (Esc to cancel)",
+        ),
+        InputPromptKind::NewSession => (
+            "new session ".to_string(),
+            "enter <host>/<session> (Esc to cancel)",
+        ),
+        InputPromptKind::NewPane => (
+            "new pane ".to_string(),
+            "enter <host>/<session> (Esc to cancel)",
+        ),
+    };
+    Line::from(vec![
+        Span::styled(label, Style::default().fg(Color::Yellow)),
+        Span::raw(prompt.value.clone()),
+        Span::styled(" _", Style::default().fg(Color::LightCyan)),
+        Span::raw(" | "),
+        Span::styled(hint, muted_style()),
+    ])
 }
 
 fn detail_meta_lines(row: &SessionSnapshot) -> Vec<Line<'static>> {
