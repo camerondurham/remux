@@ -928,7 +928,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         .split(area);
 
     draw_summary(frame, chunks[0], app);
-    if app.inspect_mode {
+    if app.inspect_mode || app.help {
         draw_inspector(frame, chunks[1], app);
     } else if app.show_context && area.width > 110 {
         let body = Layout::default()
@@ -1189,6 +1189,12 @@ fn canonical_state(row: &SessionSnapshot) -> &'static str {
         "ambiguous"
     } else if matches!(
         row.match_status,
+        MatchStatus::Shadowed | MatchStatus::Orphan | MatchStatus::Unknown
+    ) || matches!(row.state, SessionState::Unknown)
+    {
+        "drift"
+    } else if matches!(
+        row.match_status,
         MatchStatus::Missing | MatchStatus::Unreachable
     ) || matches!(row.state, SessionState::Missing | SessionState::Unreachable)
     {
@@ -1205,6 +1211,7 @@ fn canonical_state_style(row: &SessionSnapshot) -> Style {
     match canonical_state(row) {
         "ready" => Style::default().fg(Color::Green),
         "stale" => Style::default().fg(Color::Yellow),
+        "drift" => Style::default().fg(Color::LightBlue),
         "busy" => Style::default().fg(Color::LightYellow),
         "missing" => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         "ambiguous" => Style::default().fg(Color::Magenta),
