@@ -49,6 +49,7 @@ cp examples/config.yaml ~/.config/remux/config.yaml
 Edit `~/.config/remux/config.yaml`, then run:
 
 ```bash
+remux doctor
 remux hosts
 remux list
 remux sessions
@@ -125,6 +126,7 @@ Legacy `sessions` entries are still accepted as exact tmux-coordinate watches.
 
 ```bash
 remux hosts
+remux doctor [--json]
 remux snapshot <host> [--json]
 remux list [--json] [--group panes|sessions]
 remux sessions [--host HOST] [--json]
