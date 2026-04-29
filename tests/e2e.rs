@@ -455,6 +455,10 @@ impl TestEnv {
         fs::write(&tmux_path, fake_tmux_script()).unwrap();
         make_executable(&tmux_path);
 
+        let fzf_path = bin_dir.join("fzf");
+        fs::write(&fzf_path, fake_missing_fzf_script()).unwrap();
+        make_executable(&fzf_path);
+
         let config = root.join("config.yaml");
         fs::write(
             &config,
@@ -666,6 +670,12 @@ fi
 
 echo "unexpected tmux command: $*" >&2
 exit 44
+"#
+}
+
+fn fake_missing_fzf_script() -> &'static str {
+    r#"#!/usr/bin/env bash
+exit 127
 "#
 }
 

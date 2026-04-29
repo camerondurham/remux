@@ -113,6 +113,8 @@ struct App {
     inspected_detail: Option<PaneDetail>,
     kill_prompt: Option<KillPrompt>,
     input_prompt: Option<InputPrompt>,
+    action_feedback: Option<ActionFeedback>,
+    pending_confirmations: Vec<PendingConfirmation>,
     last_refresh: Option<Instant>,
     sort_mode: SortMode,
 }
@@ -132,6 +134,29 @@ struct KillPrompt {
 struct InputPrompt {
     kind: InputPromptKind,
     value: String,
+}
+
+#[derive(Clone)]
+struct ActionFeedback {
+    level: FeedbackLevel,
+    message: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FeedbackLevel {
+    Info,
+    Success,
+    Error,
+}
+
+struct PendingConfirmation {
+    kind: PendingConfirmationKind,
+    host: String,
+    session: String,
+}
+
+enum PendingConfirmationKind {
+    CreatedSession,
 }
 
 #[derive(Clone)]
@@ -192,6 +217,8 @@ impl App {
             inspected_detail: None,
             kill_prompt: None,
             input_prompt: None,
+            action_feedback: None,
+            pending_confirmations: Vec::new(),
             last_refresh: None,
             sort_mode: SortMode::Attention,
         }
@@ -279,6 +306,7 @@ impl App {
             RefreshMessage::HostFinished { snapshot } => {
                 let selected_identity = self.selected_row_identity();
                 self.update_host_finished(&snapshot);
+                self.confirm_pending_for_snapshot(&snapshot);
                 self.upsert_snapshot(snapshot);
                 self.restore_selection(selected_identity);
                 self.status = self.progress_summary();
@@ -459,11 +487,94 @@ impl App {
         };
         self.restore_selection(selected_identity);
     }
+
+    fn set_feedback(&mut self, level: FeedbackLevel, message: impl Into<String>) {
+        self.action_feedback = Some(ActionFeedback {
+            level,
+            message: compact_status_message(&message.into()),
+        });
+    }
+
+    fn add_session_confirmation(&mut self, host: impl Into<String>, session: impl Into<String>) {
+        self.pending_confirmations.push(PendingConfirmation {
+            kind: PendingConfirmationKind::CreatedSession,
+            host: host.into(),
+            session: session.into(),
+        });
+    }
+
+    fn confirm_pending_for_snapshot(&mut self, snapshot: &HostSnapshot) {
+        if self.pending_confirmations.is_empty() {
+            return;
+        }
+
+        let mut remaining = Vec::new();
+        let pending = std::mem::take(&mut self.pending_confirmations);
+        for confirmation in pending {
+            if confirmation.host != snapshot.host {
+                remaining.push(confirmation);
+                continue;
+            }
+
+            match confirmation.kind {
+                PendingConfirmationKind::CreatedSession => {
+                    let target = format!("{}/{}", confirmation.host, confirmation.session);
+                    if snapshot.status == SnapshotStatus::Unreachable {
+                        let reason = snapshot
+                            .errors
+                            .first()
+                            .map(|error| error.message.as_str())
+                            .unwrap_or("host unreachable during confirmation scan");
+                        self.set_feedback(
+                            FeedbackLevel::Error,
+                            format!(
+                                "created session {target}, but refresh could not confirm: {reason}"
+                            ),
+                        );
+                        continue;
+                    }
+
+                    let visible = snapshot.sessions.iter().any(|row| {
+                        row.raw_target.is_some()
+                            && row.tmux.session == confirmation.session
+                            && !matches!(
+                                row.match_status,
+                                MatchStatus::Missing | MatchStatus::Unreachable
+                            )
+                    });
+                    if visible {
+                        self.set_feedback(
+                            FeedbackLevel::Success,
+                            format!("created session {target}; confirmed in latest scan"),
+                        );
+                    } else {
+                        self.set_feedback(
+                            FeedbackLevel::Error,
+                            format!(
+                                "created session {target}, but it was not visible in latest scan"
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+        self.pending_confirmations = remaining;
+    }
 }
 
 impl HostProgressState {
     fn is_finished(self) -> bool {
         matches!(self, HostProgressState::Ok | HostProgressState::Unreachable)
+    }
+}
+
+impl FeedbackLevel {
+    fn label(self) -> &'static str {
+        match self {
+            FeedbackLevel::Info => "info",
+            FeedbackLevel::Success => "ok",
+            FeedbackLevel::Error => "error",
+        }
     }
 }
 
@@ -586,15 +697,20 @@ fn handle_key(
                 let prompt = app.kill_prompt.take().expect("prompt exists");
                 match lifecycle::kill(config, &prompt.target, true, false) {
                     Ok(()) => {
-                        app.status = format!("killed {}", prompt.target);
+                        app.set_feedback(
+                            FeedbackLevel::Success,
+                            format!("killed {}; refreshing to confirm", prompt.target),
+                        );
                         spawn_refresh(config, host, tx, app)?;
                     }
-                    Err(err) => app.status = format!("{err:#}"),
+                    Err(err) => {
+                        app.set_feedback(FeedbackLevel::Error, format!("kill failed: {err:#}"));
+                    }
                 }
             }
             _ => {
                 app.kill_prompt = None;
-                app.status = "kill cancelled".to_string();
+                app.set_feedback(FeedbackLevel::Info, "kill cancelled");
             }
         }
         return Ok(false);
@@ -757,7 +873,7 @@ fn handle_input_prompt_key(
     match key.code {
         KeyCode::Esc => {
             app.input_prompt = None;
-            app.status = "action cancelled".to_string();
+            app.set_feedback(FeedbackLevel::Info, "action cancelled");
         }
         KeyCode::Backspace => {
             prompt.value.pop();
@@ -790,61 +906,83 @@ fn execute_input_prompt(
         } => {
             let new_name = prompt.value.trim();
             if new_name.is_empty() {
-                app.status = "rename cancelled: empty name".to_string();
+                app.set_feedback(FeedbackLevel::Info, "rename cancelled: empty name");
                 return Ok(());
             }
             if new_name == current {
-                app.status = "rename skipped: unchanged".to_string();
+                app.set_feedback(FeedbackLevel::Info, "rename skipped: unchanged");
                 return Ok(());
             }
             match lifecycle::rename_session(config, &host_id, &current, new_name, false) {
                 Ok(()) => {
-                    app.status = format!("renamed {host_id}/{current} -> {new_name}");
+                    app.set_feedback(
+                        FeedbackLevel::Success,
+                        format!("renamed {host_id}/{current} -> {new_name}; refreshing to confirm"),
+                    );
                     spawn_refresh(config, Some(host_id), tx, app)?;
                 }
-                Err(err) => app.status = format!("{err:#}"),
+                Err(err) => {
+                    app.set_feedback(FeedbackLevel::Error, format!("rename failed: {err:#}"));
+                }
             }
         }
         InputPromptKind::NewSession => {
             let Some((host_id, session_name)) = parse_host_session(prompt.value.trim()) else {
-                app.status = "new session expects <host>/<session>".to_string();
+                app.set_feedback(FeedbackLevel::Error, "new session expects <host>/<session>");
                 return Ok(());
             };
             if let Some(scope) = scoped_host.as_deref()
                 && scope != host_id
             {
-                app.status = format!(
+                app.set_feedback(
+                    FeedbackLevel::Error,
+                    format!(
                     "new session blocked in scoped view: expected host `{scope}`, got `{host_id}`"
+                    ),
                 );
                 return Ok(());
             }
             match lifecycle::new_session(config, host_id, session_name, None, None, false) {
                 Ok(()) => {
-                    app.status = format!("created session {host_id}/{session_name}");
+                    app.set_feedback(
+                        FeedbackLevel::Success,
+                        format!("created session {host_id}/{session_name}; refreshing to confirm"),
+                    );
+                    app.add_session_confirmation(host_id, session_name);
                     spawn_refresh(config, Some(host_id.to_string()), tx, app)?;
                 }
-                Err(err) => app.status = format!("{err:#}"),
+                Err(err) => {
+                    app.set_feedback(FeedbackLevel::Error, format!("new session failed: {err:#}"));
+                }
             }
         }
         InputPromptKind::NewPane => {
             let Some((host_id, session_name)) = parse_host_session(prompt.value.trim()) else {
-                app.status = "new pane expects <host>/<session>".to_string();
+                app.set_feedback(FeedbackLevel::Error, "new pane expects <host>/<session>");
                 return Ok(());
             };
             if let Some(scope) = scoped_host.as_deref()
                 && scope != host_id
             {
-                app.status = format!(
-                    "new pane blocked in scoped view: expected host `{scope}`, got `{host_id}`"
+                app.set_feedback(
+                    FeedbackLevel::Error,
+                    format!(
+                        "new pane blocked in scoped view: expected host `{scope}`, got `{host_id}`"
+                    ),
                 );
                 return Ok(());
             }
             match lifecycle::new_pane(config, host_id, session_name, false) {
                 Ok(()) => {
-                    app.status = format!("spawned pane in {host_id}/{session_name}");
+                    app.set_feedback(
+                        FeedbackLevel::Success,
+                        format!("spawned pane in {host_id}/{session_name}; refreshing to confirm"),
+                    );
                     spawn_refresh(config, Some(host_id.to_string()), tx, app)?;
                 }
-                Err(err) => app.status = format!("{err:#}"),
+                Err(err) => {
+                    app.set_feedback(FeedbackLevel::Error, format!("new pane failed: {err:#}"));
+                }
             }
         }
     }
@@ -967,7 +1105,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         .constraints([
             Constraint::Length(4),
             Constraint::Min(10),
-            Constraint::Length(1),
+            Constraint::Length(2),
         ])
         .split(area);
 
@@ -1309,16 +1447,25 @@ fn draw_inspector(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 fn draw_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     if let Some(prompt) = &app.kill_prompt {
         frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("confirm ", Style::default().fg(Color::Yellow)),
-                Span::raw(format!("kill {}? (y/N)", prompt.target)),
+            Paragraph::new(Text::from(vec![
+                Line::from(vec![
+                    Span::styled("confirm ", Style::default().fg(Color::Yellow)),
+                    Span::raw(format!("kill {}? (y/N)", prompt.target)),
+                ]),
+                footer_key_line(),
             ])),
             area,
         );
         return;
     }
     if let Some(prompt) = &app.input_prompt {
-        frame.render_widget(Paragraph::new(input_prompt_line(prompt)), area);
+        frame.render_widget(
+            Paragraph::new(Text::from(vec![
+                input_prompt_line(prompt),
+                footer_key_line(),
+            ])),
+            area,
+        );
         return;
     }
 
@@ -1329,7 +1476,38 @@ fn draw_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     } else {
         "ready"
     };
-    let mut spans = vec![
+    let mut status_spans = vec![
+        Span::styled(mode, Style::default().fg(Color::Cyan)),
+        Span::raw(" | "),
+    ];
+    if let Some(feedback) = &app.action_feedback {
+        status_spans.push(Span::styled(
+            feedback.level.label(),
+            feedback_level_style(feedback.level),
+        ));
+        status_spans.push(Span::raw(" "));
+        status_spans.push(Span::styled(
+            feedback.message.clone(),
+            feedback_level_style(feedback.level),
+        ));
+        status_spans.push(Span::raw(" | "));
+    }
+    status_spans.push(Span::raw(app.status.clone()));
+    status_spans.push(Span::raw(format!(" | filter: {}", app.filter)));
+    if app.editing_filter {
+        status_spans.push(Span::styled(" _", Style::default().fg(Color::LightCyan)));
+    }
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![
+            Line::from(status_spans),
+            footer_key_line(),
+        ])),
+        area,
+    );
+}
+
+fn footer_key_line() -> Line<'static> {
+    Line::from(vec![
         key_span("enter"),
         Span::raw(" readonly | "),
         key_span("a"),
@@ -1354,14 +1532,7 @@ fn draw_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         Span::raw(" new-pane | "),
         key_span("q"),
         Span::raw(" quit"),
-        Span::raw("   "),
-        Span::styled(mode, Style::default().fg(Color::Cyan)),
-        Span::raw(format!(" | {} | filter: {}", app.status, app.filter)),
-    ];
-    if app.editing_filter {
-        spans.push(Span::styled(" _", Style::default().fg(Color::LightCyan)));
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    ])
 }
 
 fn inspected_row<'a>(app: &'a App, selected: &'a SessionSnapshot) -> &'a SessionSnapshot {
@@ -1776,6 +1947,25 @@ fn key_span(key: &'static str) -> Span<'static> {
     )
 }
 
+fn feedback_level_style(level: FeedbackLevel) -> Style {
+    match level {
+        FeedbackLevel::Info => Style::default().fg(Color::Yellow),
+        FeedbackLevel::Success => Style::default()
+            .fg(Color::LightGreen)
+            .add_modifier(Modifier::BOLD),
+        FeedbackLevel::Error => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+    }
+}
+
+fn compact_status_message(message: &str) -> String {
+    message
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 fn row_search_text(row: &SessionSnapshot) -> String {
     let repo_text = row
         .repo
@@ -1995,4 +2185,119 @@ fn first_row_error(session: &SessionSnapshot) -> Option<String> {
         .errors
         .first()
         .map(|error| short_message(&error.message))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refresh_progress_preserves_management_feedback() {
+        let mut app = App::new(String::new());
+        app.set_feedback(
+            FeedbackLevel::Success,
+            "created session pi/new-work; refreshing to confirm",
+        );
+
+        app.begin_refresh(vec!["pi".to_string()]);
+
+        let feedback = app.action_feedback.as_ref().expect("feedback");
+        assert_eq!(feedback.level, FeedbackLevel::Success);
+        assert_eq!(
+            feedback.message,
+            "created session pi/new-work; refreshing to confirm"
+        );
+        assert!(app.status.contains("0/1 hosts"));
+    }
+
+    #[test]
+    fn created_session_confirmation_reports_visible_session() {
+        let mut app = App::new(String::new());
+        app.add_session_confirmation("pi", "new-work");
+
+        app.apply_refresh(RefreshMessage::HostFinished {
+            snapshot: host_snapshot(
+                "pi",
+                SnapshotStatus::Ok,
+                vec![session_snapshot("pi", "new-work")],
+                Vec::new(),
+            ),
+        });
+
+        let feedback = app.action_feedback.as_ref().expect("feedback");
+        assert_eq!(feedback.level, FeedbackLevel::Success);
+        assert_eq!(
+            feedback.message,
+            "created session pi/new-work; confirmed in latest scan"
+        );
+        assert!(app.pending_confirmations.is_empty());
+    }
+
+    #[test]
+    fn created_session_confirmation_reports_missing_session() {
+        let mut app = App::new(String::new());
+        app.add_session_confirmation("pi", "new-work");
+
+        app.apply_refresh(RefreshMessage::HostFinished {
+            snapshot: host_snapshot("pi", SnapshotStatus::Ok, Vec::new(), Vec::new()),
+        });
+
+        let feedback = app.action_feedback.as_ref().expect("feedback");
+        assert_eq!(feedback.level, FeedbackLevel::Error);
+        assert_eq!(
+            feedback.message,
+            "created session pi/new-work, but it was not visible in latest scan"
+        );
+    }
+
+    #[test]
+    fn multiline_feedback_is_compacted_for_the_status_bar() {
+        assert_eq!(
+            compact_status_message("failed to create\n\nhint: verify ssh works"),
+            "failed to create | hint: verify ssh works"
+        );
+    }
+
+    fn host_snapshot(
+        host: &str,
+        status: SnapshotStatus,
+        sessions: Vec<SessionSnapshot>,
+        errors: Vec<SnapshotError>,
+    ) -> HostSnapshot {
+        HostSnapshot {
+            host: host.to_string(),
+            status,
+            collected_at: Utc::now(),
+            sessions,
+            errors,
+        }
+    }
+
+    fn session_snapshot(host: &str, session: &str) -> SessionSnapshot {
+        SessionSnapshot {
+            session_id: format!("{host}/{session}:0.0"),
+            target: format!("{host}/{session}:0.0"),
+            display_id: format!("{host}/{session}:0.0"),
+            raw_target: Some(format!("{host}/{session}:0.0")),
+            host: host.to_string(),
+            match_status: MatchStatus::Orphan,
+            watch_id: None,
+            watch_index: None,
+            candidate_targets: Vec::new(),
+            shadowed_by: None,
+            state: SessionState::Active,
+            agent_hint: None,
+            tmux: snapshot::TmuxSnapshot {
+                session: session.to_string(),
+                window: Some("0".to_string()),
+                pane: Some("0".to_string()),
+                pane_id: Some("%1".to_string()),
+                session_attached: Some(false),
+            },
+            process: None,
+            repo: None,
+            output: None,
+            errors: Vec::new(),
+        }
+    }
 }
