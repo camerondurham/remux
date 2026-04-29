@@ -20,7 +20,6 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::io::{self, Stdout};
 use std::sync::{Arc, Mutex, mpsc};
@@ -115,6 +114,8 @@ struct App {
     input_prompt: Option<InputPrompt>,
     last_refresh: Option<Instant>,
     sort_mode: SortMode,
+    show_context: bool,
+    inspect_mode: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -159,18 +160,10 @@ enum HostProgressState {
 }
 
 struct DashboardSummary {
-    host_ok: usize,
-    host_total: usize,
-    host_unreachable: usize,
     sessions: usize,
-    active: usize,
     quiet: usize,
     idle: usize,
     missing: usize,
-    ambiguous: usize,
-    shadowed: usize,
-    errors: usize,
-    attention: usize,
 }
 
 impl App {
@@ -194,6 +187,8 @@ impl App {
             input_prompt: None,
             last_refresh: None,
             sort_mode: SortMode::Attention,
+            show_context: true,
+            inspect_mode: false,
         }
     }
 
@@ -373,32 +368,6 @@ impl App {
     }
 
     fn summary(&self) -> DashboardSummary {
-        let (host_ok, host_total, host_unreachable) = if self.host_progress.is_empty() {
-            (
-                self.snapshots
-                    .iter()
-                    .filter(|snapshot| snapshot.status == SnapshotStatus::Ok)
-                    .count(),
-                self.snapshots.len(),
-                self.snapshots
-                    .iter()
-                    .filter(|snapshot| snapshot.status == SnapshotStatus::Unreachable)
-                    .count(),
-            )
-        } else {
-            (
-                self.host_progress
-                    .iter()
-                    .filter(|host| host.state == HostProgressState::Ok)
-                    .count(),
-                self.host_progress.len(),
-                self.host_progress
-                    .iter()
-                    .filter(|host| host.state == HostProgressState::Unreachable)
-                    .count(),
-            )
-        };
-
         let sessions: Vec<&SessionSnapshot> = self
             .snapshots
             .iter()
@@ -410,42 +379,12 @@ impl App {
                 .filter(|session| session.state == state)
                 .count()
         };
-        let ambiguous = sessions
-            .iter()
-            .filter(|session| session.match_status == MatchStatus::Ambiguous)
-            .count();
-        let shadowed = sessions
-            .iter()
-            .filter(|session| session.match_status == MatchStatus::Shadowed)
-            .count();
-        let errors = self
-            .snapshots
-            .iter()
-            .map(|snapshot| {
-                snapshot.errors.len()
-                    + snapshot
-                        .sessions
-                        .iter()
-                        .map(|session| session.errors.len())
-                        .sum::<usize>()
-            })
-            .sum();
         let missing = count_state(SessionState::Missing);
-        let attention = host_unreachable + missing + ambiguous + errors;
-
         DashboardSummary {
-            host_ok,
-            host_total,
-            host_unreachable,
             sessions: sessions.len(),
-            active: count_state(SessionState::Active),
             quiet: count_state(SessionState::Quiet),
             idle: count_state(SessionState::Idle),
             missing,
-            ambiguous,
-            shadowed,
-            errors,
-            attention,
         }
     }
 
@@ -624,7 +563,19 @@ fn handle_key(
     }
 
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => Ok(true),
+        KeyCode::Esc => {
+            if app.inspect_mode {
+                app.inspect_mode = false;
+                app.status = "browse".to_string();
+                Ok(false)
+            } else if app.help {
+                app.help = false;
+                Ok(false)
+            } else {
+                Ok(true)
+            }
+        }
+        KeyCode::Char('q') => Ok(true),
         KeyCode::Char('/') => {
             app.editing_filter = true;
             Ok(false)
@@ -650,12 +601,12 @@ fn handle_key(
             app.selected_identity = app.selected_row_identity();
             Ok(false)
         }
-        KeyCode::Up => {
+        KeyCode::Up | KeyCode::Char('k') => {
             app.selected = app.selected.saturating_sub(1);
             app.selected_identity = app.selected_row_identity();
             Ok(false)
         }
-        KeyCode::Char('k') => {
+        KeyCode::Char('x') => {
             begin_kill_prompt(config, app)?;
             Ok(false)
         }
@@ -692,7 +643,12 @@ fn handle_key(
             Ok(false)
         }
         KeyCode::Char('i') => {
+            app.inspect_mode = true;
             inspect_selected(config, app)?;
+            Ok(false)
+        }
+        KeyCode::Char('d') => {
+            app.show_context = !app.show_context;
             Ok(false)
         }
         _ => Ok(false),
@@ -965,98 +921,52 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
+            Constraint::Length(1),
             Constraint::Min(10),
             Constraint::Length(1),
         ])
         .split(area);
 
     draw_summary(frame, chunks[0], app);
-    let body = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(24),
-            Constraint::Percentage(42),
-            Constraint::Percentage(34),
-        ])
-        .split(chunks[1]);
-    draw_topology_tree(frame, body[0], app);
-    draw_live_table(frame, body[1], app);
-    draw_inspector(frame, body[2], app);
+    if app.inspect_mode {
+        draw_inspector(frame, chunks[1], app);
+    } else if app.show_context && area.width > 110 {
+        let body = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+            .split(chunks[1]);
+        draw_live_table(frame, body[0], app);
+        draw_context_rail(frame, body[1], app);
+    } else {
+        draw_live_table(frame, chunks[1], app);
+    }
     draw_status(frame, chunks[2], app);
 }
 
 fn draw_summary(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let summary = app.summary();
-    let top = Line::from(vec![
-        Span::styled("hosts ", label_style()),
-        Span::styled(
-            format!("{}/{} up", summary.host_ok, summary.host_total),
-            if summary.host_unreachable > 0 {
-                state_style(SessionState::Unreachable)
-            } else {
-                state_style(SessionState::Active)
-            },
-        ),
+    let mode = if app.inspect_mode {
+        "inspect"
+    } else if app.editing_filter {
+        "filter"
+    } else {
+        "browse"
+    };
+    let line = Line::from(vec![
+        Span::styled("remux", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" | "),
-        Span::styled("panes ", label_style()),
-        Span::raw(summary.sessions.to_string()),
+        Span::raw(format!("/ {}", filter_label(app))),
         Span::raw(" | "),
-        Span::styled("active ", label_style()),
-        Span::styled(
-            summary.active.to_string(),
-            state_style(SessionState::Active),
-        ),
+        Span::raw(format!(
+            "{} targets  {} stale  {} missing",
+            summary.sessions,
+            summary.quiet + summary.idle,
+            summary.missing
+        )),
         Span::raw(" | "),
-        Span::styled("quiet ", label_style()),
-        Span::styled(summary.quiet.to_string(), state_style(SessionState::Quiet)),
-        Span::raw(" | "),
-        Span::styled("idle ", label_style()),
-        Span::styled(summary.idle.to_string(), state_style(SessionState::Idle)),
-        Span::raw(" | "),
-        Span::styled("missing ", label_style()),
-        Span::styled(
-            summary.missing.to_string(),
-            state_style(SessionState::Missing),
-        ),
-        Span::raw(" | "),
-        Span::styled("ambiguous ", label_style()),
-        Span::styled(
-            summary.ambiguous.to_string(),
-            match_style(MatchStatus::Ambiguous),
-        ),
-        Span::raw(" | "),
-        Span::styled("shadowed ", label_style()),
-        Span::styled(
-            summary.shadowed.to_string(),
-            match_style(MatchStatus::Shadowed),
-        ),
+        Span::styled(mode, Style::default().fg(Color::Cyan)),
     ]);
-
-    let bottom = Line::from(vec![
-        Span::styled("attention ", label_style()),
-        Span::styled(
-            summary.attention.to_string(),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" | "),
-        Span::styled("errors ", label_style()),
-        Span::styled(
-            summary.errors.to_string(),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" | "),
-        Span::styled("sort ", label_style()),
-        Span::raw(app.sort_mode.label()),
-        Span::raw(" | "),
-        Span::styled("filter ", label_style()),
-        Span::raw(filter_label(app)),
-    ]);
-    let paragraph = Paragraph::new(Text::from(vec![top, bottom]))
-        .block(Block::default().borders(Borders::ALL).title("kpi"));
-    frame.render_widget(paragraph, area);
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 fn draw_live_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
@@ -1070,17 +980,6 @@ fn draw_live_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     }
 
     let table_rows = rows.iter().map(|session| {
-        let repo = session
-            .repo
-            .as_ref()
-            .map(|repo| basename(&repo.path).to_string())
-            .unwrap_or_else(|| "-".to_string());
-        let dirty = session
-            .repo
-            .as_ref()
-            .and_then(|repo| repo.dirty_count)
-            .map(|dirty| dirty.to_string())
-            .unwrap_or_else(|| "-".to_string());
         let preview = session
             .output
             .as_ref()
@@ -1088,9 +987,9 @@ fn draw_live_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             .unwrap_or_else(|| first_row_error(session).unwrap_or_else(|| "-".to_string()));
         Row::new(vec![
             Cell::from(session.display_id.clone()),
+            Cell::from(session.host.clone()),
+            Cell::from(canonical_state(session)).style(canonical_state_style(session)),
             Cell::from(table_target(session)),
-            Cell::from(session.match_status.as_str()).style(match_style(session.match_status)),
-            Cell::from(session.state.as_str()).style(state_style(session.state)),
             Cell::from(last_output_age(session)),
             Cell::from(
                 session
@@ -1099,33 +998,27 @@ fn draw_live_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                     .map(|process| process.command.clone())
                     .unwrap_or_else(|| "-".to_string()),
             ),
-            Cell::from(repo),
-            Cell::from(dirty.clone()).style(dirty_style(dirty.as_str())),
             Cell::from(preview).style(muted_style()),
         ])
-        .style(row_style(session))
+        .style(Style::default())
     });
     let table = Table::new(
         table_rows,
         [
+            Constraint::Min(18),
+            Constraint::Length(12),
+            Constraint::Length(11),
+            Constraint::Min(14),
+            Constraint::Length(8),
             Constraint::Min(16),
             Constraint::Min(18),
-            Constraint::Length(11),
-            Constraint::Length(9),
-            Constraint::Length(8),
-            Constraint::Length(12),
-            Constraint::Length(12),
-            Constraint::Length(7),
-            Constraint::Min(16),
         ],
     )
     .header(
-        Row::new([
-            "ID", "TARGET", "MATCH", "STATE", "LAST", "CMD", "REPO", "DIRTY", "PREVIEW",
-        ])
-        .style(Style::default().add_modifier(Modifier::BOLD)),
+        Row::new(["NAME", "HOST", "STATE", "TARGET", "AGE", "CMD", "PREVIEW"])
+            .style(Style::default().add_modifier(Modifier::BOLD)),
     )
-    .block(Block::default().borders(Borders::ALL).title("live table"))
+    .block(Block::default())
     .row_highlight_style(
         Style::default()
             .fg(Color::Black)
@@ -1137,92 +1030,6 @@ fn draw_live_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         state.select(Some(app.selected.min(rows.len() - 1)));
     }
     frame.render_stateful_widget(table, area, &mut state);
-}
-
-fn draw_topology_tree(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let rows = app.rows();
-    let selected = rows.get(app.selected).copied();
-    let mut hosts: BTreeMap<String, Vec<&SessionSnapshot>> = BTreeMap::new();
-    for row in rows {
-        hosts.entry(row.host.clone()).or_default().push(row);
-    }
-
-    let mut lines = Vec::new();
-    if hosts.is_empty() {
-        lines.push(Line::from("No topology rows"));
-    } else {
-        for (host, host_rows) in hosts {
-            let status = app
-                .snapshots
-                .iter()
-                .find(|snapshot| snapshot.host == host)
-                .map(|snapshot| snapshot.status)
-                .unwrap_or(SnapshotStatus::Ok);
-            lines.push(Line::from(vec![
-                Span::styled("▸ ", muted_style()),
-                Span::styled(host.clone(), Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(" "),
-                Span::styled(
-                    match status {
-                        SnapshotStatus::Ok => "(ok)",
-                        SnapshotStatus::Unreachable => "(unreachable)",
-                    },
-                    if status == SnapshotStatus::Ok {
-                        state_style(SessionState::Active)
-                    } else {
-                        state_style(SessionState::Unreachable)
-                    },
-                ),
-            ]));
-
-            let mut sessions: BTreeMap<String, Vec<&SessionSnapshot>> = BTreeMap::new();
-            for row in host_rows {
-                sessions
-                    .entry(row.tmux.session.clone())
-                    .or_default()
-                    .push(row);
-            }
-            for (session, session_rows) in sessions {
-                lines.push(Line::from(format!("  ▸ session {session}")));
-                for row in session_rows {
-                    let marker = if selected.map(|item| item.display_id.as_str())
-                        == Some(row.display_id.as_str())
-                    {
-                        ">"
-                    } else {
-                        " "
-                    };
-                    let pane = row
-                        .tmux
-                        .window
-                        .as_ref()
-                        .zip(row.tmux.pane.as_ref())
-                        .map(|(window, pane)| format!("{window}.{pane}"))
-                        .unwrap_or_else(|| "-".to_string());
-                    let command = row
-                        .process
-                        .as_ref()
-                        .map(|process| process.command.as_str())
-                        .unwrap_or("-");
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("    {marker} "), muted_style()),
-                        Span::styled(pane, muted_style()),
-                        Span::raw(" "),
-                        Span::styled(command.to_string(), Style::default().fg(Color::White)),
-                        Span::raw(" "),
-                        Span::styled(row.state.as_str(), state_style(row.state)),
-                    ]));
-                }
-            }
-        }
-    }
-
-    frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .block(Block::default().borders(Borders::ALL).title("topology"))
-            .wrap(Wrap { trim: false }),
-        area,
-    );
 }
 
 fn draw_inspector(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
@@ -1330,38 +1137,79 @@ fn draw_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         "ready"
     };
     let mut spans = vec![
-        key_span("enter"),
-        Span::raw(" readonly | "),
-        key_span("a"),
-        Span::raw(" jump | "),
-        key_span("r"),
-        Span::raw(" refresh | "),
-        key_span("s"),
-        Span::raw(" sort | "),
-        key_span("/"),
-        Span::raw(" filter | "),
-        key_span("c"),
-        Span::raw(" capture | "),
-        key_span("i"),
-        Span::raw(" inspect | "),
-        key_span("k"),
-        Span::raw(" kill | "),
-        key_span("e"),
-        Span::raw(" rename | "),
-        key_span("n"),
-        Span::raw(" new-session | "),
-        key_span("p"),
-        Span::raw(" new-pane | "),
-        key_span("q"),
-        Span::raw(" quit"),
-        Span::raw("   "),
+        Span::raw("↑↓ move  Enter act  i inspect  / filter  d details  ? help  x kill  q quit  "),
         Span::styled(mode, Style::default().fg(Color::Cyan)),
-        Span::raw(format!(" | {} | filter: {}", app.status, app.filter)),
+        Span::raw("  "),
+        Span::styled(short_message(&app.status), muted_style()),
     ];
     if app.editing_filter {
         spans.push(Span::styled(" _", Style::default().fg(Color::LightCyan)));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn draw_context_rail(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let Some(selected) = app.selected_row() else {
+        return;
+    };
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("target ", label_style()),
+            Span::raw(table_target(selected)),
+        ]),
+        Line::from(vec![
+            Span::styled("host ", label_style()),
+            Span::raw(selected.host.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled("state ", label_style()),
+            Span::styled(canonical_state(selected), canonical_state_style(selected)),
+        ]),
+        Line::from(vec![
+            Span::styled("cmd ", label_style()),
+            Span::raw(
+                selected
+                    .process
+                    .as_ref()
+                    .map(|p| short_message(&p.command))
+                    .unwrap_or_else(|| "-".into()),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("press i for full inspect", muted_style())),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().title("context").borders(Borders::LEFT)),
+        area,
+    );
+}
+
+fn canonical_state(row: &SessionSnapshot) -> &'static str {
+    if matches!(row.match_status, MatchStatus::Ambiguous) {
+        "ambiguous"
+    } else if matches!(
+        row.match_status,
+        MatchStatus::Missing | MatchStatus::Unreachable
+    ) || matches!(row.state, SessionState::Missing | SessionState::Unreachable)
+    {
+        "missing"
+    } else if row.state == SessionState::Idle {
+        "stale"
+    } else if row.state == SessionState::Quiet {
+        "busy"
+    } else {
+        "ready"
+    }
+}
+fn canonical_state_style(row: &SessionSnapshot) -> Style {
+    match canonical_state(row) {
+        "ready" => Style::default().fg(Color::Green),
+        "stale" => Style::default().fg(Color::Yellow),
+        "busy" => Style::default().fg(Color::LightYellow),
+        "missing" => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        "ambiguous" => Style::default().fg(Color::Magenta),
+        _ => Style::default(),
+    }
 }
 
 fn inspected_row<'a>(app: &'a App, selected: &'a SessionSnapshot) -> &'a SessionSnapshot {
@@ -1767,15 +1615,6 @@ fn muted_style() -> Style {
     Style::default().fg(Color::DarkGray)
 }
 
-fn key_span(key: &'static str) -> Span<'static> {
-    Span::styled(
-        key,
-        Style::default()
-            .fg(Color::LightCyan)
-            .add_modifier(Modifier::BOLD),
-    )
-}
-
 fn row_search_text(row: &SessionSnapshot) -> String {
     let repo_text = row
         .repo
@@ -1839,21 +1678,6 @@ fn row_identity(row: &SessionSnapshot) -> String {
                 .map(|target| format!("target:{target}"))
         })
         .unwrap_or_else(|| format!("display:{}|{}", row.display_id, row.target))
-}
-
-fn row_style(session: &SessionSnapshot) -> Style {
-    if matches!(
-        session.match_status,
-        MatchStatus::Unreachable | MatchStatus::Missing
-    ) {
-        return match_style(session.match_status);
-    }
-    match session.state {
-        SessionState::Idle => muted_style(),
-        SessionState::Quiet => Style::default().fg(Color::Gray),
-        SessionState::Missing | SessionState::Unreachable => state_style(session.state),
-        SessionState::Active | SessionState::Unknown => Style::default(),
-    }
 }
 
 fn compare_rows(left: &SessionSnapshot, right: &SessionSnapshot, mode: SortMode) -> Ordering {
@@ -1981,13 +1805,6 @@ fn short_message(message: &str) -> String {
     } else {
         format!("{}...", first_line.chars().take(LIMIT).collect::<String>())
     }
-}
-
-fn basename(path: &str) -> &str {
-    path.rsplit('/')
-        .next()
-        .filter(|value| !value.is_empty())
-        .unwrap_or(path)
 }
 
 fn first_row_error(session: &SessionSnapshot) -> Option<String> {
