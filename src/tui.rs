@@ -980,11 +980,7 @@ fn draw_live_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     }
 
     let table_rows = rows.iter().map(|session| {
-        let preview = session
-            .output
-            .as_ref()
-            .map(|output| short_message(&output.preview))
-            .unwrap_or_else(|| first_row_error(session).unwrap_or_else(|| "-".to_string()));
+        let hint = row_action_hint(session);
         Row::new(vec![
             Cell::from(session.display_id.clone()),
             Cell::from(session.host.clone()),
@@ -998,7 +994,7 @@ fn draw_live_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                     .map(|process| process.command.clone())
                     .unwrap_or_else(|| "-".to_string()),
             ),
-            Cell::from(preview).style(muted_style()),
+            Cell::from(hint).style(muted_style()),
         ])
         .style(Style::default())
     });
@@ -1011,11 +1007,11 @@ fn draw_live_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             Constraint::Min(14),
             Constraint::Length(8),
             Constraint::Min(16),
-            Constraint::Min(18),
+            Constraint::Min(22),
         ],
     )
     .header(
-        Row::new(["NAME", "HOST", "STATE", "TARGET", "AGE", "CMD", "PREVIEW"])
+        Row::new(["NAME", "HOST", "STATE", "TARGET", "AGE", "CMD", "ACTION"])
             .style(Style::default().add_modifier(Modifier::BOLD)),
     )
     .block(Block::default())
@@ -1137,7 +1133,7 @@ fn draw_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         "ready"
     };
     let mut spans = vec![
-        Span::raw("↑↓ move  Enter act  i inspect  / filter  d details  ? help  x kill  q quit  "),
+        Span::raw("↑↓ move  Enter attach(ro)  a jump(rw)  i inspect  / filter  d details  ? help  x kill  q quit  "),
         Span::styled(mode, Style::default().fg(Color::Cyan)),
         Span::raw("  "),
         Span::styled(short_message(&app.status), muted_style()),
@@ -1814,9 +1810,18 @@ fn short_message(message: &str) -> String {
     }
 }
 
-fn first_row_error(session: &SessionSnapshot) -> Option<String> {
-    session
-        .errors
-        .first()
-        .map(|error| short_message(&error.message))
+fn row_action_hint(session: &SessionSnapshot) -> String {
+    if let Some(reason) = attach_refusal_reason(session) {
+        return format!("blocked: {reason}");
+    }
+    if session.watch_id.is_some() {
+        return "enter attach watch".to_string();
+    }
+    if let Some(target) = &session.raw_target {
+        return format!("enter attach {target}");
+    }
+    if let Some(output) = &session.output {
+        return short_message(&output.preview);
+    }
+    "enter attach".to_string()
 }
