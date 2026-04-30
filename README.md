@@ -10,7 +10,7 @@ It does not summarize, score, orchestrate, spawn agents, install a daemon, or sy
 
 ![remux TUI showing local and SSH tmux sessions](docs/assets/remux-tui.png)
 
-![remux TUI demo filtering and inspecting panes](docs/assets/remux-tui-demo.gif)
+![remux TUI demo filtering, inspecting, sorting, and prompting for sessions](docs/assets/remux-tui-demo.gif)
 
 ## Why
 
@@ -211,7 +211,7 @@ a TTY, and requires `--yes` from non-interactive scripts.
 ## TUI Keys
 
 ```text
-enter readonly attach | a read-write jump | r refresh | / filter | c capture | i inspect | k kill | q quit
+enter readonly attach | a read-write jump | r refresh | s sort | / filter | c capture | i inspect | k kill | e rename | n new session | p new pane | ? help | q quit
 ```
 
 Passive discovery commands stay read-only: `hosts`, `list`, `snapshot`,
