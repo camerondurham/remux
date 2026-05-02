@@ -87,7 +87,7 @@ fn run() -> Result<()> {
         }
         Command::Capture { id, lines, color } => {
             let output = snapshot::capture(&config, &id, lines, color)?;
-            print!("{output}");
+            render::capture_output(&id, &output, None, color);
             Ok(())
         }
         Command::Attach { readonly, id } => attach::attach(&config, &id, readonly),

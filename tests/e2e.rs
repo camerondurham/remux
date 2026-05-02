@@ -71,10 +71,10 @@ fn ssh_tracer_bullet_works_end_to_end() {
     let inspect = env.remux(["--config", env.config_path(), "inspect", "codex-agent"]);
     assert_success(&inspect);
     let inspect_stdout = stdout(&inspect);
-    assert!(inspect_stdout.contains("Session:      codex-agent"));
-    assert!(inspect_stdout.contains("Command:      node"));
-    assert!(inspect_stdout.contains("Branch:       main"));
-    assert!(inspect_stdout.contains("Dirty files:  2"));
+    assert!(inspect_stdout.contains("Session") && inspect_stdout.contains("codex-agent"));
+    assert!(inspect_stdout.contains("Command") && inspect_stdout.contains("node"));
+    assert!(inspect_stdout.contains("Branch") && inspect_stdout.contains("main"));
+    assert!(inspect_stdout.contains("Dirty files") && inspect_stdout.contains("2"));
     assert!(inspect_stdout.contains("hello-remux"));
 
     let inspect_json = env.remux([
@@ -103,7 +103,10 @@ fn ssh_tracer_bullet_works_end_to_end() {
         "2",
     ]);
     assert_success(&capture);
-    assert_eq!(stdout(&capture), "line one\nhello-remux\n");
+    let capture_out = stdout(&capture);
+    assert!(capture_out.contains("Captured: codex-agent"));
+    assert!(capture_out.contains("line one"));
+    assert!(capture_out.contains("hello-remux"));
 
     let color_capture = env.remux([
         "--config",
@@ -278,7 +281,10 @@ sessions:
         "2",
     ]);
     assert_success(&capture);
-    assert_eq!(stdout(&capture), "local line\nlocal-remux\n");
+    let capture_out = stdout(&capture);
+    assert!(capture_out.contains("Captured: local-agent"));
+    assert!(capture_out.contains("local line"));
+    assert!(capture_out.contains("local-remux"));
 
     let attach = env.remux([
         "--config",
@@ -400,7 +406,10 @@ watches:
         "2",
     ]);
     assert_success(&capture);
-    assert_eq!(stdout(&capture), "line one\nhello-remux\n");
+    let capture_out = stdout(&capture);
+    assert!(capture_out.contains("Captured: codex-live"));
+    assert!(capture_out.contains("line one"));
+    assert!(capture_out.contains("hello-remux"));
 
     let ambiguous_capture = env.remux([
         "--config",

@@ -208,11 +208,19 @@ fn render_text(report: &DoctorReport) {
     println!();
     println!("HOSTS");
     for host in &report.hosts {
-        let status = if host.ok { "ok" } else { "fail" };
-        println!(
-            "- {} [{}] {} ({})",
-            host.host, host.kind, host.target, status
-        );
+        if host.ok {
+            println!("- {} [{}] {}", host.host, host.kind, host.target);
+        } else {
+            let issues = host.checks.iter().filter(|c| !c.ok).count();
+            println!(
+                "- {} [{}] {} ({} issue{})",
+                host.host,
+                host.kind,
+                host.target,
+                issues,
+                if issues == 1 { "" } else { "s" }
+            );
+        }
         for check in &host.checks {
             print_check(check);
         }
