@@ -155,5 +155,7 @@ mod tests {
         let options = host.ssh.unwrap().ssh_options(Duration::from_secs(5));
         assert_eq!(options.get("BatchMode").unwrap(), "yes");
         assert_eq!(options.get("ConnectTimeout").unwrap(), "5");
+        assert_eq!(options.get("ServerAliveInterval").unwrap(), "3");
+        assert_eq!(options.get("ServerAliveCountMax").unwrap(), "2");
     }
 }

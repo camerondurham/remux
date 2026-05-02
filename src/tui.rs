@@ -280,6 +280,18 @@ impl App {
                 self.status = self.progress_summary();
             }
             RefreshMessage::Complete => {
+                // Force any still-pending hosts to Unreachable. If we get here
+                // with Queued/Polling entries, poll_hosts detached wedged
+                // workers past the deadline. Marking them terminal keeps
+                // is_polling() honest so the UI can refresh again.
+                for progress in &mut self.host_progress {
+                    if progress.state == HostProgressState::Queued
+                        || progress.state == HostProgressState::Polling
+                    {
+                        progress.state = HostProgressState::Unreachable;
+                        progress.finished_at = Some(Instant::now());
+                    }
+                }
                 self.last_refresh_duration = self.refresh_started_at.map(|t| t.elapsed());
                 self.refresh_completed_at = Some(Instant::now());
                 self.status = format!("scan complete: {}", self.progress_summary());
@@ -551,8 +563,22 @@ fn poll_hosts(config: &Config, host_ids: Vec<String>, tx: mpsc::Sender<RefreshMe
         }));
     }
 
+    // Give workers up to command_timeout + 2s to finish cleanly. Beyond that,
+    // detach remaining workers and send Complete so the UI can resume refreshes.
+    let deadline = Instant::now() + config.poll.command_timeout + Duration::from_secs(2);
     for handle in handles {
-        let _ = handle.join();
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break; // deadline passed; detach remaining workers
+        }
+        let start = Instant::now();
+        while start.elapsed() < remaining && !handle.is_finished() {
+            thread::sleep(Duration::from_millis(25));
+        }
+        if handle.is_finished() {
+            let _ = handle.join();
+        }
+        // else: detach — thread continues in background but we move on
     }
     let _ = tx.send(RefreshMessage::Complete);
 }

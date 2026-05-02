@@ -361,6 +361,8 @@ impl SshConfig {
         let mut options = BTreeMap::from([
             ("BatchMode".to_string(), "yes".to_string()),
             ("ConnectTimeout".to_string(), timeout),
+            ("ServerAliveInterval".to_string(), "3".to_string()),
+            ("ServerAliveCountMax".to_string(), "2".to_string()),
         ]);
         options.extend(self.options.clone());
         options

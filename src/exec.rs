@@ -45,9 +45,11 @@ pub fn output(
         if started.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = join_reader(stdout_handle, "stdout", &description);
-            let stderr = join_reader(stderr_handle, "stderr", &description).unwrap_or_default();
-            let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
+            let deadline = Instant::now() + Duration::from_millis(500);
+            let _ = try_join_reader_with_deadline(stdout_handle, deadline);
+            let stderr_bytes =
+                try_join_reader_with_deadline(stderr_handle, deadline).unwrap_or_default();
+            let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
             if stderr.is_empty() {
                 bail!("{description} timed out after {}", format_duration(timeout));
             }
@@ -76,6 +78,22 @@ fn join_reader(
         .join()
         .map_err(|_| anyhow!("failed to join {stream} reader for {description}"))?
         .with_context(|| format!("failed to read {stream} for {description}"))
+}
+
+fn try_join_reader_with_deadline(
+    handle: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    deadline: Instant,
+) -> Option<Vec<u8>> {
+    while Instant::now() < deadline {
+        if handle.is_finished() {
+            return handle.join().ok().and_then(|r| r.ok());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    // Detach: the reader thread will exit when its pipe closes (or never, if a
+    // ControlMaster SSH daemon holds the fd open). One leaked thread is
+    // strictly better than blocking the caller forever.
+    None
 }
 
 fn format_duration(duration: Duration) -> String {
