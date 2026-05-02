@@ -581,6 +581,16 @@ if [[ "$remote" == NONCE=* ]]; then
   printf 'second node output\n'
   printf '===REMUX-CAPTURE-%s-%%4===\n' "$NONCE"
   printf 'scratch output\n'
+  printf '===REMUX-GIT-%s-%%3-BEGIN===\n' "$NONCE"
+  printf '/home/cam/work\n'
+  printf 'main\n'
+  printf '0\n'
+  printf '===REMUX-GIT-%s-%%3-END===\n' "$NONCE"
+  printf '===REMUX-GIT-%s-%%5-BEGIN===\n' "$NONCE"
+  printf '/home/cam/work\n'
+  printf 'main\n'
+  printf '0\n'
+  printf '===REMUX-GIT-%s-%%5-END===\n' "$NONCE"
   printf '===REMUX-END-%s===\n' "$NONCE"
   exit 0
 fi

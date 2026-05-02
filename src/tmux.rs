@@ -104,19 +104,58 @@ pub fn parse_inventory(host: &str, output: &str) -> Result<Vec<Pane>> {
     Ok(panes)
 }
 
-pub fn inventory_with_captures_command(capture_lines: usize) -> String {
+pub fn inventory_with_captures_command(
+    capture_lines: usize,
+    collect_git: bool,
+    skip_git_cwds: &[String],
+) -> String {
+    let git_section = if collect_git {
+        let skip_block = if skip_git_cwds.is_empty() {
+            String::new()
+        } else {
+            let patterns: Vec<String> = skip_git_cwds.iter().map(|c| shell_quote(c)).collect();
+            format!(
+                "      case \"$_git_cwd\" in\n        {}) continue ;;\n      esac\n",
+                patterns.join("|")
+            )
+        };
+        format!(
+            "\ntmux list-panes -a -F '#{{pane_id}}\t#{{pane_current_path}}' | while IFS='\t' read -r _git_pid _git_cwd; do\n\
+      case \"$_git_cwd\" in\n\
+        /|\"$HOME\"|\"\") continue ;;\n\
+      esac\n\
+{skip_block}\
+      echo \"===REMUX-GIT-$NONCE-$_git_pid-BEGIN===\"\n\
+      _toplevel=$(git -C \"$_git_cwd\" rev-parse --show-toplevel 2>/dev/null || echo \"\")\n\
+      if [ -n \"$_toplevel\" ]; then\n\
+        _branch=$(git -C \"$_git_cwd\" rev-parse --abbrev-ref HEAD 2>/dev/null || echo \"\")\n\
+        _dirty=$(git -C \"$_git_cwd\" status --porcelain=v1 2>/dev/null | wc -l | tr -d ' ')\n\
+      else\n\
+        _branch=\"\"\n\
+        _dirty=\"\"\n\
+      fi\n\
+      printf '%s\\n%s\\n%s\\n' \"$_toplevel\" \"$_branch\" \"$_dirty\"\n\
+      echo \"===REMUX-GIT-$NONCE-$_git_pid-END===\"\n\
+    done",
+            skip_block = skip_block,
+        )
+    } else {
+        String::new()
+    };
+
     format!(
-        r#"NONCE=$(openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | xxd -p | tr -d '\n')
-echo "===REMUX-INVENTORY-$NONCE-BEGIN==="
-{inventory}
-echo "===REMUX-INVENTORY-$NONCE-END==="
-tmux list-panes -a -F '#{{pane_id}}' | while IFS= read -r pid; do
-    echo "===REMUX-CAPTURE-$NONCE-$pid==="
-    tmux capture-pane -pt "$pid" -S -{capture_lines} || echo "===REMUX-ERROR-$NONCE==="
-done
-echo "===REMUX-END-$NONCE===""#,
+        "NONCE=$(openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | xxd -p | tr -d '\\n')\n\
+echo \"===REMUX-INVENTORY-$NONCE-BEGIN===\"\n\
+{inventory}\n\
+echo \"===REMUX-INVENTORY-$NONCE-END===\"\n\
+tmux list-panes -a -F '#{{pane_id}}' | while IFS= read -r pid; do\n\
+    echo \"===REMUX-CAPTURE-$NONCE-$pid===\"\n\
+    tmux capture-pane -pt \"$pid\" -S -{capture_lines} || echo \"===REMUX-ERROR-$NONCE===\"\n\
+done{git_section}\n\
+echo \"===REMUX-END-$NONCE===\"",
         inventory = INVENTORY_COMMAND,
         capture_lines = capture_lines,
+        git_section = git_section,
     )
 }
 
@@ -124,7 +163,11 @@ echo "===REMUX-END-$NONCE===""#,
 pub fn parse_inventory_with_captures(
     host_id: &str,
     raw: &str,
-) -> Result<(Vec<Pane>, HashMap<String, Option<String>>)> {
+) -> Result<(
+    Vec<Pane>,
+    HashMap<String, Option<String>>,
+    HashMap<String, Option<crate::git::RepoSnapshot>>,
+)> {
     let mut lines = raw.lines();
 
     // First line must be the inventory-begin delimiter; extract nonce from it.
@@ -157,17 +200,22 @@ pub fn parse_inventory_with_captures(
 
     let panes = parse_inventory(host_id, &inventory_lines.join("\n"))?;
 
-    // Collect per-pane captures.
+    // Collect per-pane captures and git sections.
     let mut captures: HashMap<String, Option<String>> = HashMap::new();
+    let mut git_map: HashMap<String, Option<crate::git::RepoSnapshot>> = HashMap::new();
     let mut current_pane_id: Option<String> = None;
     let mut current_body: Vec<&str> = Vec::new();
+    let mut current_git_pid: Option<String> = None;
+    let mut current_git_body: Vec<&str> = Vec::new();
     let mut found_end = false;
 
-    let flush = |pid: String,
-                 body: &[&str],
-                 captures: &mut HashMap<String, Option<String>>,
-                 error_sentinel: &str| {
-        // If the body is exactly the error sentinel, record None (capture failed).
+    let capture_prefix = format!("===REMUX-CAPTURE-{nonce}-");
+    let git_begin_prefix = format!("===REMUX-GIT-{nonce}-");
+
+    let flush_capture = |pid: String,
+                         body: &[&str],
+                         captures: &mut HashMap<String, Option<String>>,
+                         error_sentinel: &str| {
         if body == [error_sentinel] {
             captures.insert(pid, None);
         } else {
@@ -175,35 +223,88 @@ pub fn parse_inventory_with_captures(
         }
     };
 
+    let flush_git =
+        |pid: String,
+         body: &[&str],
+         git_map: &mut HashMap<String, Option<crate::git::RepoSnapshot>>| {
+            // body[0..3] are toplevel/branch/dirty
+            git_map.insert(pid, crate::git::parse_git_block(body));
+        };
+
     for line in lines.by_ref() {
         if line == end_marker {
             if let Some(pid) = current_pane_id.take() {
-                flush(pid, &current_body, &mut captures, &error_sentinel);
+                flush_capture(pid, &current_body, &mut captures, &error_sentinel);
                 current_body.clear();
+            }
+            if let Some(pid) = current_git_pid.take() {
+                flush_git(pid, &current_git_body, &mut git_map);
+                current_git_body.clear();
             }
             found_end = true;
             break;
         }
+
+        // Check for a git-end delimiter (reuses git_begin_prefix).
+        if let Some(rest) = line.strip_prefix(&git_begin_prefix)
+            && let Some(pid) = rest.strip_suffix("-END===")
+            && let Some(gpid) = current_git_pid.take()
+        {
+            if gpid == pid {
+                flush_git(gpid, &current_git_body, &mut git_map);
+                current_git_body.clear();
+                continue;
+            }
+            // Mismatched pid — treat as content (shouldn't happen).
+            current_git_pid = Some(gpid);
+        }
+
+        // Check for a git-begin delimiter.
+        if let Some(rest) = line.strip_prefix(&git_begin_prefix)
+            && let Some(pid) = rest.strip_suffix("-BEGIN===")
+        {
+            // Flush any in-progress capture.
+            if let Some(prev) = current_pane_id.take() {
+                flush_capture(prev, &current_body, &mut captures, &error_sentinel);
+                current_body.clear();
+            }
+            // Flush any in-progress git block.
+            if let Some(gpid) = current_git_pid.take() {
+                flush_git(gpid, &current_git_body, &mut git_map);
+                current_git_body.clear();
+            }
+            current_git_pid = Some(pid.to_string());
+            continue;
+        }
+
         // Check for a capture delimiter with the correct nonce.
-        let capture_prefix = format!("===REMUX-CAPTURE-{nonce}-");
         if let Some(rest) = line.strip_prefix(&capture_prefix)
             && let Some(pid) = rest.strip_suffix("===")
         {
             if let Some(prev) = current_pane_id.take() {
-                flush(prev, &current_body, &mut captures, &error_sentinel);
+                flush_capture(prev, &current_body, &mut captures, &error_sentinel);
                 current_body.clear();
+            }
+            if let Some(gpid) = current_git_pid.take() {
+                flush_git(gpid, &current_git_body, &mut git_map);
+                current_git_body.clear();
             }
             current_pane_id = Some(pid.to_string());
             continue;
         }
-        current_body.push(line);
+
+        if current_git_pid.is_some() {
+            current_git_body.push(line);
+        } else {
+            current_body.push(line);
+        }
     }
 
     if !found_end {
         bail!("missing end terminator for nonce {nonce}");
     }
 
-    Ok((panes, captures))
+    Ok((panes, captures, git_map))
 }
 
 pub fn capture_command(target: &PaneTarget, lines: usize, color: bool) -> String {
@@ -366,7 +467,7 @@ mod tests {
     fn parse_combined_happy_path() {
         let inv = "work\t0\t0\t%1\t100\tzsh\t/home/cam\t1\nwork\t0\t1\t%2\t101\tbash\t/tmp\t0";
         let raw = make_combined("abc123", inv, &[("%1", "line1\nline2"), ("%2", "")]);
-        let (panes, captures) = parse_inventory_with_captures("host", &raw).unwrap();
+        let (panes, captures, _git) = parse_inventory_with_captures("host", &raw).unwrap();
         assert_eq!(panes.len(), 2);
         assert_eq!(panes[0].pane_id, "%1");
         assert_eq!(panes[1].pane_id, "%2");
@@ -391,7 +492,7 @@ mod tests {
         // A line that looks like a delimiter but has a different nonce — should be capture content.
         let body_line = "===REMUX-CAPTURE-wrongnonce-%2===";
         let raw = make_combined("abc123", inv, &[("%1", body_line)]);
-        let (panes, captures) = parse_inventory_with_captures("host", &raw).unwrap();
+        let (panes, captures, _git) = parse_inventory_with_captures("host", &raw).unwrap();
         assert_eq!(panes.len(), 1);
         assert_eq!(captures["%1"], Some(body_line.to_string()));
     }
@@ -400,7 +501,7 @@ mod tests {
     fn parse_combined_empty_capture() {
         let inv = "work\t0\t0\t%1\t100\tzsh\t/home/cam\t1";
         let raw = make_combined("abc123", inv, &[("%1", "")]);
-        let (_, captures) = parse_inventory_with_captures("host", &raw).unwrap();
+        let (_, captures, _git) = parse_inventory_with_captures("host", &raw).unwrap();
         assert_eq!(captures["%1"], Some("".to_string()));
     }
 
@@ -412,7 +513,47 @@ mod tests {
         let raw = format!(
             "===REMUX-INVENTORY-{nonce}-BEGIN===\n{inv}\n===REMUX-INVENTORY-{nonce}-END===\n===REMUX-CAPTURE-{nonce}-%1===\n===REMUX-ERROR-{nonce}===\n===REMUX-END-{nonce}===\n"
         );
-        let (_, captures) = parse_inventory_with_captures("host", &raw).unwrap();
+        let (_, captures, _git) = parse_inventory_with_captures("host", &raw).unwrap();
         assert_eq!(captures["%1"], None);
+    }
+
+    #[test]
+    fn parse_combined_git_section() {
+        let nonce = "abc123";
+        let inv = "work\t0\t0\t%1\t100\tzsh\t/home/cam/repo\t1";
+        let raw = format!(
+            "===REMUX-INVENTORY-{nonce}-BEGIN===\n{inv}\n===REMUX-INVENTORY-{nonce}-END===\n\
+===REMUX-CAPTURE-{nonce}-%1===\nhello\n\
+===REMUX-GIT-{nonce}-%1-BEGIN===\n/home/cam/repo\nmain\n2\n===REMUX-GIT-{nonce}-%1-END===\n\
+===REMUX-END-{nonce}===\n"
+        );
+        let (_, _, git) = parse_inventory_with_captures("host", &raw).unwrap();
+        let snap = git["%1"].as_ref().unwrap();
+        assert_eq!(snap.path, "/home/cam/repo");
+        assert_eq!(snap.branch, Some("main".to_string()));
+        assert_eq!(snap.dirty_count, Some(2));
+    }
+
+    #[test]
+    fn parse_combined_git_not_in_repo() {
+        let nonce = "abc123";
+        let inv = "work\t0\t0\t%1\t100\tzsh\t/tmp\t1";
+        let raw = format!(
+            "===REMUX-INVENTORY-{nonce}-BEGIN===\n{inv}\n===REMUX-INVENTORY-{nonce}-END===\n\
+===REMUX-CAPTURE-{nonce}-%1===\nhello\n\
+===REMUX-GIT-{nonce}-%1-BEGIN===\n\n\n\n===REMUX-GIT-{nonce}-%1-END===\n\
+===REMUX-END-{nonce}===\n"
+        );
+        let (_, _, git) = parse_inventory_with_captures("host", &raw).unwrap();
+        assert!(git["%1"].is_none());
+    }
+
+    #[test]
+    fn collect_git_flag_controls_git_block() {
+        let off = inventory_with_captures_command(2, false, &[]);
+        assert!(!off.contains("REMUX-GIT"));
+        let on = inventory_with_captures_command(2, true, &[]);
+        assert!(on.contains("REMUX-GIT-$NONCE"));
+        assert!(on.contains("git -C"));
     }
 }

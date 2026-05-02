@@ -43,6 +43,13 @@ pub struct PollConfig {
     pub command_timeout: Duration,
     #[serde(default = "default_max_concurrency")]
     pub max_concurrency: usize,
+    #[serde(default = "default_collect_git")]
+    pub collect_git: bool,
+    #[serde(
+        default = "default_git_cache_ttl",
+        deserialize_with = "deserialize_duration"
+    )]
+    pub git_cache_ttl: Duration,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -135,6 +142,8 @@ impl Default for PollConfig {
             ssh_timeout: default_ssh_timeout(),
             command_timeout: default_command_timeout(),
             max_concurrency: default_max_concurrency(),
+            collect_git: default_collect_git(),
+            git_cache_ttl: default_git_cache_ttl(),
         }
     }
 }
@@ -208,6 +217,9 @@ impl Config {
         }
         if self.poll.max_concurrency == 0 {
             bail!("poll.max_concurrency must be greater than zero");
+        }
+        if self.poll.git_cache_ttl.is_zero() {
+            bail!("poll.git_cache_ttl must be greater than zero");
         }
 
         let mut host_ids = HashSet::new();
@@ -383,6 +395,14 @@ fn default_command_timeout() -> Duration {
 
 fn default_max_concurrency() -> usize {
     4
+}
+
+fn default_collect_git() -> bool {
+    true
+}
+
+fn default_git_cache_ttl() -> Duration {
+    Duration::from_secs(30)
 }
 
 fn validate_watch<'a>(
