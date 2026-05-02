@@ -434,6 +434,45 @@ watches:
     assert_eq!(work["panes"], 2);
 }
 
+#[test]
+fn unreachable_host_times_out_within_bounds() {
+    // Simulate a host whose SSH hangs (network partition, dead ControlMaster,
+    // etc.). The fake ssh script sleeps for 30s; config sets command_timeout
+    // to 2s. `remux snapshot` must return a timeout error within a few
+    // seconds, not hang.
+    let env = HangTestEnv::new(/* hang_secs */ 30);
+
+    let start = std::time::Instant::now();
+    let out = env.remux(["--config", env.config_path(), "snapshot", "slow"]);
+    let elapsed = start.elapsed();
+
+    assert_failure(&out);
+    let err = stderr(&out);
+    assert!(
+        err.contains("timed out") || err.contains("failed to poll"),
+        "expected timeout error in stderr, got: {err}"
+    );
+    // Generous upper bound: command_timeout (2s) + exec cleanup (0.5s) +
+    // process spawn overhead. If this fires, the hang-recovery path is
+    // broken.
+    assert!(
+        elapsed < std::time::Duration::from_secs(6),
+        "snapshot took {elapsed:?} — expected bounded recovery under ~3s"
+    );
+}
+
+#[test]
+fn ssh_keepalive_options_are_present() {
+    // Regression guard for Fix 1 (ServerAliveInterval / ServerAliveCountMax).
+    // The fake ssh script here rejects any invocation missing those options,
+    // so a successful snapshot implies remux passes them on every call.
+    let env = HangTestEnv::new_asserting_keepalives();
+
+    let out = env.remux(["--config", env.config_path(), "snapshot", "fast"]);
+    assert_success(&out);
+    assert!(stdout(&out).contains("fast"));
+}
+
 struct TestEnv {
     root: PathBuf,
     config: PathBuf,
@@ -518,6 +557,146 @@ impl Drop for TestEnv {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+/// Minimal test env for hang-recovery scenarios. Uses a parameterized fake
+/// ssh that either sleeps forever (hang_secs > 0) or responds normally
+/// depending on the requested host.
+struct HangTestEnv {
+    root: PathBuf,
+    config: PathBuf,
+    cache: PathBuf,
+    path: OsString,
+}
+
+impl HangTestEnv {
+    fn new(hang_secs: u32) -> Self {
+        Self::build(
+            fake_hang_ssh_script(hang_secs),
+            /* strict_keepalive */ false,
+        )
+    }
+
+    fn new_asserting_keepalives() -> Self {
+        Self::build(fake_hang_ssh_script(0), /* strict_keepalive */ true)
+    }
+
+    fn build(ssh_script_template: String, strict_keepalive: bool) -> Self {
+        let root = unique_temp_dir();
+        let bin_dir = root.join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+
+        let script = if strict_keepalive {
+            // Reject invocations missing the keepalive options.
+            format!(
+                "#!/usr/bin/env bash\nset -euo pipefail\nargs=\"$*\"\n\
+                 if [[ \"$args\" != *\"-o ServerAliveInterval=\"* ]]; then\n  \
+                   echo 'missing ServerAliveInterval' >&2; exit 77\n\
+                 fi\n\
+                 if [[ \"$args\" != *\"-o ServerAliveCountMax=\"* ]]; then\n  \
+                   echo 'missing ServerAliveCountMax' >&2; exit 77\n\
+                 fi\n{body}",
+                body = ssh_script_template
+                    .strip_prefix("#!/usr/bin/env bash\nset -euo pipefail\n")
+                    .unwrap_or(&ssh_script_template),
+            )
+        } else {
+            ssh_script_template
+        };
+
+        let ssh_path = bin_dir.join("ssh");
+        fs::write(&ssh_path, script).unwrap();
+        make_executable(&ssh_path);
+
+        // Stub tmux/git so host::run doesn't accidentally exec the real ones.
+        let tmux_path = bin_dir.join("tmux");
+        fs::write(&tmux_path, "#!/usr/bin/env bash\nexit 0\n").unwrap();
+        make_executable(&tmux_path);
+        let git_path = bin_dir.join("git");
+        fs::write(&git_path, "#!/usr/bin/env bash\nexit 0\n").unwrap();
+        make_executable(&git_path);
+
+        let config = root.join("config.yaml");
+        fs::write(
+            &config,
+            r#"
+poll:
+  command_timeout: 2s
+  ssh_timeout: 1s
+hosts:
+  - id: slow
+    type: ssh
+    ssh:
+      target: fake-slow
+  - id: fast
+    type: ssh
+    ssh:
+      target: fake-fast
+"#,
+        )
+        .unwrap();
+
+        let cache = root.join("cache.json");
+        let mut path = OsString::from(&bin_dir);
+        path.push(":");
+        path.push("/usr/bin:/bin");
+
+        Self {
+            root,
+            config,
+            cache,
+            path,
+        }
+    }
+
+    fn config_path(&self) -> &str {
+        self.config.to_str().unwrap()
+    }
+
+    fn remux<const N: usize>(&self, args: [&str; N]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_remux"))
+            .args(args)
+            .env("PATH", &self.path)
+            .env("REMUX_CACHE_PATH", &self.cache)
+            .output()
+            .unwrap()
+    }
+}
+
+impl Drop for HangTestEnv {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn fake_hang_ssh_script(hang_secs: u32) -> String {
+    // The fake ssh inspects its target: fake-slow → sleep and never respond,
+    // fake-fast → return a minimal valid inventory so `remux snapshot fast`
+    // succeeds. Using a single script covers both hosts in one binary.
+    format!(
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+if [[ "$args" == *"fake-slow"* ]]; then
+  sleep {hang_secs}
+  exit 0
+fi
+if [[ "$args" == *"fake-fast"* ]]; then
+  remote="${{@: -1}}"
+  if [[ "$remote" == NONCE=* ]]; then
+    NONCE=testnonce
+    printf '===REMUX-INVENTORY-%s-BEGIN===\n' "$NONCE"
+    printf '===REMUX-INVENTORY-%s-END===\n' "$NONCE"
+    printf '===REMUX-END-%s===\n' "$NONCE"
+    exit 0
+  fi
+  printf ''
+  exit 0
+fi
+echo "unknown host in args: $args" >&2
+exit 42
+"#
+    )
 }
 
 fn unique_temp_dir() -> PathBuf {
