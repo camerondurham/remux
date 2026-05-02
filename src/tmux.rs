@@ -1,6 +1,7 @@
 use crate::config::TmuxTarget;
 use anyhow::{Result, anyhow, bail};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::fmt;
 
 pub const INVENTORY_COMMAND: &str = "tmux list-panes -a -F '#S\t#I\t#P\t#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}\t#{session_attached}'";
@@ -101,6 +102,108 @@ pub fn parse_inventory(host: &str, output: &str) -> Result<Vec<Pane>> {
         });
     }
     Ok(panes)
+}
+
+pub fn inventory_with_captures_command(capture_lines: usize) -> String {
+    format!(
+        r#"NONCE=$(openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | xxd -p | tr -d '\n')
+echo "===REMUX-INVENTORY-$NONCE-BEGIN==="
+{inventory}
+echo "===REMUX-INVENTORY-$NONCE-END==="
+tmux list-panes -a -F '#{{pane_id}}' | while IFS= read -r pid; do
+    echo "===REMUX-CAPTURE-$NONCE-$pid==="
+    tmux capture-pane -pt "$pid" -S -{capture_lines} || echo "===REMUX-ERROR-$NONCE==="
+done
+echo "===REMUX-END-$NONCE===""#,
+        inventory = INVENTORY_COMMAND,
+        capture_lines = capture_lines,
+    )
+}
+
+#[allow(clippy::type_complexity)]
+pub fn parse_inventory_with_captures(
+    host_id: &str,
+    raw: &str,
+) -> Result<(Vec<Pane>, HashMap<String, Option<String>>)> {
+    let mut lines = raw.lines();
+
+    // First line must be the inventory-begin delimiter; extract nonce from it.
+    let first = lines
+        .next()
+        .ok_or_else(|| anyhow!("combined output is empty"))?;
+    let nonce = first
+        .strip_prefix("===REMUX-INVENTORY-")
+        .and_then(|s| s.strip_suffix("-BEGIN==="))
+        .ok_or_else(|| anyhow!("expected REMUX-INVENTORY-BEGIN delimiter, got: {first:?}"))?
+        .to_string();
+
+    let inv_end = format!("===REMUX-INVENTORY-{nonce}-END===");
+    let end_marker = format!("===REMUX-END-{nonce}===");
+    let error_sentinel = format!("===REMUX-ERROR-{nonce}===");
+
+    // Collect inventory lines.
+    let mut inventory_lines = Vec::new();
+    let mut found_inv_end = false;
+    for line in lines.by_ref() {
+        if line == inv_end {
+            found_inv_end = true;
+            break;
+        }
+        inventory_lines.push(line);
+    }
+    if !found_inv_end {
+        bail!("missing inventory-end delimiter for nonce {nonce}");
+    }
+
+    let panes = parse_inventory(host_id, &inventory_lines.join("\n"))?;
+
+    // Collect per-pane captures.
+    let mut captures: HashMap<String, Option<String>> = HashMap::new();
+    let mut current_pane_id: Option<String> = None;
+    let mut current_body: Vec<&str> = Vec::new();
+    let mut found_end = false;
+
+    let flush = |pid: String,
+                 body: &[&str],
+                 captures: &mut HashMap<String, Option<String>>,
+                 error_sentinel: &str| {
+        // If the body is exactly the error sentinel, record None (capture failed).
+        if body == [error_sentinel] {
+            captures.insert(pid, None);
+        } else {
+            captures.insert(pid, Some(body.join("\n")));
+        }
+    };
+
+    for line in lines.by_ref() {
+        if line == end_marker {
+            if let Some(pid) = current_pane_id.take() {
+                flush(pid, &current_body, &mut captures, &error_sentinel);
+                current_body.clear();
+            }
+            found_end = true;
+            break;
+        }
+        // Check for a capture delimiter with the correct nonce.
+        let capture_prefix = format!("===REMUX-CAPTURE-{nonce}-");
+        if let Some(rest) = line.strip_prefix(&capture_prefix)
+            && let Some(pid) = rest.strip_suffix("===")
+        {
+            if let Some(prev) = current_pane_id.take() {
+                flush(prev, &current_body, &mut captures, &error_sentinel);
+                current_body.clear();
+            }
+            current_pane_id = Some(pid.to_string());
+            continue;
+        }
+        current_body.push(line);
+    }
+
+    if !found_end {
+        bail!("missing end terminator for nonce {nonce}");
+    }
+
+    Ok((panes, captures))
 }
 
 pub fn capture_command(target: &PaneTarget, lines: usize, color: bool) -> String {
@@ -244,5 +347,72 @@ mod tests {
     fn shell_path_expands_remote_home() {
         assert_eq!(shell_path("~/work/repo"), "$HOME/'work/repo'");
         assert_eq!(shell_path("/tmp/repo"), "'/tmp/repo'");
+    }
+
+    // --- parse_inventory_with_captures tests ---
+
+    fn make_combined(nonce: &str, inv: &str, captures: &[(&str, &str)]) -> String {
+        let mut out = format!(
+            "===REMUX-INVENTORY-{nonce}-BEGIN===\n{inv}\n===REMUX-INVENTORY-{nonce}-END===\n"
+        );
+        for (pid, body) in captures {
+            out.push_str(&format!("===REMUX-CAPTURE-{nonce}-{pid}===\n{body}\n"));
+        }
+        out.push_str(&format!("===REMUX-END-{nonce}===\n"));
+        out
+    }
+
+    #[test]
+    fn parse_combined_happy_path() {
+        let inv = "work\t0\t0\t%1\t100\tzsh\t/home/cam\t1\nwork\t0\t1\t%2\t101\tbash\t/tmp\t0";
+        let raw = make_combined("abc123", inv, &[("%1", "line1\nline2"), ("%2", "")]);
+        let (panes, captures) = parse_inventory_with_captures("host", &raw).unwrap();
+        assert_eq!(panes.len(), 2);
+        assert_eq!(panes[0].pane_id, "%1");
+        assert_eq!(panes[1].pane_id, "%2");
+        assert_eq!(captures["%1"], Some("line1\nline2".to_string()));
+        assert_eq!(captures["%2"], Some("".to_string()));
+    }
+
+    #[test]
+    fn parse_combined_missing_terminator_errors() {
+        let inv = "work\t0\t0\t%1\t100\tzsh\t/home/cam\t1";
+        let nonce = "deadbeef";
+        let raw = format!(
+            "===REMUX-INVENTORY-{nonce}-BEGIN===\n{inv}\n===REMUX-INVENTORY-{nonce}-END===\n===REMUX-CAPTURE-{nonce}-%1===\nsome output\n"
+        );
+        let err = parse_inventory_with_captures("host", &raw).unwrap_err();
+        assert!(err.to_string().contains("missing end terminator"));
+    }
+
+    #[test]
+    fn parse_combined_wrong_nonce_in_body_is_content() {
+        let inv = "work\t0\t0\t%1\t100\tzsh\t/home/cam\t1";
+        // A line that looks like a delimiter but has a different nonce — should be capture content.
+        let body_line = "===REMUX-CAPTURE-wrongnonce-%2===";
+        let raw = make_combined("abc123", inv, &[("%1", body_line)]);
+        let (panes, captures) = parse_inventory_with_captures("host", &raw).unwrap();
+        assert_eq!(panes.len(), 1);
+        assert_eq!(captures["%1"], Some(body_line.to_string()));
+    }
+
+    #[test]
+    fn parse_combined_empty_capture() {
+        let inv = "work\t0\t0\t%1\t100\tzsh\t/home/cam\t1";
+        let raw = make_combined("abc123", inv, &[("%1", "")]);
+        let (_, captures) = parse_inventory_with_captures("host", &raw).unwrap();
+        assert_eq!(captures["%1"], Some("".to_string()));
+    }
+
+    #[test]
+    fn parse_combined_error_sentinel_gives_none() {
+        let inv = "work\t0\t0\t%1\t100\tzsh\t/home/cam\t1";
+        let nonce = "abc123";
+        // Simulate what the shell emits when capture-pane fails: the error sentinel as the body.
+        let raw = format!(
+            "===REMUX-INVENTORY-{nonce}-BEGIN===\n{inv}\n===REMUX-INVENTORY-{nonce}-END===\n===REMUX-CAPTURE-{nonce}-%1===\n===REMUX-ERROR-{nonce}===\n===REMUX-END-{nonce}===\n"
+        );
+        let (_, captures) = parse_inventory_with_captures("host", &raw).unwrap();
+        assert_eq!(captures["%1"], None);
     }
 }

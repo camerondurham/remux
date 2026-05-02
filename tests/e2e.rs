@@ -561,10 +561,27 @@ if [[ "$remote" == "command -v git >/dev/null 2>&1" ]]; then
   exit 0
 fi
 
-if [[ "$remote" == tmux\ list-panes* ]]; then
+if [[ "$remote" == "tmux list-panes -a -F '#S"* ]]; then
   printf 'work\t0\t1\t%%3\t1234\tnode\t/home/cam/work\t1\n'
   printf 'work\t0\t2\t%%5\t1235\tnode\t/home/cam/work/sub\t1\n'
   printf 'scratch\t2\t0\t%%4\t2222\tbash\t/tmp\t0\n'
+  exit 0
+fi
+
+if [[ "$remote" == NONCE=* ]]; then
+  NONCE=testfixednonce
+  printf '===REMUX-INVENTORY-%s-BEGIN===\n' "$NONCE"
+  printf 'work\t0\t1\t%%3\t1234\tnode\t/home/cam/work\t1\n'
+  printf 'work\t0\t2\t%%5\t1235\tnode\t/home/cam/work/sub\t1\n'
+  printf 'scratch\t2\t0\t%%4\t2222\tbash\t/tmp\t0\n'
+  printf '===REMUX-INVENTORY-%s-END===\n' "$NONCE"
+  printf '===REMUX-CAPTURE-%s-%%3===\n' "$NONCE"
+  printf 'line one\nhello-remux\n'
+  printf '===REMUX-CAPTURE-%s-%%5===\n' "$NONCE"
+  printf 'second node output\n'
+  printf '===REMUX-CAPTURE-%s-%%4===\n' "$NONCE"
+  printf 'scratch output\n'
+  printf '===REMUX-END-%s===\n' "$NONCE"
   exit 0
 fi
 
@@ -632,8 +649,16 @@ exit 43
 }
 
 fn fake_tmux_script() -> &'static str {
-    r#"#!/usr/bin/env bash
+    r##"#!/usr/bin/env bash
 set -euo pipefail
+
+args="$*"
+
+if [[ "${1:-}" == "list-panes" && "$args" == *"pane_id}"* && "$args" != *"#S"* ]]; then
+  echo '%7'
+  echo '%8'
+  exit 0
+fi
 
 if [[ "${1:-}" == "list-panes" ]]; then
   printf 'local\t0\t0\t%%7\t4321\tbash\t/tmp/local\t0\n'
@@ -641,12 +666,12 @@ if [[ "${1:-}" == "list-panes" ]]; then
   exit 0
 fi
 
-if [[ "${1:-}" == "capture-pane" && "${3:-}" == "local:0.0" ]]; then
+if [[ "${1:-}" == "capture-pane" && ("${3:-}" == "local:0.0" || "${3:-}" == "%7") ]]; then
   printf 'local line\nlocal-remux\n'
   exit 0
 fi
 
-if [[ "${1:-}" == "capture-pane" && "${3:-}" == "broken:0.0" ]]; then
+if [[ "${1:-}" == "capture-pane" && ("${3:-}" == "broken:0.0" || "${3:-}" == "%8") ]]; then
   echo "capture failed" >&2
   exit 45
 fi
@@ -670,7 +695,7 @@ fi
 
 echo "unexpected tmux command: $*" >&2
 exit 44
-"#
+"##
 }
 
 fn make_executable(path: &PathBuf) {

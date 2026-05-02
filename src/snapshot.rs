@@ -180,6 +180,7 @@ pub fn snapshot_selected(config: &Config, host: Option<&str>) -> Result<Vec<Host
     }
 }
 
+#[allow(dead_code)]
 pub fn inspect(config: &Config, id_or_target: &str) -> Result<PaneDetail> {
     inspect_with_color(config, id_or_target, false)
 }
@@ -193,6 +194,18 @@ pub fn inspect_with_color(config: &Config, id_or_target: &str, color: bool) -> R
     }
 
     bail!("unknown watch or pane target `{id_or_target}`")
+}
+
+/// Refresh the capture for an already-known pane without re-running host inventory.
+/// Used by the TUI background inspect task.
+pub fn refresh_capture_for(config: &Config, snapshot: &SessionSnapshot) -> Result<PaneDetail> {
+    let target = target_for_snapshot(snapshot)?;
+    let recent_output =
+        capture_pane(config, &target, config.poll.capture_lines, false).unwrap_or_default();
+    Ok(PaneDetail {
+        session: snapshot.clone(),
+        recent_output,
+    })
 }
 
 pub fn capture(config: &Config, id_or_target: &str, lines: usize, color: bool) -> Result<String> {
@@ -282,10 +295,11 @@ fn snapshot_host_with_cache(
 ) -> Result<HostSnapshot> {
     let host_config = config.host(host_id)?;
     let now = Utc::now();
-    match host::run(config, host_config, tmux::INVENTORY_COMMAND) {
+    let command = tmux::inventory_with_captures_command(config.poll.capture_lines);
+    match host::run(config, host_config, &command) {
         Ok(output) => {
-            let panes = tmux::parse_inventory(host_id, &output)?;
-            let sessions = sessions_from_panes(config, host_config, &panes, cache, now);
+            let (panes, captures) = tmux::parse_inventory_with_captures(host_id, &output)?;
+            let sessions = sessions_from_panes(config, host_config, &panes, &captures, cache, now);
             cache.update_host(host_id, "ok", now);
             Ok(HostSnapshot {
                 host: host_id.to_string(),
@@ -316,6 +330,7 @@ fn sessions_from_panes(
     config: &Config,
     host_config: &HostConfig,
     panes: &[Pane],
+    captures: &HashMap<String, Option<String>>,
     cache: &mut Cache,
     now: DateTime<Utc>,
 ) -> Vec<SessionSnapshot> {
@@ -334,6 +349,7 @@ fn sessions_from_panes(
                     config,
                     host_config,
                     pane,
+                    captures,
                     cache,
                     now,
                     PaneRowContext {
@@ -364,6 +380,7 @@ fn sessions_from_panes(
                 config,
                 host_config,
                 pane,
+                captures,
                 cache,
                 now,
                 PaneRowContext {
@@ -479,53 +496,54 @@ fn snapshot_for_pane(
     config: &Config,
     host_config: &HostConfig,
     pane: &Pane,
+    captures: &HashMap<String, Option<String>>,
     cache: &mut Cache,
     now: DateTime<Utc>,
     row: PaneRowContext<'_>,
 ) -> SessionSnapshot {
-    let target = PaneTarget {
-        host: host_config.id.clone(),
-        session: pane.session.clone(),
-        window: pane.window.clone(),
-        pane: pane.pane.clone(),
-        pane_id: Some(pane.pane_id.clone()),
-    };
     let display_id = row
         .watch
         .map(|watch| watch.watch.id.clone())
         .unwrap_or_else(|| pane.target.clone());
     let cache_key = format!("{}/{}", host_config.id, display_id);
-    let (state, output, errors) =
-        match capture_pane(config, &target, config.poll.capture_lines, false) {
-            Ok(output) => {
-                let output_hash = hash(&output);
-                let (state, last_output_at) = cache.update_output(
-                    &cache_key,
-                    Some(pane.pane_id.clone()),
-                    &output_hash,
-                    now,
-                    &config.poll,
-                );
-                (
-                    state,
-                    Some(OutputSnapshot {
-                        preview: preview(&output),
-                        recent: recent_preview(&output, 12),
-                        hash: output_hash,
-                        last_output_at,
-                    }),
-                    Vec::new(),
-                )
-            }
-            Err(err) => (
-                SessionState::Unknown,
-                None,
-                vec![SnapshotError {
-                    kind: "capture".to_string(),
-                    message: format!("{err:#}"),
-                }],
-            ),
-        };
+    let (state, output, errors) = match captures.get(&pane.pane_id) {
+        Some(Some(output)) => {
+            let output_hash = hash(output);
+            let (state, last_output_at) = cache.update_output(
+                &cache_key,
+                Some(pane.pane_id.clone()),
+                &output_hash,
+                now,
+                &config.poll,
+            );
+            (
+                state,
+                Some(OutputSnapshot {
+                    preview: preview(output),
+                    recent: recent_preview(output, 12),
+                    hash: output_hash,
+                    last_output_at,
+                }),
+                Vec::new(),
+            )
+        }
+        Some(None) => (
+            SessionState::Unknown,
+            None,
+            vec![SnapshotError {
+                kind: "capture".to_string(),
+                message: format!("capture-pane failed for pane {}", pane.pane_id),
+            }],
+        ),
+        None => (
+            SessionState::Unknown,
+            None,
+            vec![SnapshotError {
+                kind: "capture".to_string(),
+                message: format!("no capture data for pane {}", pane.pane_id),
+            }],
+        ),
+    };
 
     let configured_repo = row.watch.and_then(|watch| watch.watch.repo.as_deref());
     let repo = configured_repo

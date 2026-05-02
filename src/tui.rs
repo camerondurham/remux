@@ -103,7 +103,6 @@ struct App {
     editing_filter: bool,
     help: bool,
     status: String,
-    polling: bool,
     host_progress: Vec<HostProgress>,
     refresh_started_at: Option<Instant>,
     captured_for: Option<String>,
@@ -116,6 +115,7 @@ struct App {
     sort_mode: SortMode,
     show_context: bool,
     inspect_mode: bool,
+    inspect_pending: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -159,13 +159,6 @@ enum HostProgressState {
     Unreachable,
 }
 
-struct DashboardSummary {
-    sessions: usize,
-    quiet: usize,
-    idle: usize,
-    missing: usize,
-}
-
 impl App {
     fn new(filter: String) -> Self {
         Self {
@@ -176,7 +169,6 @@ impl App {
             editing_filter: false,
             help: false,
             status: "polling".to_string(),
-            polling: false,
             host_progress: Vec::new(),
             refresh_started_at: None,
             captured_for: None,
@@ -189,6 +181,7 @@ impl App {
             sort_mode: SortMode::Attention,
             show_context: true,
             inspect_mode: false,
+            inspect_pending: None,
         }
     }
 
@@ -246,7 +239,6 @@ impl App {
     }
 
     fn begin_refresh(&mut self, host_ids: Vec<String>) {
-        self.polling = true;
         self.refresh_started_at = Some(Instant::now());
         self.host_progress = host_ids
             .into_iter()
@@ -279,9 +271,23 @@ impl App {
                 self.status = self.progress_summary();
             }
             RefreshMessage::Complete => {
-                self.polling = false;
                 self.last_refresh = Some(Instant::now());
                 self.status = format!("scan complete: {}", self.progress_summary());
+            }
+            RefreshMessage::InspectResult { display_id, result } => {
+                if self.inspect_pending.as_deref() == Some(display_id.as_str()) {
+                    self.inspect_pending = None;
+                }
+                match result {
+                    Ok(detail) => {
+                        self.status = format!("inspected {display_id}");
+                        self.inspected_for = Some(display_id);
+                        self.inspected_detail = Some(detail);
+                    }
+                    Err(err) => {
+                        self.status = format!("inspect error: {err:#}");
+                    }
+                }
             }
         }
     }
@@ -367,25 +373,10 @@ impl App {
         parts.join(" | ")
     }
 
-    fn summary(&self) -> DashboardSummary {
-        let sessions: Vec<&SessionSnapshot> = self
-            .snapshots
+    fn is_polling(&self) -> bool {
+        self.host_progress
             .iter()
-            .flat_map(|snapshot| snapshot.sessions.iter())
-            .collect();
-        let count_state = |state| {
-            sessions
-                .iter()
-                .filter(|session| session.state == state)
-                .count()
-        };
-        let missing = count_state(SessionState::Missing);
-        DashboardSummary {
-            sessions: sessions.len(),
-            quiet: count_state(SessionState::Quiet),
-            idle: count_state(SessionState::Idle),
-            missing,
-        }
+            .any(|p| p.state == HostProgressState::Polling || p.state == HostProgressState::Queued)
     }
 
     fn cycle_sort_mode(&mut self) {
@@ -417,10 +408,19 @@ impl SortMode {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum RefreshMessage {
-    HostStarted { host: String },
-    HostFinished { snapshot: HostSnapshot },
+    HostStarted {
+        host: String,
+    },
+    HostFinished {
+        snapshot: HostSnapshot,
+    },
     Complete,
+    InspectResult {
+        display_id: String,
+        result: anyhow::Result<PaneDetail>,
+    },
 }
 
 fn spawn_refresh(
@@ -429,7 +429,7 @@ fn spawn_refresh(
     tx: mpsc::Sender<RefreshMessage>,
     app: &mut App,
 ) -> Result<()> {
-    if app.polling {
+    if app.is_polling() {
         return Ok(());
     }
     let host_ids = host_ids_for_refresh(config, host.as_deref())?;
@@ -439,6 +439,26 @@ fn spawn_refresh(
         poll_hosts(&config, host_ids, tx);
     });
     Ok(())
+}
+
+fn spawn_inspect(config: &Config, tx: mpsc::Sender<RefreshMessage>, app: &mut App) {
+    let Some(row) = app.selected_row() else {
+        app.status = "no selected row".to_string();
+        return;
+    };
+    // If already pending for this row, ignore (one in-flight at a time).
+    if app.inspect_pending.as_deref() == Some(row.display_id.as_str()) {
+        return;
+    }
+    let display_id = row.display_id.clone();
+    let snapshot = row.clone();
+    app.inspect_pending = Some(display_id.clone());
+    app.status = format!("inspecting {display_id}…");
+    let config = config.clone();
+    thread::spawn(move || {
+        let result = snapshot::refresh_capture_for(&config, &snapshot);
+        let _ = tx.send(RefreshMessage::InspectResult { display_id, result });
+    });
 }
 
 fn host_ids_for_refresh(config: &Config, host: Option<&str>) -> Result<Vec<String>> {
@@ -644,7 +664,7 @@ fn handle_key(
         }
         KeyCode::Char('i') => {
             app.inspect_mode = true;
-            inspect_selected(config, app)?;
+            spawn_inspect(config, tx, app);
             Ok(false)
         }
         KeyCode::Char('d') => {
@@ -861,28 +881,6 @@ fn capture_selected(config: &Config, app: &mut App) -> Result<()> {
     Ok(())
 }
 
-fn inspect_selected(config: &Config, app: &mut App) -> Result<()> {
-    let Some(row) = app.selected_row() else {
-        app.status = "no selected row".to_string();
-        return Ok(());
-    };
-    let display_id = row.display_id.clone();
-    let Some(id) = row.watch_id.clone().or_else(|| row.raw_target.clone()) else {
-        app.status = "selected row has no inspect target".to_string();
-        return Ok(());
-    };
-
-    match snapshot::inspect(config, &id) {
-        Ok(detail) => {
-            app.inspected_for = Some(display_id);
-            app.inspected_detail = Some(detail);
-            app.status = format!("inspected {id}");
-        }
-        Err(err) => app.status = format!("{err:#}"),
-    }
-    Ok(())
-}
-
 fn selected_attach_target(config: &Config, app: &App, action: &str) -> Result<PaneTarget> {
     let row = app
         .selected_row()
@@ -944,7 +942,42 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
 }
 
 fn draw_summary(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let summary = app.summary();
+    let rows = app.rows();
+    let total = rows.len();
+    let watched = rows
+        .iter()
+        .filter(|r| r.match_status == MatchStatus::Matched)
+        .count();
+    let free = rows
+        .iter()
+        .filter(|r| r.match_status == MatchStatus::Orphan)
+        .count();
+    let problems = rows
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.match_status,
+                MatchStatus::Ambiguous
+                    | MatchStatus::Shadowed
+                    | MatchStatus::Missing
+                    | MatchStatus::Unreachable
+                    | MatchStatus::Unknown
+            )
+        })
+        .count();
+
+    // Host scan status: "N/N hosts Xs"
+    let host_total = app.host_progress.len();
+    let host_done = app
+        .host_progress
+        .iter()
+        .filter(|h| h.state.is_finished())
+        .count();
+    let elapsed_str = app
+        .refresh_started_at
+        .map(|t| format_elapsed(t.elapsed()))
+        .unwrap_or_else(|| "-".to_string());
+
     let mode = if app.inspect_mode {
         "inspect"
     } else if app.editing_filter {
@@ -952,21 +985,42 @@ fn draw_summary(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     } else {
         "browse"
     };
-    let line = Line::from(vec![
+
+    let mut spans = vec![
         Span::styled("remux", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" | "),
         Span::raw(format!("/ {}", filter_label(app))),
         Span::raw(" | "),
-        Span::raw(format!(
-            "{} targets  {} stale  {} missing",
-            summary.sessions,
-            summary.quiet + summary.idle,
-            summary.missing
-        )),
-        Span::raw(" | "),
-        Span::styled(mode, Style::default().fg(Color::Cyan)),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
+        Span::raw(format!("{total} panes  ")),
+        Span::styled(format!("•{free} free"), Style::default().fg(Color::White)),
+        Span::raw("  "),
+        Span::styled(
+            format!("◆{watched} watched"),
+            Style::default().fg(Color::Cyan),
+        ),
+    ];
+    if problems > 0 {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("!{problems} issues"),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    spans.push(Span::raw(format!(
+        " | {host_done}/{host_total} hosts {elapsed_str}"
+    )));
+    spans.push(Span::raw(" | "));
+    spans.push(Span::styled(mode, Style::default().fg(Color::Cyan)));
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn row_glyph(session: &SessionSnapshot) -> &'static str {
+    match session.match_status {
+        MatchStatus::Matched => "◆ ",
+        MatchStatus::Orphan => "• ",
+        _ => "! ",
+    }
 }
 
 fn draw_live_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
@@ -979,39 +1033,64 @@ fn draw_live_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         return;
     }
 
-    let table_rows = rows.iter().map(|session| {
-        let hint = row_action_hint(session);
-        Row::new(vec![
-            Cell::from(session.display_id.clone()),
-            Cell::from(session.host.clone()),
-            Cell::from(canonical_state(session)).style(canonical_state_style(session)),
-            Cell::from(table_target(session)),
-            Cell::from(last_output_age(session)),
-            Cell::from(
+    // PREVIEW column gets whatever width remains after fixed columns.
+    // Fixed: selector(2) + glyph(2) + name(min 20) + age(6) + cmd(12) + gaps ≈ 42
+    // We compute a reasonable preview width; ratatui Min(0) will expand it.
+    let preview_min: u16 = 30;
+
+    let selected_idx = app.selected.min(rows.len() - 1);
+    let table_rows: Vec<Row> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, session)| {
+            let selector = if i == selected_idx { "› " } else { "  " };
+            let glyph = row_glyph(session);
+            let prefix = format!("{selector}{glyph}");
+
+            let name_cell = Cell::from(format!("{prefix}{}", session.display_id))
+                .style(canonical_state_style(session));
+
+            let age_cell = Cell::from(last_output_age(session));
+
+            let cmd_cell = Cell::from(
                 session
                     .process
                     .as_ref()
-                    .map(|process| process.command.clone())
+                    .map(|p| p.command.clone())
                     .unwrap_or_else(|| "-".to_string()),
-            ),
-            Cell::from(hint).style(muted_style()),
-        ])
-        .style(Style::default())
-    });
+            );
+
+            let preview_text = session
+                .output
+                .as_ref()
+                .and_then(|o| {
+                    let src = if o.recent.is_empty() {
+                        &o.preview
+                    } else {
+                        &o.recent
+                    };
+                    src.lines()
+                        .rfind(|l| !l.trim().is_empty())
+                        .map(|l| l.to_string())
+                })
+                .unwrap_or_else(|| "(no capture)".to_string());
+            let preview_cell = Cell::from(preview_text).style(muted_style());
+
+            Row::new(vec![name_cell, age_cell, cmd_cell, preview_cell])
+        })
+        .collect();
+
     let table = Table::new(
         table_rows,
         [
-            Constraint::Min(18),
+            Constraint::Min(20),
+            Constraint::Length(6),
             Constraint::Length(12),
-            Constraint::Length(11),
-            Constraint::Min(14),
-            Constraint::Length(8),
-            Constraint::Min(16),
-            Constraint::Min(22),
+            Constraint::Min(preview_min),
         ],
     )
     .header(
-        Row::new(["NAME", "HOST", "STATE", "TARGET", "AGE", "CMD", "ACTION"])
+        Row::new(["NAME", "AGE", "CMD", "PREVIEW"])
             .style(Style::default().add_modifier(Modifier::BOLD)),
     )
     .block(Block::default())
@@ -1021,10 +1100,9 @@ fn draw_live_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             .bg(Color::LightCyan)
             .add_modifier(Modifier::BOLD),
     );
+
     let mut state = TableState::default();
-    if !rows.is_empty() {
-        state.select(Some(app.selected.min(rows.len() - 1)));
-    }
+    state.select(Some(selected_idx));
     frame.render_stateful_widget(table, area, &mut state);
 }
 
@@ -1038,20 +1116,22 @@ fn draw_inspector(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 
     if app.help {
         let text = Text::from(vec![
-            Line::from("j/down select next"),
-            Line::from("up select previous"),
-            Line::from("r refresh now"),
-            Line::from("s cycle table sort"),
-            Line::from("/ filter"),
-            Line::from("enter readonly attach"),
-            Line::from("a read-write jump"),
-            Line::from("c capture into detail"),
-            Line::from("i inspect and refresh detail"),
-            Line::from("k kill selected pane"),
-            Line::from("e rename selected session"),
-            Line::from("n create session (<host>/<session>)"),
-            Line::from("p spawn pane (<host>/<session>)"),
-            Line::from("q quit"),
+            Line::from("[j/↓] select next"),
+            Line::from("[k/↑] select previous"),
+            Line::from("[r] refresh now"),
+            Line::from("[s] cycle table sort"),
+            Line::from("[/] filter"),
+            Line::from("[Enter] readonly attach"),
+            Line::from("[a] read-write jump"),
+            Line::from("[c] capture into detail"),
+            Line::from("[i] inspect and refresh detail"),
+            Line::from("[x] kill selected pane"),
+            Line::from("[e] rename selected session"),
+            Line::from("[n] create session (<host>/<session>)"),
+            Line::from("[p] spawn pane (<host>/<session>)"),
+            Line::from("[d] toggle detail pane"),
+            Line::from("[?] toggle this help"),
+            Line::from("[q] quit"),
         ]);
         frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
         return;
@@ -1127,14 +1207,14 @@ fn draw_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 
     let mode = if app.editing_filter {
         "filter"
-    } else if app.polling {
+    } else if app.is_polling() {
         "polling"
     } else {
         "ready"
     };
     let mut spans = vec![
         Span::raw(
-            "↑↓ move  Enter attach(ro)  a jump(rw)  i inspect  / filter  d details  ? help  x kill  q quit  ",
+            "[↑↓] move  [Enter] attach ro  [a] jump rw  [i] refresh  [/] filter  [d] details  [?] help  [x] kill  [q] quit   ",
         ),
         Span::styled(mode, Style::default().fg(Color::Cyan)),
         Span::raw("  "),
@@ -1150,7 +1230,64 @@ fn draw_context_rail(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let Some(selected) = app.selected_row() else {
         return;
     };
-    let lines = vec![
+
+    // Action line: spinner while pending, otherwise hotkey hints.
+    let is_pending = app.inspect_pending.as_deref() == Some(selected.display_id.as_str());
+    let action_line = if is_pending {
+        const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_millis())
+            .unwrap_or(0);
+        let frame_idx = (millis / 100) as usize % SPINNER.len();
+        Line::from(Span::styled(
+            format!("{} refreshing…", SPINNER[frame_idx]),
+            muted_style(),
+        ))
+    } else {
+        Line::from(Span::styled(
+            "[i] refresh · [Enter] attach ro · [a] jump rw · [c] copy",
+            muted_style(),
+        ))
+    };
+
+    // Cached output section.
+    let output_lines: Vec<Line<'static>> = if let Some(output) = selected.output.as_ref() {
+        let age = {
+            let age_str = if let Some(ts) = output.last_output_at {
+                let secs = Utc::now().signed_duration_since(ts).num_seconds().max(0);
+                if secs < 60 {
+                    format!("{secs}s ago")
+                } else if secs < 3600 {
+                    format!("{}m ago", secs / 60)
+                } else {
+                    format!("{}h ago", secs / 3600)
+                }
+            } else {
+                "unknown age".to_string()
+            };
+            Line::from(Span::styled(format!("captured {age_str}"), muted_style()))
+        };
+        let text = if output.recent.is_empty() {
+            output.preview.as_str()
+        } else {
+            output.recent.as_str()
+        };
+        // Fit preview into available height: 4 meta lines + blank + age + action = 7 overhead.
+        let max_preview = (area.height as usize).saturating_sub(7).max(1);
+        let mut lines: Vec<Line<'static>> = vec![age];
+        for line in tail_lines(text, max_preview) {
+            lines.push(Line::from(line));
+        }
+        lines
+    } else {
+        vec![Line::from(Span::styled(
+            "no capture yet — press [i] to fetch",
+            muted_style(),
+        ))]
+    };
+
+    let mut lines = vec![
         Line::from(vec![
             Span::styled("target ", label_style()),
             Span::raw(table_target(selected)),
@@ -1174,8 +1311,11 @@ fn draw_context_rail(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             ),
         ]),
         Line::from(""),
-        Line::from(Span::styled("press i for full inspect", muted_style())),
     ];
+    lines.extend(output_lines);
+    lines.push(Line::from(""));
+    lines.push(action_line);
+
     frame.render_widget(
         Paragraph::new(lines).block(Block::default().title("context").borders(Borders::LEFT)),
         area,
@@ -1184,25 +1324,27 @@ fn draw_context_rail(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 
 fn canonical_state(row: &SessionSnapshot) -> &'static str {
     if matches!(row.match_status, MatchStatus::Ambiguous) {
-        "ambiguous"
-    } else if matches!(
-        row.match_status,
-        MatchStatus::Shadowed | MatchStatus::Orphan | MatchStatus::Unknown
-    ) || matches!(row.state, SessionState::Unknown)
-    {
-        "drift"
-    } else if matches!(
+        return "ambiguous";
+    }
+    if matches!(
         row.match_status,
         MatchStatus::Missing | MatchStatus::Unreachable
-    ) || matches!(row.state, SessionState::Missing | SessionState::Unreachable)
-    {
-        "missing"
-    } else if row.state == SessionState::Idle {
-        "stale"
-    } else if row.state == SessionState::Quiet {
-        "busy"
-    } else {
-        "ready"
+    ) {
+        return "missing";
+    }
+    // drift: only when a configured watch's pane identity shifted (Shadowed)
+    if matches!(row.match_status, MatchStatus::Shadowed) {
+        return "drift";
+    }
+    // Orphan, Matched, Unknown: classify by session state
+    match row.state {
+        SessionState::Active => "ready",
+        SessionState::Idle => "stale",
+        SessionState::Quiet => "busy",
+        SessionState::Missing => "missing",
+        SessionState::Unreachable => "missing",
+        // Unknown state with no other signal: neutral '-' rather than 'drift'
+        SessionState::Unknown => "-",
     }
 }
 fn canonical_state_style(row: &SessionSnapshot) -> Style {
@@ -1213,6 +1355,7 @@ fn canonical_state_style(row: &SessionSnapshot) -> Style {
         "busy" => Style::default().fg(Color::LightYellow),
         "missing" => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         "ambiguous" => Style::default().fg(Color::Magenta),
+        "-" => Style::default().fg(Color::DarkGray),
         _ => Style::default(),
     }
 }
@@ -1478,7 +1621,7 @@ fn selected_output<'a>(
 }
 
 fn empty_state_lines(app: &App) -> Vec<Line<'static>> {
-    if app.snapshots.is_empty() && app.polling {
+    if app.snapshots.is_empty() && app.is_polling() {
         return vec![
             Line::from(Span::styled(
                 "Polling hosts",
@@ -1812,18 +1955,133 @@ fn short_message(message: &str) -> String {
     }
 }
 
-fn row_action_hint(session: &SessionSnapshot) -> String {
-    if let Some(reason) = attach_refusal_reason(session) {
-        return format!("blocked: {reason}");
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::snapshot::{MatchStatus, SessionSnapshot, SessionState, TmuxSnapshot};
+
+    fn make_row(match_status: MatchStatus, state: SessionState) -> SessionSnapshot {
+        SessionSnapshot {
+            session_id: "test".into(),
+            target: "test".into(),
+            display_id: "test".into(),
+            raw_target: None,
+            host: "local".into(),
+            match_status,
+            watch_id: None,
+            watch_index: None,
+            candidate_targets: vec![],
+            shadowed_by: None,
+            state,
+            agent_hint: None,
+            tmux: TmuxSnapshot {
+                session: "test".into(),
+                window: None,
+                pane: None,
+                pane_id: None,
+                session_attached: None,
+            },
+            process: None,
+            repo: None,
+            output: None,
+            errors: vec![],
+        }
     }
-    if session.watch_id.is_some() {
-        return "enter attach watch".to_string();
+
+    #[test]
+    fn orphan_active_is_ready() {
+        assert_eq!(
+            canonical_state(&make_row(MatchStatus::Orphan, SessionState::Active)),
+            "ready"
+        );
     }
-    if let Some(target) = &session.raw_target {
-        return format!("enter attach {target}");
+
+    #[test]
+    fn orphan_idle_is_stale() {
+        assert_eq!(
+            canonical_state(&make_row(MatchStatus::Orphan, SessionState::Idle)),
+            "stale"
+        );
     }
-    if let Some(output) = &session.output {
-        return short_message(&output.preview);
+
+    #[test]
+    fn orphan_quiet_is_busy() {
+        assert_eq!(
+            canonical_state(&make_row(MatchStatus::Orphan, SessionState::Quiet)),
+            "busy"
+        );
     }
-    "enter attach".to_string()
+
+    #[test]
+    fn orphan_missing_is_missing() {
+        assert_eq!(
+            canonical_state(&make_row(MatchStatus::Orphan, SessionState::Missing)),
+            "missing"
+        );
+    }
+
+    #[test]
+    fn orphan_unknown_is_dash() {
+        // Unknown state with no other signal: neutral '-' (not 'drift')
+        assert_eq!(
+            canonical_state(&make_row(MatchStatus::Orphan, SessionState::Unknown)),
+            "-"
+        );
+    }
+
+    #[test]
+    fn matched_active_is_ready() {
+        assert_eq!(
+            canonical_state(&make_row(MatchStatus::Matched, SessionState::Active)),
+            "ready"
+        );
+    }
+
+    #[test]
+    fn matched_idle_is_stale() {
+        assert_eq!(
+            canonical_state(&make_row(MatchStatus::Matched, SessionState::Idle)),
+            "stale"
+        );
+    }
+
+    #[test]
+    fn shadowed_active_is_drift() {
+        assert_eq!(
+            canonical_state(&make_row(MatchStatus::Shadowed, SessionState::Active)),
+            "drift"
+        );
+    }
+
+    #[test]
+    fn ambiguous_active_is_ambiguous() {
+        assert_eq!(
+            canonical_state(&make_row(MatchStatus::Ambiguous, SessionState::Active)),
+            "ambiguous"
+        );
+    }
+
+    #[test]
+    fn unreachable_active_is_missing() {
+        assert_eq!(
+            canonical_state(&make_row(MatchStatus::Unreachable, SessionState::Active)),
+            "missing"
+        );
+    }
+
+    #[test]
+    fn missing_status_is_missing() {
+        assert_eq!(
+            canonical_state(&make_row(MatchStatus::Missing, SessionState::Unknown)),
+            "missing"
+        );
+    }
+
+    #[test]
+    fn unknown_status_active_is_ready() {
+        assert_eq!(
+            canonical_state(&make_row(MatchStatus::Unknown, SessionState::Active)),
+            "ready"
+        );
+    }
 }
