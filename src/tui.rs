@@ -65,6 +65,12 @@ fn run_app(
         {
             break;
         }
+
+        // Auto-refresh: if enough time has elapsed since the last refresh completed
+        // (or started, if it never completed), kick off a background refresh.
+        if should_auto_refresh(&config, &app) {
+            spawn_refresh(&config, host.clone(), tx.clone(), &mut app)?;
+        }
     }
 
     Ok(())
@@ -105,13 +111,14 @@ struct App {
     status: String,
     host_progress: Vec<HostProgress>,
     refresh_started_at: Option<Instant>,
+    refresh_completed_at: Option<Instant>,
+    last_refresh_duration: Option<Duration>,
     captured_for: Option<String>,
     captured_output: Option<String>,
     inspected_for: Option<String>,
     inspected_detail: Option<PaneDetail>,
     kill_prompt: Option<KillPrompt>,
     input_prompt: Option<InputPrompt>,
-    last_refresh: Option<Instant>,
     sort_mode: SortMode,
     show_context: bool,
     inspect_mode: bool,
@@ -171,13 +178,14 @@ impl App {
             status: "polling".to_string(),
             host_progress: Vec::new(),
             refresh_started_at: None,
+            refresh_completed_at: None,
+            last_refresh_duration: None,
             captured_for: None,
             captured_output: None,
             inspected_for: None,
             inspected_detail: None,
             kill_prompt: None,
             input_prompt: None,
-            last_refresh: None,
             sort_mode: SortMode::Attention,
             show_context: true,
             inspect_mode: false,
@@ -240,6 +248,7 @@ impl App {
 
     fn begin_refresh(&mut self, host_ids: Vec<String>) {
         self.refresh_started_at = Some(Instant::now());
+        self.refresh_completed_at = None;
         self.host_progress = host_ids
             .into_iter()
             .map(|id| HostProgress {
@@ -271,7 +280,8 @@ impl App {
                 self.status = self.progress_summary();
             }
             RefreshMessage::Complete => {
-                self.last_refresh = Some(Instant::now());
+                self.last_refresh_duration = self.refresh_started_at.map(|t| t.elapsed());
+                self.refresh_completed_at = Some(Instant::now());
                 self.status = format!("scan complete: {}", self.progress_summary());
             }
             RefreshMessage::InspectResult { display_id, result } => {
@@ -367,8 +377,8 @@ impl App {
         if queued > 0 {
             parts.push(format!("{queued} queued"));
         }
-        if let Some(started) = self.refresh_started_at {
-            parts.push(format!("elapsed {}", format_elapsed(started.elapsed())));
+        if let Some(s) = self.refresh_status_str() {
+            parts.push(s);
         }
         parts.join(" | ")
     }
@@ -377,6 +387,25 @@ impl App {
         self.host_progress
             .iter()
             .any(|p| p.state == HostProgressState::Polling || p.state == HostProgressState::Queued)
+    }
+
+    fn refresh_status_str(&self) -> Option<String> {
+        if self.is_polling() {
+            Some(match self.refresh_started_at {
+                Some(t) => format!("polling {}", format_elapsed(t.elapsed())),
+                None => "polling".to_string(),
+            })
+        } else if let (Some(duration), Some(completed_at)) =
+            (self.last_refresh_duration, self.refresh_completed_at)
+        {
+            Some(format!(
+                "polled in {} · {} ago",
+                format_elapsed(duration),
+                format_elapsed(completed_at.elapsed())
+            ))
+        } else {
+            None
+        }
     }
 
     fn cycle_sort_mode(&mut self) {
@@ -439,6 +468,20 @@ fn spawn_refresh(
         poll_hosts(&config, host_ids, tx);
     });
     Ok(())
+}
+
+fn should_auto_refresh(config: &Config, app: &App) -> bool {
+    let interval = config.poll.auto_refresh_interval;
+    if interval.is_zero() || app.is_polling() {
+        return false;
+    }
+    if app.input_prompt.is_some() || app.kill_prompt.is_some() || app.editing_filter {
+        return false;
+    }
+    match app.refresh_completed_at {
+        None => true,
+        Some(completed_at) => completed_at.elapsed() >= interval,
+    }
 }
 
 fn spawn_inspect(config: &Config, tx: mpsc::Sender<RefreshMessage>, app: &mut App) {
@@ -973,10 +1016,7 @@ fn draw_summary(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         .iter()
         .filter(|h| h.state.is_finished())
         .count();
-    let elapsed_str = app
-        .refresh_started_at
-        .map(|t| format_elapsed(t.elapsed()))
-        .unwrap_or_else(|| "-".to_string());
+    let elapsed_str = app.refresh_status_str().unwrap_or_else(|| "-".to_string());
 
     let mode = if app.inspect_mode {
         "inspect"
@@ -1938,10 +1978,16 @@ fn dirty_style(value: &str) -> Style {
 }
 
 fn format_elapsed(duration: Duration) -> String {
-    if duration.as_millis() < 1_000 {
-        format!("{}ms", duration.as_millis())
+    let secs = duration.as_secs_f64();
+    if secs < 10.0 {
+        format!("{:.1}s", secs)
     } else {
-        format!("{}s", duration.as_secs())
+        let secs_u = duration.as_secs();
+        if secs_u >= 60 {
+            format!("{}m{}s", secs_u / 60, secs_u % 60)
+        } else {
+            format!("{}s", secs_u)
+        }
     }
 }
 
@@ -1989,99 +2035,27 @@ mod tests {
     }
 
     #[test]
-    fn orphan_active_is_ready() {
-        assert_eq!(
-            canonical_state(&make_row(MatchStatus::Orphan, SessionState::Active)),
-            "ready"
-        );
-    }
-
-    #[test]
-    fn orphan_idle_is_stale() {
-        assert_eq!(
-            canonical_state(&make_row(MatchStatus::Orphan, SessionState::Idle)),
-            "stale"
-        );
-    }
-
-    #[test]
-    fn orphan_quiet_is_busy() {
-        assert_eq!(
-            canonical_state(&make_row(MatchStatus::Orphan, SessionState::Quiet)),
-            "busy"
-        );
-    }
-
-    #[test]
-    fn orphan_missing_is_missing() {
-        assert_eq!(
-            canonical_state(&make_row(MatchStatus::Orphan, SessionState::Missing)),
-            "missing"
-        );
-    }
-
-    #[test]
-    fn orphan_unknown_is_dash() {
-        // Unknown state with no other signal: neutral '-' (not 'drift')
-        assert_eq!(
-            canonical_state(&make_row(MatchStatus::Orphan, SessionState::Unknown)),
-            "-"
-        );
-    }
-
-    #[test]
-    fn matched_active_is_ready() {
-        assert_eq!(
-            canonical_state(&make_row(MatchStatus::Matched, SessionState::Active)),
-            "ready"
-        );
-    }
-
-    #[test]
-    fn matched_idle_is_stale() {
-        assert_eq!(
-            canonical_state(&make_row(MatchStatus::Matched, SessionState::Idle)),
-            "stale"
-        );
-    }
-
-    #[test]
-    fn shadowed_active_is_drift() {
-        assert_eq!(
-            canonical_state(&make_row(MatchStatus::Shadowed, SessionState::Active)),
-            "drift"
-        );
-    }
-
-    #[test]
-    fn ambiguous_active_is_ambiguous() {
-        assert_eq!(
-            canonical_state(&make_row(MatchStatus::Ambiguous, SessionState::Active)),
-            "ambiguous"
-        );
-    }
-
-    #[test]
-    fn unreachable_active_is_missing() {
-        assert_eq!(
-            canonical_state(&make_row(MatchStatus::Unreachable, SessionState::Active)),
-            "missing"
-        );
-    }
-
-    #[test]
-    fn missing_status_is_missing() {
-        assert_eq!(
-            canonical_state(&make_row(MatchStatus::Missing, SessionState::Unknown)),
-            "missing"
-        );
-    }
-
-    #[test]
-    fn unknown_status_active_is_ready() {
-        assert_eq!(
-            canonical_state(&make_row(MatchStatus::Unknown, SessionState::Active)),
-            "ready"
-        );
+    fn canonical_state_mapping() {
+        let cases = [
+            (MatchStatus::Orphan, SessionState::Active, "ready"),
+            (MatchStatus::Orphan, SessionState::Idle, "stale"),
+            (MatchStatus::Orphan, SessionState::Quiet, "busy"),
+            (MatchStatus::Orphan, SessionState::Missing, "missing"),
+            (MatchStatus::Orphan, SessionState::Unknown, "-"),
+            (MatchStatus::Matched, SessionState::Active, "ready"),
+            (MatchStatus::Matched, SessionState::Idle, "stale"),
+            (MatchStatus::Shadowed, SessionState::Active, "drift"),
+            (MatchStatus::Ambiguous, SessionState::Active, "ambiguous"),
+            (MatchStatus::Unreachable, SessionState::Active, "missing"),
+            (MatchStatus::Missing, SessionState::Unknown, "missing"),
+            (MatchStatus::Unknown, SessionState::Active, "ready"),
+        ];
+        for (ms, ss, expected) in cases {
+            assert_eq!(
+                canonical_state(&make_row(ms, ss)),
+                expected,
+                "canonical_state({ms:?}, {ss:?})"
+            );
+        }
     }
 }
