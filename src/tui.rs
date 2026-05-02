@@ -1133,7 +1133,9 @@ fn draw_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         "ready"
     };
     let mut spans = vec![
-        Span::raw("↑↓ move  Enter attach(ro)  a jump(rw)  i inspect  / filter  d details  ? help  x kill  q quit  "),
+        Span::raw(
+            "↑↓ move  Enter attach(ro)  a jump(rw)  i inspect  / filter  d details  ? help  x kill  q quit  ",
+        ),
         Span::styled(mode, Style::default().fg(Color::Cyan)),
         Span::raw("  "),
         Span::styled(short_message(&app.status), muted_style()),

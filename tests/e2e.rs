@@ -455,6 +455,10 @@ impl TestEnv {
         fs::write(&tmux_path, fake_tmux_script()).unwrap();
         make_executable(&tmux_path);
 
+        let git_path = bin_dir.join("git");
+        fs::write(&git_path, "#!/usr/bin/env bash\nexit 0\n").unwrap();
+        make_executable(&git_path);
+
         let config = root.join("config.yaml");
         fs::write(
             &config,
@@ -480,9 +484,9 @@ sessions:
         .unwrap();
 
         let cache = root.join("cache.json");
-        let mut path = OsString::from(bin_dir);
+        let mut path = OsString::from(&bin_dir);
         path.push(":");
-        path.push(std::env::var_os("PATH").unwrap_or_default());
+        path.push("/usr/bin:/bin");
 
         Self {
             root,
