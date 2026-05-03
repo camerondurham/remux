@@ -46,6 +46,25 @@ mkdir -p ~/.config/remux
 cp examples/config.yaml ~/.config/remux/config.yaml
 ```
 
+## Install via Nix
+
+If you use Nix with flakes enabled:
+
+```bash
+nix profile install github:camerondurham/remux
+```
+
+Or add as a flake input:
+
+```nix
+inputs.remux = {
+  url = "github:camerondurham/remux";
+  inputs.nixpkgs.follows = "nixpkgs";
+};
+# ...then in your home.packages:
+# inputs.remux.packages.${system}.default
+```
+
 Edit `~/.config/remux/config.yaml`, then run:
 
 ```bash
