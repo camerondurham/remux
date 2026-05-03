@@ -8,6 +8,18 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
+
+/// In-memory git cache shared across poll workers.
+/// Key: (host_id, cwd) → (repo snapshot, time fetched).
+pub type GitCache = Arc<Mutex<HashMap<(String, String), (Option<RepoSnapshot>, Instant)>>>;
+
+static GLOBAL_GIT_CACHE: OnceLock<GitCache> = OnceLock::new();
+
+fn global_git_cache() -> &'static GitCache {
+    GLOBAL_GIT_CACHE.get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct HostSnapshot {
@@ -153,7 +165,7 @@ struct PaneRowContext<'a> {
 pub fn snapshot_host(config: &Config, host_id: &str) -> Result<HostSnapshot> {
     let cache_load = Cache::load_with_warning();
     let mut cache = cache_load.cache;
-    let mut snapshot = snapshot_host_with_cache(config, host_id, &mut cache)?;
+    let mut snapshot = snapshot_host_with_cache(config, host_id, &mut cache, global_git_cache())?;
     append_cache_warning(&mut snapshot, cache_load.warning);
     append_cache_save_error(&mut snapshot, cache.save().err());
     Ok(snapshot)
@@ -162,9 +174,12 @@ pub fn snapshot_host(config: &Config, host_id: &str) -> Result<HostSnapshot> {
 pub fn snapshot_all(config: &Config) -> Result<Vec<HostSnapshot>> {
     let cache_load = Cache::load_with_warning();
     let mut cache = cache_load.cache;
+    let git_cache = global_git_cache();
     let mut snapshots = Vec::new();
     for host in &config.hosts {
-        snapshots.push(snapshot_host_with_cache(config, &host.id, &mut cache)?);
+        snapshots.push(snapshot_host_with_cache(
+            config, &host.id, &mut cache, git_cache,
+        )?);
     }
     if let Some(first) = snapshots.first_mut() {
         append_cache_warning(first, cache_load.warning);
@@ -180,6 +195,7 @@ pub fn snapshot_selected(config: &Config, host: Option<&str>) -> Result<Vec<Host
     }
 }
 
+#[allow(dead_code)]
 pub fn inspect(config: &Config, id_or_target: &str) -> Result<PaneDetail> {
     inspect_with_color(config, id_or_target, false)
 }
@@ -193,6 +209,18 @@ pub fn inspect_with_color(config: &Config, id_or_target: &str, color: bool) -> R
     }
 
     bail!("unknown watch or pane target `{id_or_target}`")
+}
+
+/// Refresh the capture for an already-known pane without re-running host inventory.
+/// Used by the TUI background inspect task.
+pub fn refresh_capture_for(config: &Config, snapshot: &SessionSnapshot) -> Result<PaneDetail> {
+    let target = target_for_snapshot(snapshot)?;
+    let recent_output =
+        capture_pane(config, &target, config.poll.capture_lines, false).unwrap_or_default();
+    Ok(PaneDetail {
+        session: snapshot.clone(),
+        recent_output,
+    })
 }
 
 pub fn capture(config: &Config, id_or_target: &str, lines: usize, color: bool) -> Result<String> {
@@ -232,7 +260,8 @@ fn inspect_watch(config: &Config, watch_id: &str, color: bool) -> Result<PaneDet
     let watch = config.watch(watch_id)?;
     let cache_load = Cache::load_with_warning();
     let mut cache = cache_load.cache;
-    let mut host_snapshot = snapshot_host_with_cache(config, &watch.watch.host, &mut cache)?;
+    let mut host_snapshot =
+        snapshot_host_with_cache(config, &watch.watch.host, &mut cache, global_git_cache())?;
     append_cache_warning(&mut host_snapshot, cache_load.warning);
     append_cache_save_error(&mut host_snapshot, cache.save().err());
     let mut snapshot = host_snapshot
@@ -259,7 +288,8 @@ fn inspect_watch(config: &Config, watch_id: &str, color: bool) -> Result<PaneDet
 fn inspect_target(config: &Config, target: &PaneTarget, color: bool) -> Result<PaneDetail> {
     let cache_load = Cache::load_with_warning();
     let mut cache = cache_load.cache;
-    let mut host_snapshot = snapshot_host_with_cache(config, &target.host, &mut cache)?;
+    let mut host_snapshot =
+        snapshot_host_with_cache(config, &target.host, &mut cache, global_git_cache())?;
     append_cache_warning(&mut host_snapshot, cache_load.warning);
     append_cache_save_error(&mut host_snapshot, cache.save().err());
     let target_string = target.to_string();
@@ -279,13 +309,61 @@ fn snapshot_host_with_cache(
     config: &Config,
     host_id: &str,
     cache: &mut Cache,
+    git_cache: &GitCache,
 ) -> Result<HostSnapshot> {
     let host_config = config.host(host_id)?;
     let now = Utc::now();
-    match host::run(config, host_config, tmux::INVENTORY_COMMAND) {
+
+    // Determine which cwds are cache-fresh so we can skip them in the git section.
+    let skip_git_cwds: Vec<String> = if config.poll.collect_git {
+        let gc = git_cache.lock().unwrap();
+        gc.iter()
+            .filter_map(|((hid, cwd), (_, fetched))| {
+                if hid == host_id && fetched.elapsed() < config.poll.git_cache_ttl {
+                    Some(cwd.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let command = tmux::inventory_with_captures_command(
+        config.poll.capture_lines,
+        config.poll.collect_git,
+        &skip_git_cwds,
+    );
+    match host::run(config, host_config, &command) {
         Ok(output) => {
-            let panes = tmux::parse_inventory(host_id, &output)?;
-            let sessions = sessions_from_panes(config, host_config, &panes, cache, now);
+            let (panes, captures, git_map) = tmux::parse_inventory_with_captures(host_id, &output)?;
+
+            // Update git cache with fresh results; use cached value for skipped cwds.
+            {
+                let mut gc = git_cache.lock().unwrap();
+                for (pane_id, repo) in &git_map {
+                    // Find the cwd for this pane.
+                    if let Some(pane) = panes.iter().find(|p| &p.pane_id == pane_id) {
+                        gc.insert(
+                            (host_id.to_string(), pane.cwd.clone()),
+                            (repo.clone(), Instant::now()),
+                        );
+                    }
+                }
+            }
+
+            let sessions = sessions_from_panes(
+                config,
+                host_config,
+                &panes,
+                &captures,
+                &git_map,
+                git_cache,
+                host_id,
+                cache,
+                now,
+            );
             cache.update_host(host_id, "ok", now);
             Ok(HostSnapshot {
                 host: host_id.to_string(),
@@ -312,10 +390,15 @@ fn snapshot_host_with_cache(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sessions_from_panes(
     config: &Config,
     host_config: &HostConfig,
     panes: &[Pane],
+    captures: &HashMap<String, Option<String>>,
+    git_map: &HashMap<String, Option<RepoSnapshot>>,
+    git_cache: &GitCache,
+    host_id: &str,
     cache: &mut Cache,
     now: DateTime<Utc>,
 ) -> Vec<SessionSnapshot> {
@@ -334,6 +417,10 @@ fn sessions_from_panes(
                     config,
                     host_config,
                     pane,
+                    captures,
+                    git_map,
+                    git_cache,
+                    host_id,
                     cache,
                     now,
                     PaneRowContext {
@@ -364,6 +451,10 @@ fn sessions_from_panes(
                 config,
                 host_config,
                 pane,
+                captures,
+                git_map,
+                git_cache,
+                host_id,
                 cache,
                 now,
                 PaneRowContext {
@@ -475,62 +566,103 @@ fn path_matches_prefix(path: &str, prefix: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn snapshot_for_pane(
     config: &Config,
     host_config: &HostConfig,
     pane: &Pane,
+    captures: &HashMap<String, Option<String>>,
+    git_map: &HashMap<String, Option<RepoSnapshot>>,
+    git_cache: &GitCache,
+    host_id: &str,
     cache: &mut Cache,
     now: DateTime<Utc>,
     row: PaneRowContext<'_>,
 ) -> SessionSnapshot {
-    let target = PaneTarget {
-        host: host_config.id.clone(),
-        session: pane.session.clone(),
-        window: pane.window.clone(),
-        pane: pane.pane.clone(),
-        pane_id: Some(pane.pane_id.clone()),
-    };
     let display_id = row
         .watch
         .map(|watch| watch.watch.id.clone())
         .unwrap_or_else(|| pane.target.clone());
     let cache_key = format!("{}/{}", host_config.id, display_id);
-    let (state, output, errors) =
-        match capture_pane(config, &target, config.poll.capture_lines, false) {
-            Ok(output) => {
-                let output_hash = hash(&output);
-                let (state, last_output_at) = cache.update_output(
-                    &cache_key,
-                    Some(pane.pane_id.clone()),
-                    &output_hash,
-                    now,
-                    &config.poll,
-                );
-                (
-                    state,
-                    Some(OutputSnapshot {
-                        preview: preview(&output),
-                        recent: recent_preview(&output, 12),
-                        hash: output_hash,
-                        last_output_at,
-                    }),
-                    Vec::new(),
-                )
-            }
-            Err(err) => (
-                SessionState::Unknown,
-                None,
-                vec![SnapshotError {
-                    kind: "capture".to_string(),
-                    message: format!("{err:#}"),
-                }],
-            ),
-        };
+    let (state, output, errors) = match captures.get(&pane.pane_id) {
+        Some(Some(output)) => {
+            let output_hash = hash(output);
+            let (state, last_output_at) = cache.update_output(
+                &cache_key,
+                Some(pane.pane_id.clone()),
+                &output_hash,
+                now,
+                &config.poll,
+            );
+            (
+                state,
+                Some(OutputSnapshot {
+                    preview: preview(output),
+                    recent: recent_preview(output, 12),
+                    hash: output_hash,
+                    last_output_at,
+                }),
+                Vec::new(),
+            )
+        }
+        Some(None) => (
+            SessionState::Unknown,
+            None,
+            vec![SnapshotError {
+                kind: "capture".to_string(),
+                message: format!("capture-pane failed for pane {}", pane.pane_id),
+            }],
+        ),
+        None => (
+            SessionState::Unknown,
+            None,
+            vec![SnapshotError {
+                kind: "capture".to_string(),
+                message: format!("no capture data for pane {}", pane.pane_id),
+            }],
+        ),
+    };
 
-    let configured_repo = row.watch.and_then(|watch| watch.watch.repo.as_deref());
-    let repo = configured_repo
-        .map(|repo| git::collect(config, host_config, repo))
-        .or_else(|| git::infer(config, host_config, &pane.cwd));
+    let repo = if let Some(configured_repo) = row.watch.and_then(|w| w.watch.repo.as_deref()) {
+        // Configured repo path: use git::collect (1 SSH call per distinct path, not per pane).
+        // Check git cache first.
+        let cache_key = (host_id.to_string(), configured_repo.to_string());
+        let cached = {
+            let gc = git_cache.lock().unwrap();
+            gc.get(&cache_key).and_then(|(snap, fetched)| {
+                if fetched.elapsed() < config.poll.git_cache_ttl {
+                    Some(snap.clone())
+                } else {
+                    None
+                }
+            })
+        };
+        if let Some(snap) = cached {
+            snap
+        } else {
+            let snap = Some(git::collect(config, host_config, configured_repo));
+            {
+                let mut gc = git_cache.lock().unwrap();
+                gc.insert(cache_key, (snap.clone(), Instant::now()));
+            }
+            snap
+        }
+    } else {
+        // Orphan pane: use batched git result from combined SSH command.
+        // Fall back to git cache if not in this poll's batch.
+        git_map.get(&pane.pane_id).cloned().unwrap_or_else(|| {
+            let gc = git_cache.lock().unwrap();
+            gc.get(&(host_id.to_string(), pane.cwd.clone()))
+                .and_then(|(snap, fetched)| {
+                    if fetched.elapsed() < config.poll.git_cache_ttl {
+                        Some(snap.clone())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(None)
+        })
+    };
 
     SessionSnapshot {
         session_id: display_id.clone(),
@@ -665,7 +797,8 @@ fn target_for_watch(config: &Config, watch_id: &str, action: &str) -> Result<Pan
     let watch = config.watch(watch_id)?;
     let cache_load = Cache::load_with_warning();
     let mut cache = cache_load.cache;
-    let mut host_snapshot = snapshot_host_with_cache(config, &watch.watch.host, &mut cache)?;
+    let mut host_snapshot =
+        snapshot_host_with_cache(config, &watch.watch.host, &mut cache, global_git_cache())?;
     append_cache_warning(&mut host_snapshot, cache_load.warning);
     append_cache_save_error(&mut host_snapshot, cache.save().err());
     let snapshot = host_snapshot
@@ -934,5 +1067,38 @@ mod tests {
             cwd: cwd.to_string(),
             session_attached: false,
         }
+    }
+
+    #[test]
+    fn git_cache_ttl_skips_fresh_cwds_in_command() {
+        use std::time::{Duration, Instant};
+        let git_cache: GitCache = Arc::new(Mutex::new(HashMap::new()));
+        // Populate cache with a fresh entry for /home/cam/work on host "pi".
+        {
+            let mut gc = git_cache.lock().unwrap();
+            gc.insert(
+                ("pi".to_string(), "/home/cam/work".to_string()),
+                (None, Instant::now()),
+            );
+        }
+        // Build skip list: entries fresher than 30s TTL.
+        let ttl = Duration::from_secs(30);
+        let skip: Vec<String> = {
+            let gc = git_cache.lock().unwrap();
+            gc.iter()
+                .filter_map(|((hid, cwd), (_, fetched))| {
+                    if hid == "pi" && fetched.elapsed() < ttl {
+                        Some(cwd.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        assert_eq!(skip, vec!["/home/cam/work".to_string()]);
+        // The command should contain the skip pattern.
+        let cmd = crate::tmux::inventory_with_captures_command(2, true, &skip);
+        assert!(cmd.contains("'/home/cam/work'"));
+        assert!(cmd.contains("continue"));
     }
 }

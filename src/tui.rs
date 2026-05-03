@@ -20,7 +20,6 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::io::{self, Stdout};
 use std::sync::{Arc, Mutex, mpsc};
@@ -66,6 +65,12 @@ fn run_app(
         {
             break;
         }
+
+        // Auto-refresh: if enough time has elapsed since the last refresh completed
+        // (or started, if it never completed), kick off a background refresh.
+        if should_auto_refresh(&config, &app) {
+            spawn_refresh(&config, host.clone(), tx.clone(), &mut app)?;
+        }
     }
 
     Ok(())
@@ -104,17 +109,20 @@ struct App {
     editing_filter: bool,
     help: bool,
     status: String,
-    polling: bool,
     host_progress: Vec<HostProgress>,
     refresh_started_at: Option<Instant>,
+    refresh_completed_at: Option<Instant>,
+    last_refresh_duration: Option<Duration>,
     captured_for: Option<String>,
     captured_output: Option<String>,
     inspected_for: Option<String>,
     inspected_detail: Option<PaneDetail>,
     kill_prompt: Option<KillPrompt>,
     input_prompt: Option<InputPrompt>,
-    last_refresh: Option<Instant>,
     sort_mode: SortMode,
+    show_context: bool,
+    inspect_mode: bool,
+    inspect_pending: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -158,21 +166,6 @@ enum HostProgressState {
     Unreachable,
 }
 
-struct DashboardSummary {
-    host_ok: usize,
-    host_total: usize,
-    host_unreachable: usize,
-    sessions: usize,
-    active: usize,
-    quiet: usize,
-    idle: usize,
-    missing: usize,
-    ambiguous: usize,
-    shadowed: usize,
-    errors: usize,
-    attention: usize,
-}
-
 impl App {
     fn new(filter: String) -> Self {
         Self {
@@ -183,17 +176,20 @@ impl App {
             editing_filter: false,
             help: false,
             status: "polling".to_string(),
-            polling: false,
             host_progress: Vec::new(),
             refresh_started_at: None,
+            refresh_completed_at: None,
+            last_refresh_duration: None,
             captured_for: None,
             captured_output: None,
             inspected_for: None,
             inspected_detail: None,
             kill_prompt: None,
             input_prompt: None,
-            last_refresh: None,
             sort_mode: SortMode::Attention,
+            show_context: true,
+            inspect_mode: false,
+            inspect_pending: None,
         }
     }
 
@@ -251,8 +247,8 @@ impl App {
     }
 
     fn begin_refresh(&mut self, host_ids: Vec<String>) {
-        self.polling = true;
         self.refresh_started_at = Some(Instant::now());
+        self.refresh_completed_at = None;
         self.host_progress = host_ids
             .into_iter()
             .map(|id| HostProgress {
@@ -284,9 +280,36 @@ impl App {
                 self.status = self.progress_summary();
             }
             RefreshMessage::Complete => {
-                self.polling = false;
-                self.last_refresh = Some(Instant::now());
+                // Force any still-pending hosts to Unreachable. If we get here
+                // with Queued/Polling entries, poll_hosts detached wedged
+                // workers past the deadline. Marking them terminal keeps
+                // is_polling() honest so the UI can refresh again.
+                for progress in &mut self.host_progress {
+                    if progress.state == HostProgressState::Queued
+                        || progress.state == HostProgressState::Polling
+                    {
+                        progress.state = HostProgressState::Unreachable;
+                        progress.finished_at = Some(Instant::now());
+                    }
+                }
+                self.last_refresh_duration = self.refresh_started_at.map(|t| t.elapsed());
+                self.refresh_completed_at = Some(Instant::now());
                 self.status = format!("scan complete: {}", self.progress_summary());
+            }
+            RefreshMessage::InspectResult { display_id, result } => {
+                if self.inspect_pending.as_deref() == Some(display_id.as_str()) {
+                    self.inspect_pending = None;
+                }
+                match result {
+                    Ok(detail) => {
+                        self.status = format!("inspected {display_id}");
+                        self.inspected_for = Some(display_id);
+                        self.inspected_detail = Some(detail);
+                    }
+                    Err(err) => {
+                        self.status = format!("inspect error: {err:#}");
+                    }
+                }
             }
         }
     }
@@ -366,86 +389,34 @@ impl App {
         if queued > 0 {
             parts.push(format!("{queued} queued"));
         }
-        if let Some(started) = self.refresh_started_at {
-            parts.push(format!("elapsed {}", format_elapsed(started.elapsed())));
+        if let Some(s) = self.refresh_status_str() {
+            parts.push(s);
         }
         parts.join(" | ")
     }
 
-    fn summary(&self) -> DashboardSummary {
-        let (host_ok, host_total, host_unreachable) = if self.host_progress.is_empty() {
-            (
-                self.snapshots
-                    .iter()
-                    .filter(|snapshot| snapshot.status == SnapshotStatus::Ok)
-                    .count(),
-                self.snapshots.len(),
-                self.snapshots
-                    .iter()
-                    .filter(|snapshot| snapshot.status == SnapshotStatus::Unreachable)
-                    .count(),
-            )
-        } else {
-            (
-                self.host_progress
-                    .iter()
-                    .filter(|host| host.state == HostProgressState::Ok)
-                    .count(),
-                self.host_progress.len(),
-                self.host_progress
-                    .iter()
-                    .filter(|host| host.state == HostProgressState::Unreachable)
-                    .count(),
-            )
-        };
+    fn is_polling(&self) -> bool {
+        self.host_progress
+            .iter()
+            .any(|p| p.state == HostProgressState::Polling || p.state == HostProgressState::Queued)
+    }
 
-        let sessions: Vec<&SessionSnapshot> = self
-            .snapshots
-            .iter()
-            .flat_map(|snapshot| snapshot.sessions.iter())
-            .collect();
-        let count_state = |state| {
-            sessions
-                .iter()
-                .filter(|session| session.state == state)
-                .count()
-        };
-        let ambiguous = sessions
-            .iter()
-            .filter(|session| session.match_status == MatchStatus::Ambiguous)
-            .count();
-        let shadowed = sessions
-            .iter()
-            .filter(|session| session.match_status == MatchStatus::Shadowed)
-            .count();
-        let errors = self
-            .snapshots
-            .iter()
-            .map(|snapshot| {
-                snapshot.errors.len()
-                    + snapshot
-                        .sessions
-                        .iter()
-                        .map(|session| session.errors.len())
-                        .sum::<usize>()
+    fn refresh_status_str(&self) -> Option<String> {
+        if self.is_polling() {
+            Some(match self.refresh_started_at {
+                Some(t) => format!("polling {}", format_elapsed(t.elapsed())),
+                None => "polling".to_string(),
             })
-            .sum();
-        let missing = count_state(SessionState::Missing);
-        let attention = host_unreachable + missing + ambiguous + errors;
-
-        DashboardSummary {
-            host_ok,
-            host_total,
-            host_unreachable,
-            sessions: sessions.len(),
-            active: count_state(SessionState::Active),
-            quiet: count_state(SessionState::Quiet),
-            idle: count_state(SessionState::Idle),
-            missing,
-            ambiguous,
-            shadowed,
-            errors,
-            attention,
+        } else if let (Some(duration), Some(completed_at)) =
+            (self.last_refresh_duration, self.refresh_completed_at)
+        {
+            Some(format!(
+                "polled in {} · {} ago",
+                format_elapsed(duration),
+                format_elapsed(completed_at.elapsed())
+            ))
+        } else {
+            None
         }
     }
 
@@ -478,10 +449,19 @@ impl SortMode {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum RefreshMessage {
-    HostStarted { host: String },
-    HostFinished { snapshot: HostSnapshot },
+    HostStarted {
+        host: String,
+    },
+    HostFinished {
+        snapshot: HostSnapshot,
+    },
     Complete,
+    InspectResult {
+        display_id: String,
+        result: anyhow::Result<PaneDetail>,
+    },
 }
 
 fn spawn_refresh(
@@ -490,7 +470,7 @@ fn spawn_refresh(
     tx: mpsc::Sender<RefreshMessage>,
     app: &mut App,
 ) -> Result<()> {
-    if app.polling {
+    if app.is_polling() {
         return Ok(());
     }
     let host_ids = host_ids_for_refresh(config, host.as_deref())?;
@@ -500,6 +480,40 @@ fn spawn_refresh(
         poll_hosts(&config, host_ids, tx);
     });
     Ok(())
+}
+
+fn should_auto_refresh(config: &Config, app: &App) -> bool {
+    let interval = config.poll.auto_refresh_interval;
+    if interval.is_zero() || app.is_polling() {
+        return false;
+    }
+    if app.input_prompt.is_some() || app.kill_prompt.is_some() || app.editing_filter {
+        return false;
+    }
+    match app.refresh_completed_at {
+        None => true,
+        Some(completed_at) => completed_at.elapsed() >= interval,
+    }
+}
+
+fn spawn_inspect(config: &Config, tx: mpsc::Sender<RefreshMessage>, app: &mut App) {
+    let Some(row) = app.selected_row() else {
+        app.status = "no selected row".to_string();
+        return;
+    };
+    // If already pending for this row, ignore (one in-flight at a time).
+    if app.inspect_pending.as_deref() == Some(row.display_id.as_str()) {
+        return;
+    }
+    let display_id = row.display_id.clone();
+    let snapshot = row.clone();
+    app.inspect_pending = Some(display_id.clone());
+    app.status = format!("inspecting {display_id}…");
+    let config = config.clone();
+    thread::spawn(move || {
+        let result = snapshot::refresh_capture_for(&config, &snapshot);
+        let _ = tx.send(RefreshMessage::InspectResult { display_id, result });
+    });
 }
 
 fn host_ids_for_refresh(config: &Config, host: Option<&str>) -> Result<Vec<String>> {
@@ -549,8 +563,22 @@ fn poll_hosts(config: &Config, host_ids: Vec<String>, tx: mpsc::Sender<RefreshMe
         }));
     }
 
+    // Give workers up to command_timeout + 2s to finish cleanly. Beyond that,
+    // detach remaining workers and send Complete so the UI can resume refreshes.
+    let deadline = Instant::now() + config.poll.command_timeout + Duration::from_secs(2);
     for handle in handles {
-        let _ = handle.join();
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break; // deadline passed; detach remaining workers
+        }
+        let start = Instant::now();
+        while start.elapsed() < remaining && !handle.is_finished() {
+            thread::sleep(Duration::from_millis(25));
+        }
+        if handle.is_finished() {
+            let _ = handle.join();
+        }
+        // else: detach — thread continues in background but we move on
     }
     let _ = tx.send(RefreshMessage::Complete);
 }
@@ -624,7 +652,19 @@ fn handle_key(
     }
 
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => Ok(true),
+        KeyCode::Esc => {
+            if app.inspect_mode {
+                app.inspect_mode = false;
+                app.status = "browse".to_string();
+                Ok(false)
+            } else if app.help {
+                app.help = false;
+                Ok(false)
+            } else {
+                Ok(true)
+            }
+        }
+        KeyCode::Char('q') => Ok(true),
         KeyCode::Char('/') => {
             app.editing_filter = true;
             Ok(false)
@@ -650,12 +690,12 @@ fn handle_key(
             app.selected_identity = app.selected_row_identity();
             Ok(false)
         }
-        KeyCode::Up => {
+        KeyCode::Up | KeyCode::Char('k') => {
             app.selected = app.selected.saturating_sub(1);
             app.selected_identity = app.selected_row_identity();
             Ok(false)
         }
-        KeyCode::Char('k') => {
+        KeyCode::Char('x') => {
             begin_kill_prompt(config, app)?;
             Ok(false)
         }
@@ -692,7 +732,12 @@ fn handle_key(
             Ok(false)
         }
         KeyCode::Char('i') => {
-            inspect_selected(config, app)?;
+            app.inspect_mode = true;
+            spawn_inspect(config, tx, app);
+            Ok(false)
+        }
+        KeyCode::Char('d') => {
+            app.show_context = !app.show_context;
             Ok(false)
         }
         _ => Ok(false),
@@ -905,28 +950,6 @@ fn capture_selected(config: &Config, app: &mut App) -> Result<()> {
     Ok(())
 }
 
-fn inspect_selected(config: &Config, app: &mut App) -> Result<()> {
-    let Some(row) = app.selected_row() else {
-        app.status = "no selected row".to_string();
-        return Ok(());
-    };
-    let display_id = row.display_id.clone();
-    let Some(id) = row.watch_id.clone().or_else(|| row.raw_target.clone()) else {
-        app.status = "selected row has no inspect target".to_string();
-        return Ok(());
-    };
-
-    match snapshot::inspect(config, &id) {
-        Ok(detail) => {
-            app.inspected_for = Some(display_id);
-            app.inspected_detail = Some(detail);
-            app.status = format!("inspected {id}");
-        }
-        Err(err) => app.status = format!("{err:#}"),
-    }
-    Ok(())
-}
-
 fn selected_attach_target(config: &Config, app: &App, action: &str) -> Result<PaneTarget> {
     let row = app
         .selected_row()
@@ -965,98 +988,105 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
+            Constraint::Length(1),
             Constraint::Min(10),
             Constraint::Length(1),
         ])
         .split(area);
 
     draw_summary(frame, chunks[0], app);
-    let body = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(24),
-            Constraint::Percentage(42),
-            Constraint::Percentage(34),
-        ])
-        .split(chunks[1]);
-    draw_topology_tree(frame, body[0], app);
-    draw_live_table(frame, body[1], app);
-    draw_inspector(frame, body[2], app);
+    if app.inspect_mode || app.help {
+        draw_inspector(frame, chunks[1], app);
+    } else if app.show_context && area.width > 110 {
+        let body = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+            .split(chunks[1]);
+        draw_live_table(frame, body[0], app);
+        draw_context_rail(frame, body[1], app);
+    } else {
+        draw_live_table(frame, chunks[1], app);
+    }
     draw_status(frame, chunks[2], app);
 }
 
 fn draw_summary(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let summary = app.summary();
-    let top = Line::from(vec![
-        Span::styled("hosts ", label_style()),
-        Span::styled(
-            format!("{}/{} up", summary.host_ok, summary.host_total),
-            if summary.host_unreachable > 0 {
-                state_style(SessionState::Unreachable)
-            } else {
-                state_style(SessionState::Active)
-            },
-        ),
-        Span::raw(" | "),
-        Span::styled("panes ", label_style()),
-        Span::raw(summary.sessions.to_string()),
-        Span::raw(" | "),
-        Span::styled("active ", label_style()),
-        Span::styled(
-            summary.active.to_string(),
-            state_style(SessionState::Active),
-        ),
-        Span::raw(" | "),
-        Span::styled("quiet ", label_style()),
-        Span::styled(summary.quiet.to_string(), state_style(SessionState::Quiet)),
-        Span::raw(" | "),
-        Span::styled("idle ", label_style()),
-        Span::styled(summary.idle.to_string(), state_style(SessionState::Idle)),
-        Span::raw(" | "),
-        Span::styled("missing ", label_style()),
-        Span::styled(
-            summary.missing.to_string(),
-            state_style(SessionState::Missing),
-        ),
-        Span::raw(" | "),
-        Span::styled("ambiguous ", label_style()),
-        Span::styled(
-            summary.ambiguous.to_string(),
-            match_style(MatchStatus::Ambiguous),
-        ),
-        Span::raw(" | "),
-        Span::styled("shadowed ", label_style()),
-        Span::styled(
-            summary.shadowed.to_string(),
-            match_style(MatchStatus::Shadowed),
-        ),
-    ]);
+    let rows = app.rows();
+    let total = rows.len();
+    let watched = rows
+        .iter()
+        .filter(|r| r.match_status == MatchStatus::Matched)
+        .count();
+    let free = rows
+        .iter()
+        .filter(|r| r.match_status == MatchStatus::Orphan)
+        .count();
+    let problems = rows
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.match_status,
+                MatchStatus::Ambiguous
+                    | MatchStatus::Shadowed
+                    | MatchStatus::Missing
+                    | MatchStatus::Unreachable
+                    | MatchStatus::Unknown
+            )
+        })
+        .count();
 
-    let bottom = Line::from(vec![
-        Span::styled("attention ", label_style()),
+    // Host scan status: "N/N hosts Xs"
+    let host_total = app.host_progress.len();
+    let host_done = app
+        .host_progress
+        .iter()
+        .filter(|h| h.state.is_finished())
+        .count();
+    let elapsed_str = app.refresh_status_str().unwrap_or_else(|| "-".to_string());
+
+    let mode = if app.inspect_mode {
+        "inspect"
+    } else if app.editing_filter {
+        "filter"
+    } else {
+        "browse"
+    };
+
+    let mut spans = vec![
+        Span::styled("remux", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" | "),
+        Span::raw(format!("/ {}", filter_label(app))),
+        Span::raw(" | "),
+        Span::raw(format!("{total} panes  ")),
+        Span::styled(format!("•{free} free"), Style::default().fg(Color::White)),
+        Span::raw("  "),
         Span::styled(
-            summary.attention.to_string(),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
+            format!("◆{watched} watched"),
+            Style::default().fg(Color::Cyan),
         ),
-        Span::raw(" | "),
-        Span::styled("errors ", label_style()),
-        Span::styled(
-            summary.errors.to_string(),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" | "),
-        Span::styled("sort ", label_style()),
-        Span::raw(app.sort_mode.label()),
-        Span::raw(" | "),
-        Span::styled("filter ", label_style()),
-        Span::raw(filter_label(app)),
-    ]);
-    let paragraph = Paragraph::new(Text::from(vec![top, bottom]))
-        .block(Block::default().borders(Borders::ALL).title("kpi"));
-    frame.render_widget(paragraph, area);
+    ];
+    if problems > 0 {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("!{problems} issues"),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    spans.push(Span::raw(format!(
+        " | {host_done}/{host_total} hosts {elapsed_str}"
+    )));
+    spans.push(Span::raw(" | "));
+    spans.push(Span::styled(mode, Style::default().fg(Color::Cyan)));
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn row_glyph(session: &SessionSnapshot) -> &'static str {
+    match session.match_status {
+        MatchStatus::Matched => "◆ ",
+        MatchStatus::Orphan => "• ",
+        _ => "! ",
+    }
 }
 
 fn draw_live_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
@@ -1069,160 +1099,77 @@ fn draw_live_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         return;
     }
 
-    let table_rows = rows.iter().map(|session| {
-        let repo = session
-            .repo
-            .as_ref()
-            .map(|repo| basename(&repo.path).to_string())
-            .unwrap_or_else(|| "-".to_string());
-        let dirty = session
-            .repo
-            .as_ref()
-            .and_then(|repo| repo.dirty_count)
-            .map(|dirty| dirty.to_string())
-            .unwrap_or_else(|| "-".to_string());
-        let preview = session
-            .output
-            .as_ref()
-            .map(|output| short_message(&output.preview))
-            .unwrap_or_else(|| first_row_error(session).unwrap_or_else(|| "-".to_string()));
-        Row::new(vec![
-            Cell::from(session.display_id.clone()),
-            Cell::from(table_target(session)),
-            Cell::from(session.match_status.as_str()).style(match_style(session.match_status)),
-            Cell::from(session.state.as_str()).style(state_style(session.state)),
-            Cell::from(last_output_age(session)),
-            Cell::from(
+    // PREVIEW column gets whatever width remains after fixed columns.
+    // Fixed: selector(2) + glyph(2) + name(min 20) + age(6) + cmd(12) + gaps ≈ 42
+    // We compute a reasonable preview width; ratatui Min(0) will expand it.
+    let preview_min: u16 = 30;
+
+    let selected_idx = app.selected.min(rows.len() - 1);
+    let table_rows: Vec<Row> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, session)| {
+            let selector = if i == selected_idx { "› " } else { "  " };
+            let glyph = row_glyph(session);
+            let prefix = format!("{selector}{glyph}");
+
+            let name_cell = Cell::from(format!("{prefix}{}", session.display_id))
+                .style(canonical_state_style(session));
+
+            let age_cell = Cell::from(last_output_age(session));
+
+            let cmd_cell = Cell::from(
                 session
                     .process
                     .as_ref()
-                    .map(|process| process.command.clone())
+                    .map(|p| p.command.clone())
                     .unwrap_or_else(|| "-".to_string()),
-            ),
-            Cell::from(repo),
-            Cell::from(dirty.clone()).style(dirty_style(dirty.as_str())),
-            Cell::from(preview).style(muted_style()),
-        ])
-        .style(row_style(session))
-    });
+            );
+
+            let preview_text = session
+                .output
+                .as_ref()
+                .and_then(|o| {
+                    let src = if o.recent.is_empty() {
+                        &o.preview
+                    } else {
+                        &o.recent
+                    };
+                    src.lines()
+                        .rfind(|l| !l.trim().is_empty())
+                        .map(|l| l.to_string())
+                })
+                .unwrap_or_else(|| "(no capture)".to_string());
+            let preview_cell = Cell::from(preview_text).style(muted_style());
+
+            Row::new(vec![name_cell, age_cell, cmd_cell, preview_cell])
+        })
+        .collect();
+
     let table = Table::new(
         table_rows,
         [
-            Constraint::Min(16),
-            Constraint::Min(18),
-            Constraint::Length(11),
-            Constraint::Length(9),
-            Constraint::Length(8),
+            Constraint::Min(20),
+            Constraint::Length(6),
             Constraint::Length(12),
-            Constraint::Length(12),
-            Constraint::Length(7),
-            Constraint::Min(16),
+            Constraint::Min(preview_min),
         ],
     )
     .header(
-        Row::new([
-            "ID", "TARGET", "MATCH", "STATE", "LAST", "CMD", "REPO", "DIRTY", "PREVIEW",
-        ])
-        .style(Style::default().add_modifier(Modifier::BOLD)),
+        Row::new(["NAME", "AGE", "CMD", "PREVIEW"])
+            .style(Style::default().add_modifier(Modifier::BOLD)),
     )
-    .block(Block::default().borders(Borders::ALL).title("live table"))
+    .block(Block::default())
     .row_highlight_style(
         Style::default()
             .fg(Color::Black)
             .bg(Color::LightCyan)
             .add_modifier(Modifier::BOLD),
     );
+
     let mut state = TableState::default();
-    if !rows.is_empty() {
-        state.select(Some(app.selected.min(rows.len() - 1)));
-    }
+    state.select(Some(selected_idx));
     frame.render_stateful_widget(table, area, &mut state);
-}
-
-fn draw_topology_tree(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let rows = app.rows();
-    let selected = rows.get(app.selected).copied();
-    let mut hosts: BTreeMap<String, Vec<&SessionSnapshot>> = BTreeMap::new();
-    for row in rows {
-        hosts.entry(row.host.clone()).or_default().push(row);
-    }
-
-    let mut lines = Vec::new();
-    if hosts.is_empty() {
-        lines.push(Line::from("No topology rows"));
-    } else {
-        for (host, host_rows) in hosts {
-            let status = app
-                .snapshots
-                .iter()
-                .find(|snapshot| snapshot.host == host)
-                .map(|snapshot| snapshot.status)
-                .unwrap_or(SnapshotStatus::Ok);
-            lines.push(Line::from(vec![
-                Span::styled("▸ ", muted_style()),
-                Span::styled(host.clone(), Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(" "),
-                Span::styled(
-                    match status {
-                        SnapshotStatus::Ok => "(ok)",
-                        SnapshotStatus::Unreachable => "(unreachable)",
-                    },
-                    if status == SnapshotStatus::Ok {
-                        state_style(SessionState::Active)
-                    } else {
-                        state_style(SessionState::Unreachable)
-                    },
-                ),
-            ]));
-
-            let mut sessions: BTreeMap<String, Vec<&SessionSnapshot>> = BTreeMap::new();
-            for row in host_rows {
-                sessions
-                    .entry(row.tmux.session.clone())
-                    .or_default()
-                    .push(row);
-            }
-            for (session, session_rows) in sessions {
-                lines.push(Line::from(format!("  ▸ session {session}")));
-                for row in session_rows {
-                    let marker = if selected.map(|item| item.display_id.as_str())
-                        == Some(row.display_id.as_str())
-                    {
-                        ">"
-                    } else {
-                        " "
-                    };
-                    let pane = row
-                        .tmux
-                        .window
-                        .as_ref()
-                        .zip(row.tmux.pane.as_ref())
-                        .map(|(window, pane)| format!("{window}.{pane}"))
-                        .unwrap_or_else(|| "-".to_string());
-                    let command = row
-                        .process
-                        .as_ref()
-                        .map(|process| process.command.as_str())
-                        .unwrap_or("-");
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("    {marker} "), muted_style()),
-                        Span::styled(pane, muted_style()),
-                        Span::raw(" "),
-                        Span::styled(command.to_string(), Style::default().fg(Color::White)),
-                        Span::raw(" "),
-                        Span::styled(row.state.as_str(), state_style(row.state)),
-                    ]));
-                }
-            }
-        }
-    }
-
-    frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .block(Block::default().borders(Borders::ALL).title("topology"))
-            .wrap(Wrap { trim: false }),
-        area,
-    );
 }
 
 fn draw_inspector(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
@@ -1235,20 +1182,22 @@ fn draw_inspector(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 
     if app.help {
         let text = Text::from(vec![
-            Line::from("j/down select next"),
-            Line::from("up select previous"),
-            Line::from("r refresh now"),
-            Line::from("s cycle table sort"),
-            Line::from("/ filter"),
-            Line::from("enter readonly attach"),
-            Line::from("a read-write jump"),
-            Line::from("c capture into detail"),
-            Line::from("i inspect and refresh detail"),
-            Line::from("k kill selected pane"),
-            Line::from("e rename selected session"),
-            Line::from("n create session (<host>/<session>)"),
-            Line::from("p spawn pane (<host>/<session>)"),
-            Line::from("q quit"),
+            Line::from("[j/↓] select next"),
+            Line::from("[k/↑] select previous"),
+            Line::from("[r] refresh now"),
+            Line::from("[s] cycle table sort"),
+            Line::from("[/] filter"),
+            Line::from("[Enter] readonly attach"),
+            Line::from("[a] read-write jump"),
+            Line::from("[c] capture into detail"),
+            Line::from("[i] inspect and refresh detail"),
+            Line::from("[x] kill selected pane"),
+            Line::from("[e] rename selected session"),
+            Line::from("[n] create session (<host>/<session>)"),
+            Line::from("[p] spawn pane (<host>/<session>)"),
+            Line::from("[d] toggle detail pane"),
+            Line::from("[?] toggle this help"),
+            Line::from("[q] quit"),
         ]);
         frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
         return;
@@ -1324,44 +1273,157 @@ fn draw_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 
     let mode = if app.editing_filter {
         "filter"
-    } else if app.polling {
+    } else if app.is_polling() {
         "polling"
     } else {
         "ready"
     };
     let mut spans = vec![
-        key_span("enter"),
-        Span::raw(" readonly | "),
-        key_span("a"),
-        Span::raw(" jump | "),
-        key_span("r"),
-        Span::raw(" refresh | "),
-        key_span("s"),
-        Span::raw(" sort | "),
-        key_span("/"),
-        Span::raw(" filter | "),
-        key_span("c"),
-        Span::raw(" capture | "),
-        key_span("i"),
-        Span::raw(" inspect | "),
-        key_span("k"),
-        Span::raw(" kill | "),
-        key_span("e"),
-        Span::raw(" rename | "),
-        key_span("n"),
-        Span::raw(" new-session | "),
-        key_span("p"),
-        Span::raw(" new-pane | "),
-        key_span("q"),
-        Span::raw(" quit"),
-        Span::raw("   "),
+        Span::raw(
+            "[↑↓] move  [Enter] attach ro  [a] jump rw  [i] refresh  [/] filter  [d] details  [?] help  [x] kill  [q] quit   ",
+        ),
         Span::styled(mode, Style::default().fg(Color::Cyan)),
-        Span::raw(format!(" | {} | filter: {}", app.status, app.filter)),
+        Span::raw("  "),
+        Span::styled(short_message(&app.status), muted_style()),
     ];
     if app.editing_filter {
         spans.push(Span::styled(" _", Style::default().fg(Color::LightCyan)));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn draw_context_rail(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let Some(selected) = app.selected_row() else {
+        return;
+    };
+
+    // Action line: spinner while pending, otherwise hotkey hints.
+    let is_pending = app.inspect_pending.as_deref() == Some(selected.display_id.as_str());
+    let action_line = if is_pending {
+        const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_millis())
+            .unwrap_or(0);
+        let frame_idx = (millis / 100) as usize % SPINNER.len();
+        Line::from(Span::styled(
+            format!("{} refreshing…", SPINNER[frame_idx]),
+            muted_style(),
+        ))
+    } else {
+        Line::from(Span::styled(
+            "[i] refresh · [Enter] attach ro · [a] jump rw · [c] copy",
+            muted_style(),
+        ))
+    };
+
+    // Cached output section.
+    let output_lines: Vec<Line<'static>> = if let Some(output) = selected.output.as_ref() {
+        let age = {
+            let age_str = if let Some(ts) = output.last_output_at {
+                let secs = Utc::now().signed_duration_since(ts).num_seconds().max(0);
+                if secs < 60 {
+                    format!("{secs}s ago")
+                } else if secs < 3600 {
+                    format!("{}m ago", secs / 60)
+                } else {
+                    format!("{}h ago", secs / 3600)
+                }
+            } else {
+                "unknown age".to_string()
+            };
+            Line::from(Span::styled(format!("captured {age_str}"), muted_style()))
+        };
+        let text = if output.recent.is_empty() {
+            output.preview.as_str()
+        } else {
+            output.recent.as_str()
+        };
+        // Fit preview into available height: 4 meta lines + blank + age + action = 7 overhead.
+        let max_preview = (area.height as usize).saturating_sub(7).max(1);
+        let mut lines: Vec<Line<'static>> = vec![age];
+        for line in tail_lines(text, max_preview) {
+            lines.push(Line::from(line));
+        }
+        lines
+    } else {
+        vec![Line::from(Span::styled(
+            "no capture yet — press [i] to fetch",
+            muted_style(),
+        ))]
+    };
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("target ", label_style()),
+            Span::raw(table_target(selected)),
+        ]),
+        Line::from(vec![
+            Span::styled("host ", label_style()),
+            Span::raw(selected.host.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled("state ", label_style()),
+            Span::styled(canonical_state(selected), canonical_state_style(selected)),
+        ]),
+        Line::from(vec![
+            Span::styled("cmd ", label_style()),
+            Span::raw(
+                selected
+                    .process
+                    .as_ref()
+                    .map(|p| short_message(&p.command))
+                    .unwrap_or_else(|| "-".into()),
+            ),
+        ]),
+        Line::from(""),
+    ];
+    lines.extend(output_lines);
+    lines.push(Line::from(""));
+    lines.push(action_line);
+
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().title("context").borders(Borders::LEFT)),
+        area,
+    );
+}
+
+fn canonical_state(row: &SessionSnapshot) -> &'static str {
+    if matches!(row.match_status, MatchStatus::Ambiguous) {
+        return "ambiguous";
+    }
+    if matches!(
+        row.match_status,
+        MatchStatus::Missing | MatchStatus::Unreachable
+    ) {
+        return "missing";
+    }
+    // drift: only when a configured watch's pane identity shifted (Shadowed)
+    if matches!(row.match_status, MatchStatus::Shadowed) {
+        return "drift";
+    }
+    // Orphan, Matched, Unknown: classify by session state
+    match row.state {
+        SessionState::Active => "ready",
+        SessionState::Idle => "stale",
+        SessionState::Quiet => "busy",
+        SessionState::Missing => "missing",
+        SessionState::Unreachable => "missing",
+        // Unknown state with no other signal: neutral '-' rather than 'drift'
+        SessionState::Unknown => "-",
+    }
+}
+fn canonical_state_style(row: &SessionSnapshot) -> Style {
+    match canonical_state(row) {
+        "ready" => Style::default().fg(Color::Green),
+        "stale" => Style::default().fg(Color::Yellow),
+        "drift" => Style::default().fg(Color::LightBlue),
+        "busy" => Style::default().fg(Color::LightYellow),
+        "missing" => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        "ambiguous" => Style::default().fg(Color::Magenta),
+        "-" => Style::default().fg(Color::DarkGray),
+        _ => Style::default(),
+    }
 }
 
 fn inspected_row<'a>(app: &'a App, selected: &'a SessionSnapshot) -> &'a SessionSnapshot {
@@ -1625,7 +1687,7 @@ fn selected_output<'a>(
 }
 
 fn empty_state_lines(app: &App) -> Vec<Line<'static>> {
-    if app.snapshots.is_empty() && app.polling {
+    if app.snapshots.is_empty() && app.is_polling() {
         return vec![
             Line::from(Span::styled(
                 "Polling hosts",
@@ -1767,15 +1829,6 @@ fn muted_style() -> Style {
     Style::default().fg(Color::DarkGray)
 }
 
-fn key_span(key: &'static str) -> Span<'static> {
-    Span::styled(
-        key,
-        Style::default()
-            .fg(Color::LightCyan)
-            .add_modifier(Modifier::BOLD),
-    )
-}
-
 fn row_search_text(row: &SessionSnapshot) -> String {
     let repo_text = row
         .repo
@@ -1839,21 +1892,6 @@ fn row_identity(row: &SessionSnapshot) -> String {
                 .map(|target| format!("target:{target}"))
         })
         .unwrap_or_else(|| format!("display:{}|{}", row.display_id, row.target))
-}
-
-fn row_style(session: &SessionSnapshot) -> Style {
-    if matches!(
-        session.match_status,
-        MatchStatus::Unreachable | MatchStatus::Missing
-    ) {
-        return match_style(session.match_status);
-    }
-    match session.state {
-        SessionState::Idle => muted_style(),
-        SessionState::Quiet => Style::default().fg(Color::Gray),
-        SessionState::Missing | SessionState::Unreachable => state_style(session.state),
-        SessionState::Active | SessionState::Unknown => Style::default(),
-    }
 }
 
 fn compare_rows(left: &SessionSnapshot, right: &SessionSnapshot, mode: SortMode) -> Ordering {
@@ -1966,10 +2004,16 @@ fn dirty_style(value: &str) -> Style {
 }
 
 fn format_elapsed(duration: Duration) -> String {
-    if duration.as_millis() < 1_000 {
-        format!("{}ms", duration.as_millis())
+    let secs = duration.as_secs_f64();
+    if secs < 10.0 {
+        format!("{:.1}s", secs)
     } else {
-        format!("{}s", duration.as_secs())
+        let secs_u = duration.as_secs();
+        if secs_u >= 60 {
+            format!("{}m{}s", secs_u / 60, secs_u % 60)
+        } else {
+            format!("{}s", secs_u)
+        }
     }
 }
 
@@ -1983,16 +2027,61 @@ fn short_message(message: &str) -> String {
     }
 }
 
-fn basename(path: &str) -> &str {
-    path.rsplit('/')
-        .next()
-        .filter(|value| !value.is_empty())
-        .unwrap_or(path)
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::snapshot::{MatchStatus, SessionSnapshot, SessionState, TmuxSnapshot};
 
-fn first_row_error(session: &SessionSnapshot) -> Option<String> {
-    session
-        .errors
-        .first()
-        .map(|error| short_message(&error.message))
+    fn make_row(match_status: MatchStatus, state: SessionState) -> SessionSnapshot {
+        SessionSnapshot {
+            session_id: "test".into(),
+            target: "test".into(),
+            display_id: "test".into(),
+            raw_target: None,
+            host: "local".into(),
+            match_status,
+            watch_id: None,
+            watch_index: None,
+            candidate_targets: vec![],
+            shadowed_by: None,
+            state,
+            agent_hint: None,
+            tmux: TmuxSnapshot {
+                session: "test".into(),
+                window: None,
+                pane: None,
+                pane_id: None,
+                session_attached: None,
+            },
+            process: None,
+            repo: None,
+            output: None,
+            errors: vec![],
+        }
+    }
+
+    #[test]
+    fn canonical_state_mapping() {
+        let cases = [
+            (MatchStatus::Orphan, SessionState::Active, "ready"),
+            (MatchStatus::Orphan, SessionState::Idle, "stale"),
+            (MatchStatus::Orphan, SessionState::Quiet, "busy"),
+            (MatchStatus::Orphan, SessionState::Missing, "missing"),
+            (MatchStatus::Orphan, SessionState::Unknown, "-"),
+            (MatchStatus::Matched, SessionState::Active, "ready"),
+            (MatchStatus::Matched, SessionState::Idle, "stale"),
+            (MatchStatus::Shadowed, SessionState::Active, "drift"),
+            (MatchStatus::Ambiguous, SessionState::Active, "ambiguous"),
+            (MatchStatus::Unreachable, SessionState::Active, "missing"),
+            (MatchStatus::Missing, SessionState::Unknown, "missing"),
+            (MatchStatus::Unknown, SessionState::Active, "ready"),
+        ];
+        for (ms, ss, expected) in cases {
+            assert_eq!(
+                canonical_state(&make_row(ms, ss)),
+                expected,
+                "canonical_state({ms:?}, {ss:?})"
+            );
+        }
+    }
 }

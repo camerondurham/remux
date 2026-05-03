@@ -1,7 +1,6 @@
 use crate::config::{Config, HostConfig};
 use crate::host;
 use crate::tmux;
-use anyhow::Result;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -14,13 +13,14 @@ pub struct RepoSnapshot {
     pub error: Option<String>,
 }
 
+#[allow(dead_code)]
 pub fn infer(config: &Config, host_config: &HostConfig, cwd: &str) -> Option<RepoSnapshot> {
     if cwd.trim().is_empty() {
         return None;
     }
 
     let cwd_arg = path_arg(cwd, host_config.is_local());
-    let root = run_git(
+    let root = host::run(
         config,
         host_config,
         &format!("git -C {cwd_arg} rev-parse --show-toplevel"),
@@ -37,12 +37,12 @@ pub fn infer(config: &Config, host_config: &HostConfig, cwd: &str) -> Option<Rep
 pub fn collect(config: &Config, host_config: &HostConfig, path: &str) -> RepoSnapshot {
     let expanded_path = expand_repo_path(path, host_config.is_local());
     let path_arg = path_arg(path, host_config.is_local());
-    let branch = run_git(
+    let branch = host::run(
         config,
         host_config,
         &format!("git -C {path_arg} rev-parse --abbrev-ref HEAD"),
     );
-    let status = run_git(
+    let status = host::run(
         config,
         host_config,
         &format!("git -C {path_arg} status --porcelain=v1"),
@@ -79,8 +79,28 @@ pub fn collect(config: &Config, host_config: &HostConfig, path: &str) -> RepoSna
     }
 }
 
-fn run_git(config: &Config, host_config: &HostConfig, command: &str) -> Result<String> {
-    host::run(config, host_config, command)
+/// Parse the git block emitted by the combined SSH command.
+/// Lines: toplevel, branch, dirty_count (from `wc -l`).
+/// Returns `None` if toplevel is empty (cwd not in a repo).
+/// `changed_files` is left empty — the batched path only collects dirty count.
+pub fn parse_git_block(lines: &[&str]) -> Option<RepoSnapshot> {
+    let toplevel = lines.first().map(|s| s.trim()).unwrap_or("").to_string();
+    if toplevel.is_empty() {
+        return None;
+    }
+    let branch = lines
+        .get(1)
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let dirty_count = lines.get(2).and_then(|s| s.trim().parse::<usize>().ok());
+    Some(RepoSnapshot {
+        path: toplevel,
+        branch,
+        dirty_count,
+        changed_files: vec![],
+        error: None,
+    })
 }
 
 fn expand_repo_path(path: &str, local: bool) -> String {
@@ -110,4 +130,46 @@ fn expand_home_path(path: &str) -> PathBuf {
         return PathBuf::from(home).join(rest);
     }
     path.to_path_buf()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_git_block_happy_path() {
+        let lines = ["/home/cam/work", "main", "3"];
+        let snap = parse_git_block(&lines).unwrap();
+        assert_eq!(snap.path, "/home/cam/work");
+        assert_eq!(snap.branch, Some("main".to_string()));
+        assert_eq!(snap.dirty_count, Some(3));
+        assert!(snap.changed_files.is_empty());
+        assert!(snap.error.is_none());
+    }
+
+    #[test]
+    fn parse_git_block_empty_toplevel_returns_none() {
+        let lines = ["", "main", "0"];
+        assert!(parse_git_block(&lines).is_none());
+    }
+
+    #[test]
+    fn parse_git_block_no_lines_returns_none() {
+        assert!(parse_git_block(&[]).is_none());
+    }
+
+    #[test]
+    fn parse_git_block_malformed_dirty_count() {
+        let lines = ["/repo", "main", "notanumber"];
+        let snap = parse_git_block(&lines).unwrap();
+        assert_eq!(snap.dirty_count, None);
+    }
+
+    #[test]
+    fn parse_git_block_missing_branch() {
+        let lines = ["/repo", "", "0"];
+        let snap = parse_git_block(&lines).unwrap();
+        assert_eq!(snap.branch, None);
+        assert_eq!(snap.dirty_count, Some(0));
+    }
 }

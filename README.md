@@ -208,6 +208,23 @@ Lifecycle commands are explicit mutations. `remux new` creates a detached tmux
 session. `remux kill` kills a resolved session or pane, requires confirmation on
 a TTY, and requires `--yes` from non-interactive scripts.
 
+### Speed up remote polling with SSH multiplexing
+
+Each poll cycle sends one command per host. Without multiplexing, every command opens a fresh SSH connection — TCP handshake, key exchange, authentication — which typically costs 100–500ms per call. With `ControlMaster` enabled, the first connection establishes a persistent master socket and every subsequent `ssh` invocation reuses it at local-pipe speed (usually under 20ms).
+
+Add this to `~/.ssh/config` for the hosts you monitor with `remux`:
+
+```text
+Host your-remote-hosts
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%r@%h:%p
+    ControlPersist 10m
+```
+
+The first `remux` poll after opening the TUI warms the master; subsequent polls feel noticeably faster, especially on high-latency links. `ControlPersist 10m` keeps the connection alive for 10 minutes after the last command; tune to taste.
+
+Verify with `ssh -G <hostname> | grep -iE '^control(master|path|persist) '` — `controlmaster` should read `auto` (not `false`).
+
 ## TUI Keys
 
 ```text

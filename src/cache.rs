@@ -198,6 +198,9 @@ mod tests {
             ssh_timeout: Duration::from_secs(5),
             command_timeout: Duration::from_secs(15),
             max_concurrency: 4,
+            collect_git: true,
+            git_cache_ttl: Duration::from_secs(30),
+            auto_refresh_interval: Duration::from_secs(15),
         };
         let start = Utc::now();
 

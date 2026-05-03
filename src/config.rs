@@ -43,6 +43,19 @@ pub struct PollConfig {
     pub command_timeout: Duration,
     #[serde(default = "default_max_concurrency")]
     pub max_concurrency: usize,
+    #[serde(default = "default_collect_git")]
+    pub collect_git: bool,
+    #[serde(
+        default = "default_git_cache_ttl",
+        deserialize_with = "deserialize_duration"
+    )]
+    pub git_cache_ttl: Duration,
+    /// Interval between automatic background refreshes in the TUI. Set to 0s to disable and rely on manual [r] refreshes.
+    #[serde(
+        default = "default_auto_refresh_interval",
+        deserialize_with = "deserialize_duration"
+    )]
+    pub auto_refresh_interval: Duration,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -135,6 +148,9 @@ impl Default for PollConfig {
             ssh_timeout: default_ssh_timeout(),
             command_timeout: default_command_timeout(),
             max_concurrency: default_max_concurrency(),
+            collect_git: default_collect_git(),
+            git_cache_ttl: default_git_cache_ttl(),
+            auto_refresh_interval: default_auto_refresh_interval(),
         }
     }
 }
@@ -208,6 +224,14 @@ impl Config {
         }
         if self.poll.max_concurrency == 0 {
             bail!("poll.max_concurrency must be greater than zero");
+        }
+        if self.poll.git_cache_ttl.is_zero() {
+            bail!("poll.git_cache_ttl must be greater than zero");
+        }
+        if !self.poll.auto_refresh_interval.is_zero()
+            && self.poll.auto_refresh_interval < Duration::from_secs(1)
+        {
+            bail!("poll.auto_refresh_interval must be 0s (disabled) or at least 1s");
         }
 
         let mut host_ids = HashSet::new();
@@ -337,6 +361,8 @@ impl SshConfig {
         let mut options = BTreeMap::from([
             ("BatchMode".to_string(), "yes".to_string()),
             ("ConnectTimeout".to_string(), timeout),
+            ("ServerAliveInterval".to_string(), "3".to_string()),
+            ("ServerAliveCountMax".to_string(), "2".to_string()),
         ]);
         options.extend(self.options.clone());
         options
@@ -383,6 +409,18 @@ fn default_command_timeout() -> Duration {
 
 fn default_max_concurrency() -> usize {
     4
+}
+
+fn default_collect_git() -> bool {
+    true
+}
+
+fn default_git_cache_ttl() -> Duration {
+    Duration::from_secs(30)
+}
+
+fn default_auto_refresh_interval() -> Duration {
+    Duration::from_secs(15)
 }
 
 fn validate_watch<'a>(
@@ -633,5 +671,34 @@ watches:
         assert_eq!(parse_duration("5s").unwrap(), Duration::from_secs(5));
         assert_eq!(parse_duration("5m").unwrap(), Duration::from_secs(300));
         assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn auto_refresh_interval_defaults_to_15s() {
+        let config: Config = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(config.poll.auto_refresh_interval, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn auto_refresh_interval_parses_15s() {
+        let config: Config = serde_yaml::from_str("poll:\n  auto_refresh_interval: 15s").unwrap();
+        assert_eq!(config.poll.auto_refresh_interval, Duration::from_secs(15));
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn auto_refresh_interval_parses_0s() {
+        let config: Config = serde_yaml::from_str("poll:\n  auto_refresh_interval: 0s").unwrap();
+        assert_eq!(config.poll.auto_refresh_interval, Duration::ZERO);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn auto_refresh_interval_rejects_500ms() {
+        // parse_duration only supports whole-second units, so "500ms" is an
+        // invalid unit string and is rejected at parse time.
+        let result: Result<Config, _> =
+            serde_yaml::from_str("poll:\n  auto_refresh_interval: 500ms");
+        assert!(result.is_err());
     }
 }
