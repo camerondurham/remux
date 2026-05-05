@@ -4,6 +4,7 @@ use crate::ssh;
 use crate::tmux::{self, PaneTarget};
 use anyhow::{Context, Result};
 use std::env;
+use std::path::Path;
 use std::process::Command;
 
 pub fn attach(config: &Config, id_or_target: &str, readonly: bool) -> Result<()> {
@@ -14,18 +15,24 @@ pub fn attach(config: &Config, id_or_target: &str, readonly: bool) -> Result<()>
 pub fn attach_target(config: &Config, target: &PaneTarget, readonly: bool) -> Result<()> {
     let host = config.host(&target.host)?;
     match host.kind {
-        HostKind::Local => attach_local(target, readonly),
+        HostKind::Local => attach_local(target, readonly, host.tmux_socket()),
         HostKind::Ssh => {
-            let command = attach_command(target, readonly);
+            let command = attach_command(target, readonly, host.tmux_socket());
             ssh::run_interactive(host, &command, config.poll.ssh_timeout)
                 .with_context(|| format!("failed to run remote tmux attach for `{target}`"))
         }
     }
 }
 
-fn attach_local(target: &PaneTarget, readonly: bool) -> Result<()> {
+fn attach_local(target: &PaneTarget, readonly: bool, socket: Option<&str>) -> Result<()> {
     let mut command = Command::new("tmux");
-    if inside_tmux() {
+    if let Some(socket) = socket {
+        command
+            .arg("-S")
+            .arg(crate::config::expand_home_path(Path::new(socket)));
+        command.env_remove("TMUX");
+    }
+    if should_switch_client(socket, inside_tmux()) {
         // Inside an existing tmux client, `switch-client -t <pane-target>`
         // is the documented way to change session/window/pane atomically —
         // tmux special-cases a target containing `:`, `.`, or `%`.
@@ -61,6 +68,10 @@ fn inside_tmux() -> bool {
     env::var_os("TMUX").is_some()
 }
 
+fn should_switch_client(socket: Option<&str>, inside_tmux: bool) -> bool {
+    socket.is_none() && inside_tmux
+}
+
 /// Build a single-target string for `switch-client -t` that selects
 /// session, window, and pane. Prefers the global `%pane_id` when known,
 /// otherwise falls back to `session:window.pane`.
@@ -89,8 +100,8 @@ fn add_select_args(command: &mut Command, target: &PaneTarget) {
         .arg(select_pane_target(target));
 }
 
-fn attach_command(target: &PaneTarget, readonly: bool) -> String {
-    let mut parts = vec!["tmux attach-session".to_string()];
+fn attach_command(target: &PaneTarget, readonly: bool, socket: Option<&str>) -> String {
+    let mut parts = vec![tmux::tmux_command(socket), "attach-session".to_string()];
     if readonly {
         parts.push("-r".to_string());
     }
@@ -131,7 +142,7 @@ mod tests {
 
     #[test]
     fn attach_command_with_pane_id_uses_window_index_and_pane_id() {
-        let cmd = attach_command(&pane_target(Some("%42")), false);
+        let cmd = attach_command(&pane_target(Some("%42")), false, None);
         assert!(cmd.contains("attach-session"));
         assert!(cmd.contains("-t 's'"));
         // select-window uses a window target (index), not the pane_id.
@@ -150,10 +161,24 @@ mod tests {
 
     #[test]
     fn attach_command_without_pane_id_uses_window_and_pane_indices() {
-        let cmd = attach_command(&pane_target(None), true);
+        let cmd = attach_command(&pane_target(None), true, None);
         assert!(cmd.contains("attach-session -r"));
         assert!(cmd.contains("select-window -t '1'"));
         assert!(cmd.contains("select-pane -t '2'"));
+    }
+
+    #[test]
+    fn attach_command_includes_custom_socket() {
+        let cmd = attach_command(&pane_target(Some("%42")), true, Some("/tmp/tmux.sock"));
+        assert!(cmd.starts_with("tmux -S '/tmp/tmux.sock' attach-session -r"));
+        assert!(cmd.contains("select-pane -t '%42'"));
+    }
+
+    #[test]
+    fn configured_socket_does_not_switch_existing_client() {
+        assert!(should_switch_client(None, true));
+        assert!(!should_switch_client(Some("/tmp/tmux.sock"), true));
+        assert!(!should_switch_client(Some("/tmp/tmux.sock"), false));
     }
 
     #[test]

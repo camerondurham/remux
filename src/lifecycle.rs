@@ -37,7 +37,8 @@ pub fn new_session(
         .into());
     }
 
-    let command = tmux::new_session_command(session_name, cwd, window_name);
+    let host = config.host(host_id)?;
+    let command = tmux::new_session_command(session_name, cwd, window_name, host.tmux_socket());
     run_lifecycle_command(config, host_id, &command, verbose)
         .with_context(|| format!("failed to create session `{host_id}/{session_name}`"))
 }
@@ -45,7 +46,7 @@ pub fn new_session(
 pub fn kill(config: &Config, target: &str, yes: bool, verbose: bool) -> Result<()> {
     let target = resolve_kill_target(config, target)?;
     confirm_kill(&target, yes)?;
-    let (host_id, command) = target.command();
+    let (host_id, command) = target.command(config)?;
     run_lifecycle_command(config, host_id, &command, verbose)
 }
 
@@ -77,10 +78,11 @@ pub fn rename_session(
         );
     }
 
+    let host = config.host(host_id)?;
     run_lifecycle_command(
         config,
         host_id,
-        &tmux::rename_session_command(old_name, new_name),
+        &tmux::rename_session_command(old_name, new_name, host.tmux_socket()),
         verbose,
     )
     .with_context(|| format!("failed to rename `{host_id}/{old_name}` to `{new_name}`"))
@@ -99,10 +101,11 @@ pub fn new_pane(config: &Config, host_id: &str, session: &str, verbose: bool) ->
         );
     }
 
+    let host = config.host(host_id)?;
     run_lifecycle_command(
         config,
         host_id,
-        &tmux::split_window_command(session),
+        &tmux::split_window_command(session, host.tmux_socket()),
         verbose,
     )
     .with_context(|| format!("failed to spawn pane in `{host_id}/{session}`"))
@@ -225,10 +228,22 @@ fn run_lifecycle_command(
 }
 
 impl KillTarget {
-    fn command(&self) -> (&str, String) {
+    fn command(&self, config: &Config) -> Result<(&str, String)> {
         match self {
-            KillTarget::Session { host, session } => (host, tmux::kill_session_command(session)),
-            KillTarget::Pane(target) => (&target.host, tmux::kill_pane_command(target)),
+            KillTarget::Session { host, session } => {
+                let host_config = config.host(host)?;
+                Ok((
+                    host,
+                    tmux::kill_session_command(session, host_config.tmux_socket()),
+                ))
+            }
+            KillTarget::Pane(target) => {
+                let host_config = config.host(&target.host)?;
+                Ok((
+                    &target.host,
+                    tmux::kill_pane_command(target, host_config.tmux_socket()),
+                ))
+            }
         }
     }
 

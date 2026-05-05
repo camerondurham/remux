@@ -300,6 +300,66 @@ sessions:
 }
 
 #[test]
+fn local_host_can_inspect_configured_tmux_socket() {
+    let env = TestEnv::new();
+    env.write_config(
+        r#"
+poll:
+  capture_lines: 2
+hosts:
+  - id: local
+    type: local
+    tmux_socket: /tmp/remux-custom.sock
+sessions:
+  - id: socket-agent
+    host: local
+    tmux:
+      session: socketed
+      window: 1
+      pane: 0
+"#,
+    );
+
+    let snapshot = env.remux(["--config", env.config_path(), "snapshot", "local", "--json"]);
+    assert_success(&snapshot);
+    let snapshot: Value = serde_json::from_str(&stdout(&snapshot)).unwrap();
+    assert_eq!(snapshot["tmux_socket"], "/tmp/remux-custom.sock");
+    assert_eq!(snapshot["sessions"][0]["session_id"], "socket-agent");
+    assert_eq!(
+        snapshot["sessions"][0]["tmux_socket"],
+        "/tmp/remux-custom.sock"
+    );
+    assert_eq!(snapshot["sessions"][0]["target"], "local/socketed:1.0");
+    assert_eq!(snapshot["sessions"][0]["output"]["preview"], "socket-remux");
+
+    let inspect = env.remux(["--config", env.config_path(), "inspect", "socket-agent"]);
+    assert_success(&inspect);
+    let inspect_stdout = stdout(&inspect);
+    assert!(inspect_stdout.contains("Session") && inspect_stdout.contains("socket-agent"));
+    assert!(inspect_stdout.contains("socket-remux"));
+
+    let capture = env.remux([
+        "--config",
+        env.config_path(),
+        "capture",
+        "socket-agent",
+        "--lines",
+        "2",
+    ]);
+    assert_success(&capture);
+    assert!(stdout(&capture).contains("socket-remux"));
+
+    let attach = env.remux_inside_other_tmux([
+        "--config",
+        env.config_path(),
+        "attach",
+        "--readonly",
+        "socket-agent",
+    ]);
+    assert_success(&attach);
+}
+
+#[test]
 fn capture_failures_are_reported_without_fake_output() {
     let env = TestEnv::new();
     env.write_config(
@@ -557,6 +617,16 @@ sessions:
             .args(args)
             .env("PATH", &self.path)
             .env("REMUX_CACHE_PATH", &self.cache)
+            .output()
+            .unwrap()
+    }
+
+    fn remux_inside_other_tmux<const N: usize>(&self, args: [&str; N]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_remux"))
+            .args(args)
+            .env("PATH", &self.path)
+            .env("REMUX_CACHE_PATH", &self.cache)
+            .env("TMUX", "/tmp/default-tmux,123,0")
             .output()
             .unwrap()
     }
@@ -850,7 +920,42 @@ fn fake_tmux_script() -> &'static str {
     r##"#!/usr/bin/env bash
 set -euo pipefail
 
+socket=""
+if [[ "${1:-}" == "-S" ]]; then
+  socket="${2:-}"
+  shift 2
+fi
 args="$*"
+
+if [[ "$socket" == "/tmp/remux-custom.sock" && "${1:-}" == "list-panes" && "$args" == *"pane_id}"* && "$args" != *"#S"* ]]; then
+  echo '%70'
+  exit 0
+fi
+
+if [[ "$socket" == "/tmp/remux-custom.sock" && "${1:-}" == "list-panes" ]]; then
+  printf 'socketed\t1\t0\t%%70\t7777\tzsh\t/tmp/socketed\t1\n'
+  exit 0
+fi
+
+if [[ "$socket" == "/tmp/remux-custom.sock" && "${1:-}" == "capture-pane" && ("${3:-}" == "socketed:1.0" || "${3:-}" == "%70") ]]; then
+  printf 'socket line\nsocket-remux\n'
+  exit 0
+fi
+
+if [[ "$socket" == "/tmp/remux-custom.sock" && "${1:-}" == "attach-session" ]]; then
+  if [[ -n "${TMUX:-}" ]]; then
+    echo "TMUX should be unset for cross-socket attach" >&2
+    exit 47
+  fi
+  if [[ "$args" == *"socketed"* && "$args" == *"select-pane -t %70"* ]]; then
+    exit 0
+  fi
+fi
+
+if [[ "$socket" == "/tmp/remux-custom.sock" ]]; then
+  echo "unexpected tmux socket command: $*" >&2
+  exit 46
+fi
 
 if [[ "${1:-}" == "list-panes" && "$args" == *"pane_id}"* && "$args" != *"#S"* ]]; then
   echo '%7'

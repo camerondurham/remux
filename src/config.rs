@@ -63,6 +63,8 @@ pub struct HostConfig {
     pub id: String,
     #[serde(rename = "type")]
     pub kind: HostKind,
+    #[serde(default)]
+    pub tmux_socket: Option<String>,
     pub ssh: Option<SshConfig>,
 }
 
@@ -242,6 +244,13 @@ impl Config {
             if !host_ids.insert(host.id.as_str()) {
                 bail!("duplicate host id `{}`", host.id);
             }
+            if host
+                .tmux_socket
+                .as_ref()
+                .is_some_and(|socket| socket.trim().is_empty())
+            {
+                bail!("host `{}` tmux_socket must not be empty", host.id);
+            }
 
             match host.kind {
                 HostKind::Local => {
@@ -334,6 +343,13 @@ impl Watch {
 impl HostConfig {
     pub fn is_local(&self) -> bool {
         self.kind == HostKind::Local
+    }
+
+    pub fn tmux_socket(&self) -> Option<&str> {
+        self.tmux_socket
+            .as_deref()
+            .map(str::trim)
+            .filter(|socket| !socket.is_empty())
     }
 
     pub fn ssh(&self) -> Result<&SshConfig> {
@@ -528,6 +544,7 @@ hosts:
     type: local
   - id: pi
     type: ssh
+    tmux_socket: ~/.work-os/tmux.sock
     ssh:
       target: cam@192.168.0.197
 sessions:
@@ -555,6 +572,10 @@ watches:
         assert_eq!(config.poll.command_timeout, Duration::from_secs(11));
         assert_eq!(config.poll.max_concurrency, 3);
         assert_eq!(
+            config.host("pi").unwrap().tmux_socket(),
+            Some("~/.work-os/tmux.sock")
+        );
+        assert_eq!(
             config.host("pi").unwrap().ssh().unwrap().target().unwrap(),
             "cam@192.168.0.197"
         );
@@ -563,6 +584,27 @@ watches:
             Some("codex")
         );
         assert_eq!(config.watches_for_host("pi").len(), 2);
+    }
+
+    #[test]
+    fn rejects_empty_tmux_socket() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+hosts:
+  - id: local
+    type: local
+    tmux_socket: " "
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("tmux_socket must not be empty")
+        );
     }
 
     #[test]

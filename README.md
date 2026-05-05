@@ -121,9 +121,13 @@ poll:
 hosts:
   - id: local
     type: local
+    # Optional: inspect a non-default tmux server socket.
+    # tmux_socket: ~/.work-os/tmux.sock
 
   - id: pi
     type: ssh
+    # Optional: evaluated on the remote host for SSH targets.
+    # tmux_socket: ~/.work-os/tmux.sock
     ssh:
       target: cam@192.168.0.197
 

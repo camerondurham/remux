@@ -12,7 +12,7 @@ pub fn hosts(config: &Config) -> Result<()> {
     }
     let cache = cache_load.cache;
 
-    let headers = &["HOST", "TYPE", "TARGET", "STATUS", "LAST POLL"];
+    let headers = &["HOST", "TYPE", "TARGET", "SOCKET", "STATUS", "LAST POLL"];
     let rows: Vec<Vec<String>> = config
         .hosts
         .iter()
@@ -30,6 +30,10 @@ pub fn hosts(config: &Config) -> Result<()> {
                 HostKind::Local => "local",
                 HostKind::Ssh => "ssh",
             };
+            let socket = host
+                .tmux_socket()
+                .map(|socket| clamp_preview(socket, 30))
+                .unwrap_or_else(|| "-".to_string());
             let (status, last_poll) = cache
                 .hosts
                 .get(&host.id)
@@ -40,7 +44,14 @@ pub fn hosts(config: &Config) -> Result<()> {
                     )
                 })
                 .unwrap_or_else(|| ("-".to_string(), "-".to_string()));
-            vec![host.id.clone(), kind.to_string(), target, status, last_poll]
+            vec![
+                host.id.clone(),
+                kind.to_string(),
+                target,
+                socket,
+                status,
+                last_poll,
+            ]
         })
         .collect();
     print!("{}", render_table(headers, rows, None));
@@ -56,6 +67,9 @@ pub fn snapshot(snapshot: &HostSnapshot, json: bool) -> Result<()> {
     match snapshot.status {
         SnapshotStatus::Ok => {
             println!("Host: {}", snapshot.host);
+            if let Some(socket) = &snapshot.tmux_socket {
+                println!("Socket: {socket}");
+            }
             println!("Collected: {}", snapshot.collected_at);
             print_snapshot_errors(snapshot);
             println!();
@@ -63,6 +77,9 @@ pub fn snapshot(snapshot: &HostSnapshot, json: bool) -> Result<()> {
         }
         SnapshotStatus::Unreachable => {
             println!("Host: {}", snapshot.host);
+            if let Some(socket) = &snapshot.tmux_socket {
+                println!("Socket: {socket}");
+            }
             println!("Status: unreachable");
             print_snapshot_errors(snapshot);
             if !snapshot.sessions.is_empty() {
@@ -190,6 +207,14 @@ pub fn inspect(detail: &PaneDetail, json: bool) -> Result<()> {
     if let Some(watch_id) = &session.watch_id {
         pairs.push(("Watch", watch_id.clone()));
     }
+    pairs.push((
+        "Tmux socket",
+        session
+            .tmux_socket
+            .as_deref()
+            .unwrap_or("default")
+            .to_string(),
+    ));
     if let Some(shadowed_by) = &session.shadowed_by {
         pairs.push(("Shadowed by", shadowed_by.clone()));
     }

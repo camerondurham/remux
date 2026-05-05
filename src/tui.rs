@@ -586,6 +586,7 @@ fn poll_hosts(config: &Config, host_ids: Vec<String>, tx: mpsc::Sender<RefreshMe
 fn synthetic_error_snapshot(host: String, err: anyhow::Error) -> HostSnapshot {
     HostSnapshot {
         host,
+        tmux_socket: None,
         status: snapshot::SnapshotStatus::Unreachable,
         collected_at: Utc::now(),
         sessions: Vec::new(),
@@ -1113,8 +1114,20 @@ fn draw_live_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             let glyph = row_glyph(session);
             let prefix = format!("{selector}{glyph}");
 
-            let name_cell = Cell::from(format!("{prefix}{}", session.display_id))
-                .style(canonical_state_style(session));
+            let mut name_spans = vec![Span::styled(prefix, canonical_state_style(session))];
+            if session.tmux_socket.is_some() {
+                name_spans.push(Span::styled(
+                    "i ",
+                    Style::default()
+                        .fg(Color::LightBlue)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            name_spans.push(Span::styled(
+                session.display_id.clone(),
+                canonical_state_style(session),
+            ));
+            let name_cell = Cell::from(Line::from(name_spans));
 
             let age_cell = Cell::from(last_output_age(session));
 
@@ -1363,6 +1376,16 @@ fn draw_context_rail(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             Span::raw(selected.host.clone()),
         ]),
         Line::from(vec![
+            Span::styled("socket ", label_style()),
+            Span::raw(
+                selected
+                    .tmux_socket
+                    .as_deref()
+                    .unwrap_or("default")
+                    .to_string(),
+            ),
+        ]),
+        Line::from(vec![
             Span::styled("state ", label_style()),
             Span::styled(canonical_state(selected), canonical_state_style(selected)),
         ]),
@@ -1494,6 +1517,7 @@ fn detail_meta_lines(row: &SessionSnapshot) -> Vec<Line<'static>> {
         .unwrap_or_else(|| "-".to_string());
     let watch = row.watch_id.as_deref().unwrap_or("-");
     let raw_target = row.raw_target.as_deref().unwrap_or("-");
+    let socket = row.tmux_socket.as_deref().unwrap_or("default");
 
     let mut lines = vec![
         Line::from(Span::styled(
@@ -1515,6 +1539,10 @@ fn detail_meta_lines(row: &SessionSnapshot) -> Vec<Line<'static>> {
         Line::from(vec![
             Span::styled("target: ", label_style()),
             Span::raw(raw_target.to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("socket: ", label_style()),
+            Span::raw(socket.to_string()),
         ]),
         Line::from(vec![
             Span::styled("tmux: ", label_style()),
@@ -1851,8 +1879,9 @@ fn row_search_text(row: &SessionSnapshot) -> String {
         .map(|output| format!("{} {}", output.preview, output.recent))
         .unwrap_or_default();
     format!(
-        "{} {} {} {} {} {} {} {}",
+        "{} {} {} {} {} {} {} {} {}",
         row.host,
+        row.tmux_socket.as_deref().unwrap_or(""),
         row.display_id,
         row.match_status.as_str(),
         row.state.as_str(),
@@ -2039,6 +2068,7 @@ mod tests {
             display_id: "test".into(),
             raw_target: None,
             host: "local".into(),
+            tmux_socket: None,
             match_status,
             watch_id: None,
             watch_index: None,

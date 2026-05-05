@@ -4,7 +4,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt;
 
-pub const INVENTORY_COMMAND: &str = "tmux list-panes -a -F '#S\t#I\t#P\t#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}\t#{session_attached}'";
+pub const INVENTORY_FORMAT: &str = "'#S\t#I\t#P\t#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}\t#{session_attached}'";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PaneTarget {
@@ -108,7 +108,9 @@ pub fn inventory_with_captures_command(
     capture_lines: usize,
     collect_git: bool,
     skip_git_cwds: &[String],
+    socket: Option<&str>,
 ) -> String {
+    let tmux = tmux_command(socket);
     let git_section = if collect_git {
         let skip_block = if skip_git_cwds.is_empty() {
             String::new()
@@ -120,7 +122,7 @@ pub fn inventory_with_captures_command(
             )
         };
         format!(
-            "\ntmux list-panes -a -F '#{{pane_id}}\t#{{pane_current_path}}' | while IFS='\t' read -r _git_pid _git_cwd; do\n\
+            "\n{tmux} list-panes -a -F '#{{pane_id}}\t#{{pane_current_path}}' | while IFS='\t' read -r _git_pid _git_cwd; do\n\
       case \"$_git_cwd\" in\n\
         /|\"$HOME\"|\"\") continue ;;\n\
       esac\n\
@@ -138,6 +140,7 @@ pub fn inventory_with_captures_command(
       echo \"===REMUX-GIT-$NONCE-$_git_pid-END===\"\n\
     done",
             skip_block = skip_block,
+            tmux = tmux,
         )
     } else {
         String::new()
@@ -148,14 +151,15 @@ pub fn inventory_with_captures_command(
 echo \"===REMUX-INVENTORY-$NONCE-BEGIN===\"\n\
 {inventory}\n\
 echo \"===REMUX-INVENTORY-$NONCE-END===\"\n\
-tmux list-panes -a -F '#{{pane_id}}' | while IFS= read -r pid; do\n\
+{tmux} list-panes -a -F '#{{pane_id}}' | while IFS= read -r pid; do\n\
     echo \"===REMUX-CAPTURE-$NONCE-$pid===\"\n\
-    tmux capture-pane -pt \"$pid\" -S -{capture_lines} || echo \"===REMUX-ERROR-$NONCE===\"\n\
+    {tmux} capture-pane -pt \"$pid\" -S -{capture_lines} || echo \"===REMUX-ERROR-$NONCE===\"\n\
 done{git_section}\n\
 echo \"===REMUX-END-$NONCE===\"",
-        inventory = INVENTORY_COMMAND,
+        inventory = inventory_command(socket),
         capture_lines = capture_lines,
         git_section = git_section,
+        tmux = tmux,
     )
 }
 
@@ -307,18 +311,33 @@ pub fn parse_inventory_with_captures(
     Ok((panes, captures, git_map))
 }
 
-pub fn capture_command(target: &PaneTarget, lines: usize, color: bool) -> String {
+pub fn capture_command(
+    target: &PaneTarget,
+    lines: usize,
+    color: bool,
+    socket: Option<&str>,
+) -> String {
     let color_flag = if color { "-e " } else { "" };
     format!(
-        "tmux capture-pane {}-pt {} -S -{}",
+        "{} capture-pane {}-pt {} -S -{}",
+        tmux_command(socket),
         color_flag,
         shell_quote(&target.tmux_target()),
         lines
     )
 }
 
-pub fn new_session_command(session: &str, cwd: Option<&str>, window_name: Option<&str>) -> String {
-    let mut parts = vec!["tmux new-session -d -s".to_string(), shell_quote(session)];
+pub fn new_session_command(
+    session: &str,
+    cwd: Option<&str>,
+    window_name: Option<&str>,
+    socket: Option<&str>,
+) -> String {
+    let mut parts = vec![
+        tmux_command(socket),
+        "new-session -d -s".to_string(),
+        shell_quote(session),
+    ];
     if let Some(cwd) = cwd {
         parts.push("-c".to_string());
         parts.push(shell_path(cwd));
@@ -330,24 +349,51 @@ pub fn new_session_command(session: &str, cwd: Option<&str>, window_name: Option
     parts.join(" ")
 }
 
-pub fn kill_session_command(session: &str) -> String {
-    format!("tmux kill-session -t {}", shell_quote(session))
-}
-
-pub fn kill_pane_command(target: &PaneTarget) -> String {
-    format!("tmux kill-pane -t {}", shell_quote(&target.tmux_target()))
-}
-
-pub fn rename_session_command(old_name: &str, new_name: &str) -> String {
+pub fn kill_session_command(session: &str, socket: Option<&str>) -> String {
     format!(
-        "tmux rename-session -t {} {}",
+        "{} kill-session -t {}",
+        tmux_command(socket),
+        shell_quote(session)
+    )
+}
+
+pub fn kill_pane_command(target: &PaneTarget, socket: Option<&str>) -> String {
+    format!(
+        "{} kill-pane -t {}",
+        tmux_command(socket),
+        shell_quote(&target.tmux_target())
+    )
+}
+
+pub fn rename_session_command(old_name: &str, new_name: &str, socket: Option<&str>) -> String {
+    format!(
+        "{} rename-session -t {} {}",
+        tmux_command(socket),
         shell_quote(old_name),
         shell_quote(new_name)
     )
 }
 
-pub fn split_window_command(session: &str) -> String {
-    format!("tmux split-window -d -t {}", shell_quote(session))
+pub fn split_window_command(session: &str, socket: Option<&str>) -> String {
+    format!(
+        "{} split-window -d -t {}",
+        tmux_command(socket),
+        shell_quote(session)
+    )
+}
+
+pub fn inventory_command(socket: Option<&str>) -> String {
+    format!(
+        "{} list-panes -a -F {INVENTORY_FORMAT}",
+        tmux_command(socket)
+    )
+}
+
+pub fn tmux_command(socket: Option<&str>) -> String {
+    match socket.map(str::trim).filter(|socket| !socket.is_empty()) {
+        Some(socket) => format!("tmux -S {}", shell_path(socket)),
+        None => "tmux".to_string(),
+    }
 }
 
 fn parse_tmux_bool(value: &str) -> bool {
@@ -413,7 +459,7 @@ mod tests {
     fn capture_command_quotes_target() {
         let target = PaneTarget::parse("pi/codex:0.1").unwrap();
         assert_eq!(
-            capture_command(&target, 120, false),
+            capture_command(&target, 120, false, None),
             "tmux capture-pane -pt 'codex:0.1' -S -120"
         );
     }
@@ -422,24 +468,39 @@ mod tests {
     fn capture_command_preserves_color_when_requested() {
         let target = PaneTarget::parse("pi/codex:0.1").unwrap();
         assert_eq!(
-            capture_command(&target, 20, true),
+            capture_command(&target, 20, true, None),
             "tmux capture-pane -e -pt 'codex:0.1' -S -20"
         );
     }
 
     #[test]
+    fn commands_include_custom_socket_when_configured() {
+        let target = PaneTarget::parse("pi/codex:0.1").unwrap();
+        assert_eq!(
+            capture_command(&target, 20, false, Some("~/.work-os/tmux.sock")),
+            "tmux -S $HOME/'.work-os/tmux.sock' capture-pane -pt 'codex:0.1' -S -20"
+        );
+        let combined = inventory_with_captures_command(2, false, &[], Some("/tmp/tmux.sock"));
+        assert!(combined.contains("tmux -S '/tmp/tmux.sock' list-panes -a -F '#S"));
+        assert!(combined.contains("tmux -S '/tmp/tmux.sock' capture-pane -pt \"$pid\" -S -2"));
+    }
+
+    #[test]
     fn lifecycle_commands_quote_targets() {
         assert_eq!(
-            new_session_command("work", Some("~/repo"), Some("main")),
+            new_session_command("work", Some("~/repo"), Some("main"), None),
             "tmux new-session -d -s 'work' -c $HOME/'repo' -n 'main'"
         );
-        assert_eq!(kill_session_command("work"), "tmux kill-session -t 'work'");
         assert_eq!(
-            rename_session_command("work", "work-next"),
+            kill_session_command("work", None),
+            "tmux kill-session -t 'work'"
+        );
+        assert_eq!(
+            rename_session_command("work", "work-next", None),
             "tmux rename-session -t 'work' 'work-next'"
         );
         assert_eq!(
-            split_window_command("work"),
+            split_window_command("work", None),
             "tmux split-window -d -t 'work'"
         );
     }
@@ -550,9 +611,9 @@ mod tests {
 
     #[test]
     fn collect_git_flag_controls_git_block() {
-        let off = inventory_with_captures_command(2, false, &[]);
+        let off = inventory_with_captures_command(2, false, &[], None);
         assert!(!off.contains("REMUX-GIT"));
-        let on = inventory_with_captures_command(2, true, &[]);
+        let on = inventory_with_captures_command(2, true, &[], None);
         assert!(on.contains("REMUX-GIT-$NONCE"));
         assert!(on.contains("git -C"));
     }

@@ -24,6 +24,7 @@ fn global_git_cache() -> &'static GitCache {
 #[derive(Debug, Clone, Serialize)]
 pub struct HostSnapshot {
     pub host: String,
+    pub tmux_socket: Option<String>,
     pub status: SnapshotStatus,
     pub collected_at: DateTime<Utc>,
     pub sessions: Vec<SessionSnapshot>,
@@ -95,6 +96,7 @@ pub struct SessionSnapshot {
     pub display_id: String,
     pub raw_target: Option<String>,
     pub host: String,
+    pub tmux_socket: Option<String>,
     pub match_status: MatchStatus,
     pub watch_id: Option<String>,
     pub watch_index: Option<usize>,
@@ -241,7 +243,7 @@ pub fn capture_pane(
         bail!("capture lines must be greater than zero");
     }
     let host_config = config.host(&target.host)?;
-    let command = tmux::capture_command(target, lines, color);
+    let command = tmux::capture_command(target, lines, color, host_config.tmux_socket());
     host::run(config, host_config, &command)
 }
 
@@ -334,6 +336,7 @@ fn snapshot_host_with_cache(
         config.poll.capture_lines,
         config.poll.collect_git,
         &skip_git_cwds,
+        host_config.tmux_socket(),
     );
     match host::run(config, host_config, &command) {
         Ok(output) => {
@@ -367,6 +370,7 @@ fn snapshot_host_with_cache(
             cache.update_host(host_id, "ok", now);
             Ok(HostSnapshot {
                 host: host_id.to_string(),
+                tmux_socket: host_config.tmux_socket().map(str::to_string),
                 status: SnapshotStatus::Ok,
                 collected_at: now,
                 sessions,
@@ -378,6 +382,7 @@ fn snapshot_host_with_cache(
             let message = format!("{err:#}");
             Ok(HostSnapshot {
                 host: host_id.to_string(),
+                tmux_socket: host_config.tmux_socket().map(str::to_string),
                 status: SnapshotStatus::Unreachable,
                 collected_at: now,
                 sessions: unreachable_sessions(config, host_id, &message),
@@ -670,6 +675,7 @@ fn snapshot_for_pane(
         display_id,
         raw_target: Some(pane.target.clone()),
         host: host_config.id.clone(),
+        tmux_socket: host_config.tmux_socket().map(str::to_string),
         match_status: row.match_status,
         watch_id: row.watch.map(|watch| watch.watch.id.clone()),
         watch_index: row.watch.map(|watch| watch.index),
@@ -735,6 +741,7 @@ fn watch_without_pane_snapshot(
         display_id: watch.watch.id.clone(),
         raw_target: None,
         host: host_config.id.clone(),
+        tmux_socket: host_config.tmux_socket().map(str::to_string),
         match_status,
         watch_id: Some(watch.watch.id.clone()),
         watch_index: Some(watch.index),
@@ -1097,7 +1104,7 @@ mod tests {
         };
         assert_eq!(skip, vec!["/home/cam/work".to_string()]);
         // The command should contain the skip pattern.
-        let cmd = crate::tmux::inventory_with_captures_command(2, true, &skip);
+        let cmd = crate::tmux::inventory_with_captures_command(2, true, &skip, None);
         assert!(cmd.contains("'/home/cam/work'"));
         assert!(cmd.contains("continue"));
     }
