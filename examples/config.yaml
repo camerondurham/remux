@@ -8,9 +8,13 @@ poll:
 hosts:
   - id: local
     type: local
+    # Optional: inspect a non-default tmux server socket for this host.
+    # tmux_socket: ~/.work-os/tmux.sock
 
   - id: pi
     type: ssh
+    # Optional for SSH hosts too; the path is evaluated on the remote host.
+    # tmux_socket: ~/.work-os/tmux.sock
     ssh:
       target: cam@192.168.0.197
       # Optional escape hatch for environments with broken system SSH config.

@@ -141,6 +141,7 @@ mod tests {
         let host = HostConfig {
             id: "pi".to_string(),
             kind: HostKind::Ssh,
+            tmux_socket: None,
             ssh: Some(SshConfig {
                 target: Some("cam@192.168.0.197".to_string()),
                 host: None,
