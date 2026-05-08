@@ -268,12 +268,14 @@ The footer shows the primary navigation and action keys:
 [↑↓] move  [Enter] attach ro  [a] jump rw  [i] refresh  [/] filter  [d] details  [?] help  [x] kill  [q] quit
 ```
 
+The footer labels `[i]` as "refresh", which is a shorthand — `[i]` opens the inspect pane for the selected row and re-captures that pane's output. Use `[r]` for a full re-poll of every configured host.
+
 Press `?` at any time for the full key list, which additionally includes:
 
 | Key | Action |
 | --- | --- |
 | `j` / `k` | Select next / previous row (aliases for `↓` / `↑`) |
-| `r` | Force a refresh (same as `[i]` when a row is selected) |
+| `r` | Re-poll every configured host to refresh the full pane inventory |
 | `s` | Cycle the table sort mode |
 | `c` | Capture selected pane output into the detail view |
 | `e` | Rename the selected session |
