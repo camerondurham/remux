@@ -1,4 +1,13 @@
 #!/usr/bin/env node
+// Generate README assets (PNG screenshot + 4-frame GIF) that match the
+// current remux TUI layout: a single-line top summary, a 4-column live
+// table (NAME / AGE / CMD / PREVIEW) with a glyph + selector prefix, an
+// optional right-side context rail, and a single-line footer.
+//
+// Source of truth: src/tui.rs (`draw_summary`, `draw_live_table`,
+// `draw_context_rail`, `draw_status`). Keep this file in sync with those
+// functions when the TUI layout changes.
+
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,253 +17,74 @@ const scriptDir = dirname(fileURLToPath(import.meta.url));
 const assetDir = scriptDir;
 const workDir = resolve(process.env.REMUX_ASSET_WORKDIR || "/tmp/remux-demo-assets");
 
-const width = 1280;
-const height = 760;
+// ---------------------------------------------------------------------------
+// Canvas + geometry
+// ---------------------------------------------------------------------------
+
+const WIDTH = 1280;
+const HEIGHT = 720;
+
+const FONT_SIZE = 14;
+const FONT_FAMILY = '"SFMono-Regular", "JetBrains Mono", "Menlo", "Consolas", "Liberation Mono", monospace';
+const CHAR_W = FONT_SIZE * 0.6; // empirical avg for monospace 14px
+const LINE_H = 20;
+
+// Reserve 1 line at top for the summary, 1 line at bottom for the footer.
+const SUMMARY_Y = 26; // text baseline
+const FOOTER_Y = 706; // text baseline
+
+// Body region between summary and footer.
+const BODY_TOP = 46;
+const BODY_BOTTOM = 690;
+const BODY_H = BODY_BOTTOM - BODY_TOP;
+
+// 68% / 32% horizontal split (matches Constraint::Percentage(68|32) in tui.rs).
+const PAD_LEFT = 14;
+const PAD_RIGHT = 14;
+const BODY_W = WIDTH - PAD_LEFT - PAD_RIGHT;
+const TABLE_W = Math.floor(BODY_W * 0.68);
+const RAIL_X = PAD_LEFT + TABLE_W; // left edge of context rail (border lives here)
+const RAIL_TEXT_X = RAIL_X + 14; // text inside rail starts past the border
+const RAIL_W = WIDTH - PAD_RIGHT - RAIL_X;
+
+// ---------------------------------------------------------------------------
+// Palette — approximates ratatui's named colors as Apple Terminal / iTerm2
+// would render them on a dark profile. These are chosen for SVG readability,
+// not a cycle-accurate terminal reproduction.
+// ---------------------------------------------------------------------------
 
 const palette = {
   bg: "#0d1117",
-  panel: "#111820",
-  panel2: "#0f151c",
-  border: "#56606c",
-  borderSoft: "#29323c",
   text: "#d7dde5",
-  muted: "#7d8590",
-  dim: "#6e7681",
-  active: "#79d7ff",
-  quiet: "#e3b341",
-  idle: "#8b949e",
-  missing: "#ff6b6b",
-  ambiguous: "#d58cff",
-  shadowed: "#8ab4ff",
-  selectedBg: "#9ee7ff",
-  selectedText: "#081019",
-  dirty: "#f2cc60",
-  match: "#76e4f7",
-  footerBg: "#0a0f14",
+  dim: "#7d8590",       // Color::DarkGray (muted)
+  label: "#c9d1d9",     // Color::Gray bold (context rail labels)
+  header: "#e6edf3",    // bold header row
+
+  // canonical_state() color mapping (matches canonical_state_style in tui.rs)
+  ready: "#7ee787",        // Color::Green
+  stale: "#d0c040",        // Color::Yellow
+  busy: "#ffe066",         // Color::LightYellow
+  drift: "#8ab4ff",        // Color::LightBlue
+  missingBold: "#ff6b6b",  // Color::Red + BOLD
+  ambiguous: "#d58cff",    // Color::Magenta
+  neutral: "#6e7681",      // Color::DarkGray ("-" state)
+
+  // Summary / status line accents
+  cyan: "#79d7ff",         // Color::Cyan (mode label, ◆ watched)
+  white: "#e6edf3",        // Color::White (• free)
+  red: "#ff6b6b",          // Color::Red (!N issues)
+
+  // Selected row (row_highlight_style in draw_live_table)
+  selectedBg: "#9ee7ff",   // Color::LightCyan bg
+  selectedFg: "#081019",   // Color::Black fg (bold)
+
+  // Socket indicator ("i " LightBlue bold, before name, when socket is set)
+  socketBlue: "#8ab4ff",
 };
 
-const hosts = [
-  { id: "local", status: "ok" },
-  { id: "pi", status: "ok" },
-  { id: "lab", status: "ok" },
-  { id: "buildbox", status: "unreachable" },
-];
-
-const rows = [
-  {
-    host: "buildbox",
-    id: "build-runner",
-    target: "buildbox/build:0.0",
-    match: "unreachable",
-    state: "unreachable",
-    last: "-",
-    command: "bash",
-    repo: "remux",
-    dirty: "-",
-    preview: "ssh: connect: no route",
-    session: "build",
-    pane: "0.0",
-    paneId: "-",
-    pid: "-",
-    cwd: "/home/nixos/remux",
-    branch: "-",
-    errors: ["poll: ssh connect failed"],
-  },
-  {
-    host: "pi",
-    id: "missing-debug",
-    target: "pi/debug",
-    match: "missing",
-    state: "missing",
-    last: "-",
-    command: "-",
-    repo: "-",
-    dirty: "-",
-    preview: "watch did not match",
-    session: "debug",
-    pane: "-",
-    paneId: "-",
-    pid: "-",
-    cwd: "-",
-    branch: "-",
-    errors: ["missing: watch did not match a live pane"],
-  },
-  {
-    host: "lab",
-    id: "lab-agent",
-    target: "lab/ai",
-    match: "ambiguous",
-    state: "unknown",
-    last: "-",
-    command: "python",
-    repo: "bots",
-    dirty: "1",
-    preview: "matched 2 live panes",
-    session: "ai",
-    pane: "-",
-    paneId: "-",
-    pid: "-",
-    cwd: "/srv/bots",
-    branch: "main",
-    candidates: ["lab/ai:2.0", "lab/ai:2.1"],
-  },
-  {
-    host: "pi",
-    id: "pi-service",
-    target: "pi/service:0.0",
-    match: "shadowed",
-    state: "active",
-    last: "48s",
-    command: "bash",
-    repo: "service",
-    dirty: "0",
-    preview: "heartbeat ok",
-    session: "service",
-    pane: "0.0",
-    paneId: "%21",
-    pid: "6220",
-    cwd: "/home/cam/service",
-    branch: "main",
-    shadowedBy: "pi-agent",
-    output: ["while true; do curl -sf localhost:8080/health; sleep 5; done", "heartbeat ok"],
-  },
-  {
-    host: "local",
-    id: "local/ops:1.0",
-    target: "local/ops:1.0",
-    match: "orphan",
-    state: "idle",
-    last: "2h",
-    command: "bash",
-    repo: "-",
-    dirty: "-",
-    preview: "deploy shell idle",
-    session: "ops",
-    pane: "1.0",
-    paneId: "%4",
-    pid: "3911",
-    cwd: "/home/nixos",
-    branch: "-",
-    output: ["last deploy succeeded", "waiting for next maintenance window"],
-  },
-  {
-    host: "lab",
-    id: "lab/ai:2.0",
-    target: "lab/ai:2.0",
-    match: "orphan",
-    state: "active",
-    last: "5s",
-    command: "python",
-    repo: "bots",
-    dirty: "1",
-    preview: "running eval job",
-    session: "ai",
-    pane: "2.0",
-    paneId: "%8",
-    pid: "8842",
-    cwd: "/srv/bots",
-    branch: "main",
-    output: ["python run_eval.py --suite smoke", "processed 12 jobs", "running eval job"],
-  },
-  {
-    host: "lab",
-    id: "lab/ai:2.1",
-    target: "lab/ai:2.1",
-    match: "orphan",
-    state: "active",
-    last: "6s",
-    command: "python",
-    repo: "bots",
-    dirty: "1",
-    preview: "collecting traces",
-    session: "ai",
-    pane: "2.1",
-    paneId: "%9",
-    pid: "8843",
-    cwd: "/srv/bots",
-    branch: "main",
-    output: ["tail -f logs/trace.log", "collecting traces"],
-  },
-  {
-    host: "pi",
-    id: "pi-agent",
-    target: "pi/work:0.1",
-    match: "matched",
-    state: "active",
-    last: "38s",
-    command: "node",
-    repo: "openclaw",
-    dirty: "2",
-    preview: "all checks queued",
-    session: "work",
-    pane: "0.1",
-    paneId: "%11",
-    pid: "5101",
-    cwd: "/home/cam/openclaw",
-    branch: "main",
-    changed: [" M src/agent.ts", "?? notes/plan.md"],
-    output: [
-      "npm test",
-      "agent: editing transport adapter",
-      "all checks queued",
-      "Changed files (2)",
-      " M src/agent.ts",
-      "?? notes/plan.md",
-    ],
-  },
-  {
-    host: "local",
-    id: "local-codex",
-    target: "local/agent:0.0",
-    match: "matched",
-    state: "active",
-    last: "12s",
-    command: "codex",
-    repo: "remux",
-    dirty: "1",
-    preview: "updated four-panel dashboard",
-    session: "agent",
-    pane: "0.0",
-    paneId: "%1",
-    pid: "4101",
-    cwd: "/home/nixos/remux",
-    branch: "codex/update-readme-tui-assets",
-    changed: [" M src/tui.rs", " M docs/assets/generate-demo-assets.mjs"],
-    output: [
-      "cargo test --locked --all-targets",
-      "reading src/tui.rs",
-      "updated four-panel dashboard",
-      "regenerating README assets",
-    ],
-  },
-  {
-    host: "local",
-    id: "local-build",
-    target: "local/build:1.0",
-    match: "matched",
-    state: "quiet",
-    last: "4m",
-    command: "cargo",
-    repo: "remux",
-    dirty: "0",
-    preview: "Finished dev profile",
-    session: "build",
-    pane: "1.0",
-    paneId: "%2",
-    pid: "4188",
-    cwd: "/home/nixos/remux",
-    branch: "main",
-    output: ["cargo test --locked", "Finished dev profile"],
-  },
-];
-
-const layout = {
-  kpi: { x: 18, y: 18, w: 1244, h: 96 },
-  topology: { x: 18, y: 128, w: 245, h: 570 },
-  table: { x: 273, y: 128, w: 600, h: 570 },
-  inspector: { x: 883, y: 128, w: 379, h: 570 },
-  footer: { x: 0, y: 710, w: 1280, h: 50 },
-};
+// ---------------------------------------------------------------------------
+// SVG primitives
+// ---------------------------------------------------------------------------
 
 function escapeXml(value) {
   return String(value)
@@ -264,577 +94,570 @@ function escapeXml(value) {
     .replaceAll('"', "&quot;");
 }
 
-function text(x, y, value, options = {}) {
-  return `<text x="${x}" y="${y}" fill="${options.color || palette.text}" font-size="${options.size || 15}" font-weight="${options.weight || 400}" opacity="${options.opacity == null ? 1 : options.opacity}">${escapeXml(value)}</text>`;
+function rect(x, y, w, h, fill, opts = {}) {
+  const rx = opts.rx == null ? 0 : opts.rx;
+  return `<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="${rx}" fill="${fill}"/>`;
 }
 
-function rect(x, y, w, h, options = {}) {
-  return `<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="${options.rx == null ? 0 : options.rx}" fill="${options.fill || "none"}" stroke="${options.stroke || "none"}" stroke-width="${options.sw == null ? 1 : options.sw}"/>`;
+function line(x1, y1, x2, y2, stroke, strokeWidth = 1) {
+  return `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${stroke}" stroke-width="${strokeWidth}"/>`;
 }
 
-function line(x1, y1, x2, y2, color = palette.borderSoft, strokeWidth = 1) {
-  return `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${color}" stroke-width="${strokeWidth}"/>`;
+function tspan(value, { fill, weight } = {}) {
+  const attrs = [];
+  if (fill) attrs.push(`fill="${fill}"`);
+  if (weight) attrs.push(`font-weight="${weight}"`);
+  return `<tspan ${attrs.join(" ")}>${escapeXml(value)}</tspan>`;
 }
 
-function charLimit(widthPx, size = 13) {
-  return Math.max(1, Math.floor(widthPx / (size * 0.62)));
+// Render a run of styled parts at (x, y). Each part is { value, fill?, weight? }.
+function styledText(x, y, parts, { size = FONT_SIZE, defaultFill = palette.text } = {}) {
+  const inner = parts
+    .map((p) => tspan(p.value, { fill: p.fill || defaultFill, weight: p.weight }))
+    .join("");
+  return `<text x="${x}" y="${y}" font-size="${size}" fill="${defaultFill}" xml:space="preserve">${inner}</text>`;
 }
 
-function truncate(value, maxChars) {
-  const string = String(value);
-  if (string.length <= maxChars) {
-    return string;
-  }
-  if (maxChars <= 1) {
-    return string.slice(0, maxChars);
-  }
-  return `${string.slice(0, maxChars - 1)}~`;
+// Plain single-color text.
+function plainText(x, y, value, { fill = palette.text, weight, size = FONT_SIZE } = {}) {
+  const w = weight ? ` font-weight="${weight}"` : "";
+  return `<text x="${x}" y="${y}" font-size="${size}" fill="${fill}"${w} xml:space="preserve">${escapeXml(value)}</text>`;
 }
 
-function rowText(row) {
-  return [
-    row.host,
-    row.id,
-    row.target,
-    row.match,
-    row.state,
-    row.command,
-    row.repo,
-    row.preview,
-    row.cwd,
-    row.branch,
-  ]
-    .join(" ")
-    .toLowerCase();
+function truncate(value, max) {
+  const s = String(value);
+  if (s.length <= max) return s;
+  if (max <= 1) return s.slice(0, max);
+  return `${s.slice(0, max - 1)}…`;
 }
 
-function visibleRows(filter) {
-  const needle = filter.trim().toLowerCase();
-  if (!needle) {
-    return rows;
-  }
-  return rows.filter((row) => rowText(row).includes(needle));
-}
+// ---------------------------------------------------------------------------
+// Mock data
+//
+// The mock deliberately covers several canonical states so the screenshot
+// shows the full color vocabulary: matched/ready, matched/busy (quiet),
+// matched/stale (idle), orphan/ready, orphan/stale, and one unreachable
+// host producing a missing row. Names are generic so this image can live
+// in public docs.
+// ---------------------------------------------------------------------------
 
-function styleForMatch(match) {
-  if (match === "matched") return palette.match;
-  if (match === "missing" || match === "unreachable") return palette.missing;
-  if (match === "ambiguous") return palette.ambiguous;
-  if (match === "shadowed") return palette.shadowed;
-  return palette.text;
-}
+// Host list mirrors `app.host_progress` in tui.rs. An "unreachable" host is
+// still counted as "done" by the real TUI (its poll finished, just with an
+// error), so all four hosts appear in the `N/N hosts` summary even though one
+// will produce a missing row.
+const hosts = [
+  { id: "local", status: "ok" },
+  { id: "pi", status: "ok" },
+  { id: "lab", status: "ok" },
+  { id: "buildbox", status: "unreachable" },
+];
 
-function styleForState(state) {
-  if (state === "active") return palette.active;
-  if (state === "quiet") return palette.quiet;
-  if (state === "idle") return palette.idle;
-  if (state === "missing" || state === "unreachable") return palette.missing;
-  return palette.dim;
-}
-
-function rowFill(row) {
-  if (row.match === "unreachable") return "#1c1014";
-  if (row.match === "missing") return "#1b1018";
-  if (row.match === "ambiguous") return "#171328";
-  if (row.match === "shadowed") return "#111a2a";
-  return "transparent";
-}
-
-function dirtyColor(value) {
-  return value !== "-" && value !== "0" ? palette.dirty : palette.dim;
-}
-
-function summary() {
-  const hostOk = hosts.filter((host) => host.status === "ok").length;
-  const hostTotal = hosts.length;
-  const countState = (state) => rows.filter((row) => row.state === state).length;
-  const countMatch = (match) => rows.filter((row) => row.match === match).length;
-  const errors = rows.filter((row) => row.errors?.length).length;
-  const attention =
-    hosts.filter((host) => host.status === "unreachable").length +
-    countState("missing") +
-    countMatch("ambiguous") +
-    errors;
-  return {
-    hostOk,
-    hostTotal,
-    panes: rows.length,
-    active: countState("active"),
-    quiet: countState("quiet"),
-    idle: countState("idle"),
-    missing: countState("missing"),
-    ambiguous: countMatch("ambiguous"),
-    shadowed: countMatch("shadowed"),
-    errors,
-    attention,
-  };
-}
-
-function drawPanel(area, title, fill = palette.panel) {
-  return (
-    rect(area.x, area.y, area.w, area.h, {
-      fill,
-      stroke: palette.border,
-      rx: 6,
-    }) +
-    text(area.x + 16, area.y + 25, title, {
-      color: palette.muted,
-      size: 15,
-      weight: 700,
-    })
-  );
-}
-
-function richLine(x, y, parts, size = 17) {
-  let cursor = x;
-  let output = "";
-  for (const part of parts) {
-    output += text(cursor, y, part.value, {
-      color: part.color,
-      size,
-      weight: part.weight,
-    });
-    cursor += String(part.value).length * size * 0.62;
-  }
-  return output;
-}
-
-function drawKpi(filter, sortMode) {
-  const box = layout.kpi;
-  const data = summary();
-  let output = drawPanel(box, "kpi", palette.panel);
-  output += richLine(
-    box.x + 16,
-    box.y + 54,
-    [
-      { value: "hosts ", color: palette.muted },
-      { value: `${data.hostOk}/${data.hostTotal} up`, color: data.hostOk === data.hostTotal ? palette.active : palette.missing, weight: 700 },
-      { value: " | panes ", color: palette.muted },
-      { value: data.panes, color: palette.text, weight: 700 },
-      { value: " | active ", color: palette.muted },
-      { value: data.active, color: palette.active, weight: 700 },
-      { value: " | quiet ", color: palette.muted },
-      { value: data.quiet, color: palette.quiet, weight: 700 },
-      { value: " | idle ", color: palette.muted },
-      { value: data.idle, color: palette.idle, weight: 700 },
-      { value: " | missing ", color: palette.muted },
-      { value: data.missing, color: palette.missing, weight: 700 },
-      { value: " | ambiguous ", color: palette.muted },
-      { value: data.ambiguous, color: palette.ambiguous, weight: 700 },
-      { value: " | shadowed ", color: palette.muted },
-      { value: data.shadowed, color: palette.shadowed, weight: 700 },
+// Each row mirrors the fields draw_live_table + draw_context_rail read.
+// Derived values:
+//   - glyph from match ("matched" -> ◆, "orphan" -> •, else !)
+//   - canonical state label + color from state (see canonical_state in tui.rs)
+const rows = [
+  {
+    display: "local/agent:0.0",
+    host: "local",
+    socket: null,
+    match: "matched",
+    state: "ready",
+    age: "5s",
+    cmd: "codex",
+    preview: "regenerating README assets",
+    captured: "5s ago",
+    output: [
+      "cargo test --locked",
+      "reading src/tui.rs",
+      "updated four-panel dashboard",
+      "regenerating README assets",
     ],
-    17,
-  );
-  output += richLine(
-    box.x + 16,
-    box.y + 80,
-    [
-      { value: "attention ", color: palette.muted },
-      { value: data.attention, color: palette.dirty, weight: 700 },
-      { value: " | errors ", color: palette.muted },
-      { value: data.errors, color: palette.missing, weight: 700 },
-      { value: " | sort ", color: palette.muted },
-      { value: sortMode, color: palette.text, weight: 700 },
-      { value: " | filter ", color: palette.muted },
-      { value: filter || "-", color: palette.text, weight: 700 },
+  },
+  {
+    display: "local/build:1.0",
+    host: "local",
+    socket: null,
+    match: "matched",
+    state: "stale",
+    age: "4m",
+    cmd: "cargo",
+    preview: "Finished `dev` profile [unoptimized + debuginfo]",
+    captured: "4m ago",
+    output: [
+      "cargo test --locked --all-targets",
+      "   Compiling remux v0.1.0",
+      "    Finished `dev` profile [unoptimized + debuginfo]",
     ],
-    17,
+  },
+  {
+    display: "local/ops:1.0",
+    host: "local",
+    socket: null,
+    match: "orphan",
+    state: "stale",
+    age: "2h",
+    cmd: "zsh",
+    preview: "waiting for next maintenance window",
+    captured: "2h ago",
+    output: [
+      "last deploy succeeded",
+      "waiting for next maintenance window",
+    ],
+  },
+  {
+    display: "pi/agent:0.1",
+    host: "pi",
+    socket: null,
+    match: "matched",
+    state: "busy",
+    age: "38s",
+    cmd: "node",
+    preview: "agent: editing transport adapter",
+    captured: "38s ago",
+    output: [
+      "npm test",
+      "agent: editing transport adapter",
+      "all checks queued",
+    ],
+  },
+  {
+    display: "pi/debug:0.0",
+    host: "pi",
+    socket: null,
+    match: "orphan",
+    state: "ready",
+    age: "12s",
+    cmd: "bash",
+    preview: "$ journalctl -u remux -f",
+    captured: "12s ago",
+    output: [
+      "$ journalctl -u remux -f",
+      "May 08 09:15:41 pi remux[8842]: polled 3/3 hosts",
+    ],
+  },
+  {
+    display: "pi/ops:0.0",
+    host: "pi",
+    socket: "~/.work-os/tmux.sock",
+    match: "matched",
+    state: "ready",
+    age: "1m",
+    cmd: "bash",
+    preview: "serving 200 req/s",
+    captured: "1m ago",
+    output: [
+      "while true; do curl -sf localhost:8080/health; sleep 5; done",
+      "serving 200 req/s",
+    ],
+  },
+  {
+    display: "lab/ai:2.0",
+    host: "lab",
+    socket: null,
+    match: "orphan",
+    state: "busy",
+    age: "6s",
+    cmd: "python",
+    preview: "processed 12 jobs",
+    captured: "6s ago",
+    output: [
+      "python run_eval.py --suite smoke",
+      "processed 12 jobs",
+      "collecting traces",
+    ],
+  },
+  {
+    display: "lab/ai:2.1",
+    host: "lab",
+    socket: null,
+    match: "orphan",
+    state: "ready",
+    age: "3s",
+    cmd: "python",
+    preview: "tail -f logs/trace.log",
+    captured: "3s ago",
+    output: [
+      "tail -f logs/trace.log",
+      "collecting traces",
+    ],
+  },
+  {
+    display: "buildbox/build:0.0",
+    host: "buildbox",
+    socket: null,
+    match: "missing",
+    state: "missing",
+    age: "-",
+    cmd: "-",
+    preview: "ssh: connect: no route to host",
+    captured: null,
+    output: null,
+  },
+];
+
+// ---------------------------------------------------------------------------
+// Derived helpers
+// ---------------------------------------------------------------------------
+
+function rowGlyph(row) {
+  if (row.match === "matched") return "◆";
+  if (row.match === "orphan") return "•";
+  return "!";
+}
+
+function stateColor(state) {
+  switch (state) {
+    case "ready": return palette.ready;
+    case "stale": return palette.stale;
+    case "busy": return palette.busy;
+    case "drift": return palette.drift;
+    case "ambiguous": return palette.ambiguous;
+    case "missing": return palette.missingBold;
+    default: return palette.neutral;
+  }
+}
+
+function rowStateWeight(state) {
+  return state === "missing" ? "700" : undefined;
+}
+
+function filterRows(filter) {
+  const needle = (filter || "").trim().toLowerCase();
+  if (!needle) return rows;
+  return rows.filter((row) =>
+    [row.display, row.host, row.cmd, row.preview].join(" ").toLowerCase().includes(needle),
   );
-  return output;
 }
 
-function drawTopology(tableRows, selectedId) {
-  const box = layout.topology;
-  let output = drawPanel(box, "topology", palette.panel2);
-  const byHost = new Map();
-  for (const row of tableRows) {
-    if (!byHost.has(row.host)) byHost.set(row.host, []);
-    byHost.get(row.host).push(row);
-  }
+// ---------------------------------------------------------------------------
+// Drawing functions
+// ---------------------------------------------------------------------------
 
-  let y = box.y + 54;
-  for (const host of hosts) {
-    const hostRows = byHost.get(host.id) || [];
-    if (hostRows.length === 0) continue;
-    output += text(box.x + 14, y, "> ", { color: palette.muted, size: 13 });
-    output += text(box.x + 34, y, host.id, { color: palette.text, size: 13, weight: 700 });
-    output += text(box.x + 34 + host.id.length * 8.1, y, ` (${host.status})`, {
-      color: host.status === "ok" ? palette.active : palette.missing,
-      size: 13,
-    });
-    y += 22;
-
-    const sessions = new Map();
-    for (const row of hostRows) {
-      if (!sessions.has(row.session)) sessions.set(row.session, []);
-      sessions.get(row.session).push(row);
-    }
-    for (const [session, sessionRows] of sessions) {
-      output += text(box.x + 32, y, `> session ${truncate(session, 18)}`, {
-        color: palette.text,
-        size: 13,
-      });
-      y += 20;
-      for (const row of sessionRows) {
-        const marker = row.id === selectedId ? ">" : " ";
-        output += text(box.x + 47, y, marker, {
-          color: row.id === selectedId ? palette.active : palette.muted,
-          size: 13,
-          weight: 700,
-        });
-        output += text(box.x + 62, y, truncate(row.pane, 5), {
-          color: palette.muted,
-          size: 13,
-        });
-        output += text(box.x + 104, y, truncate(row.command, 8), {
-          color: palette.text,
-          size: 13,
-        });
-        output += text(box.x + 172, y, truncate(row.state, 10), {
-          color: styleForState(row.state),
-          size: 13,
-          weight: 700,
-        });
-        y += 19;
-        if (y > box.y + box.h - 16) return output;
-      }
-    }
-  }
-  return output;
+function drawBackground() {
+  return rect(0, 0, WIDTH, HEIGHT, palette.bg);
 }
 
-function drawTable(tableRows, selectedId) {
-  const box = layout.table;
-  const cols = [
-    { key: "id", label: "ID", x: 14, w: 90 },
-    { key: "target", label: "TARGET", x: 104, w: 116 },
-    { key: "match", label: "MATCH", x: 220, w: 70 },
-    { key: "state", label: "STATE", x: 290, w: 52 },
-    { key: "last", label: "LAST", x: 342, w: 38 },
-    { key: "command", label: "CMD", x: 381, w: 49 },
-    { key: "repo", label: "REPO", x: 430, w: 50 },
-    { key: "dirty", label: "DIRTY", x: 480, w: 44 },
-    { key: "preview", label: "PREVIEW", x: 526, w: 64 },
+// `remux | / <filter> | N panes  •F free  ◆W watched  [!P issues] | N/N hosts Xs | <mode>`
+function drawSummary({ rows: currentRows, filter, mode, elapsed }) {
+  const watched = currentRows.filter((r) => r.match === "matched").length;
+  const free = currentRows.filter((r) => r.match === "orphan").length;
+  const issues = currentRows.filter(
+    (r) => !["matched", "orphan"].includes(r.match),
+  ).length;
+  const hostsUp = hosts.filter((h) => h.status === "ok").length;
+  const hostsTotal = hosts.length;
+
+  const parts = [
+    { value: "remux", weight: "700" },
+    { value: " | " },
+    { value: `/ ${filter || "-"}` },
+    { value: " | " },
+    { value: `${currentRows.length} panes  ` },
+    { value: `•${free} free`, fill: palette.white },
+    { value: "  " },
+    { value: `◆${watched} watched`, fill: palette.cyan },
   ];
-  let output = drawPanel(box, "live table", palette.panel);
-  output += line(box.x + 10, box.y + 44, box.x + box.w - 10, box.y + 44);
-  for (const col of cols) {
-    output += text(box.x + col.x, box.y + 41, col.label, {
-      color: palette.text,
-      size: 12,
-      weight: 700,
-    });
+  if (issues > 0) {
+    parts.push({ value: "  " });
+    parts.push({ value: `!${issues} issues`, fill: palette.red });
   }
+  parts.push({ value: ` | ${hostsUp}/${hostsTotal} hosts ${elapsed}` });
+  parts.push({ value: " | " });
+  parts.push({ value: mode, fill: palette.cyan });
 
-  tableRows.slice(0, 18).forEach((row, index) => {
-    const rowY = box.y + 66 + index * 25;
-    const selected = row.id === selectedId;
-    const fill = selected ? palette.selectedBg : rowFill(row);
-    if (fill !== "transparent") {
-      output += rect(box.x + 8, rowY - 17, box.w - 16, 22, {
-        fill,
-        rx: 3,
-      });
-    }
-    const base = selected ? palette.selectedText : palette.text;
-    for (const col of cols) {
-      const value = row[col.key];
-      const color = selected
-        ? palette.selectedText
-        : col.key === "match"
-          ? styleForMatch(row.match)
-          : col.key === "state"
-            ? styleForState(row.state)
-            : col.key === "dirty"
-              ? dirtyColor(row.dirty)
-              : col.key === "preview"
-                ? palette.muted
-                : base;
-      const weight =
-        selected ||
-        col.key === "match" ||
-        col.key === "state" ||
-        (col.key === "dirty" && row.dirty !== "-" && row.dirty !== "0")
-          ? 700
-          : 400;
-      output += text(
-        box.x + col.x,
-        rowY,
-        truncate(value, charLimit(col.w, 12)),
-        { color, size: 12, weight },
+  return styledText(PAD_LEFT, SUMMARY_Y, parts);
+}
+
+// Table header row + body rows. Uses fixed column X offsets, not SVG columns.
+function drawTable({ rows: currentRows, selectedIndex }) {
+  // Column X offsets within the table pane (relative to PAD_LEFT).
+  const col = {
+    name: PAD_LEFT,
+    age: PAD_LEFT + Math.floor(TABLE_W * 0.55),
+    cmd: PAD_LEFT + Math.floor(TABLE_W * 0.62),
+    preview: PAD_LEFT + Math.floor(TABLE_W * 0.74),
+  };
+
+  const nameCharMax = Math.floor((col.age - col.name - 4) / CHAR_W);
+  const cmdCharMax = Math.floor((col.preview - col.cmd - 4) / CHAR_W) - 1;
+  const previewCharMax = Math.floor((PAD_LEFT + TABLE_W - col.preview) / CHAR_W) - 1;
+
+  // Header
+  const headerY = BODY_TOP + LINE_H;
+  let svg = "";
+  svg += plainText(col.name, headerY, "NAME", { fill: palette.header, weight: "700" });
+  svg += plainText(col.age, headerY, "AGE", { fill: palette.header, weight: "700" });
+  svg += plainText(col.cmd, headerY, "CMD", { fill: palette.header, weight: "700" });
+  svg += plainText(col.preview, headerY, "PREVIEW", {
+    fill: palette.header,
+    weight: "700",
+  });
+
+  // Rows
+  const rowStartY = headerY + LINE_H;
+  currentRows.forEach((row, i) => {
+    const y = rowStartY + i * LINE_H;
+    const selected = i === selectedIndex;
+
+    if (selected) {
+      // full-width highlight covers NAME through PREVIEW
+      svg += rect(
+        col.name - 4,
+        y - LINE_H + 4,
+        TABLE_W,
+        LINE_H,
+        palette.selectedBg,
       );
     }
-  });
-  return output;
-}
 
-function selectedRow(selectedId) {
-  return rows.find((row) => row.id === selectedId) || rows[0];
-}
+    const glyph = rowGlyph(row);
+    const selector = selected ? "› " : "  ";
+    const stateFill = selected ? palette.selectedFg : stateColor(row.state);
+    const nameFill = selected ? palette.selectedFg : stateColor(row.state);
+    const weight = selected ? "700" : rowStateWeight(row.state);
 
-function drawInspector(selectedId, options = {}) {
-  const box = layout.inspector;
-  const row = selectedRow(selectedId);
-  let output = drawPanel(box, options.help ? "keys" : "inspector", palette.panel2);
-  if (options.help) {
-    const help = [
-      "j/down select next",
-      "up select previous",
-      "r refresh now",
-      "s cycle table sort",
-      "/ filter",
-      "enter readonly attach",
-      "a read-write jump",
-      "c capture into detail",
-      "i inspect and refresh detail",
-      "k kill selected pane",
-      "e rename selected session",
-      "n create session",
-      "p spawn pane",
-      "q quit",
+    const nameParts = [
+      { value: `${selector}${glyph} `, fill: stateFill, weight },
     ];
-    help.forEach((lineText, index) => {
-      output += text(box.x + 16, box.y + 56 + index * 22, lineText, {
-        color: palette.text,
-        size: 13,
+    if (row.socket) {
+      nameParts.push({
+        value: "i ",
+        fill: selected ? palette.selectedFg : palette.socketBlue,
+        weight: "700",
       });
+    }
+    nameParts.push({
+      value: truncate(row.display, nameCharMax - (row.socket ? 2 : 0)),
+      fill: nameFill,
+      weight,
     });
-    return output;
-  }
+    svg += styledText(col.name, y, nameParts);
 
-  const split = box.x + 166;
-  output += line(split, box.y + 45, split, box.y + box.h - 18);
-  let y = box.y + 56;
-  const leftX = box.x + 16;
-  const rightX = split + 14;
-  output += text(leftX, y, truncate(row.id, 16), {
-    color: palette.active,
-    size: 13,
-    weight: 700,
+    svg += plainText(col.age, y, row.age, {
+      fill: selected ? palette.selectedFg : palette.text,
+      weight: selected ? "700" : undefined,
+    });
+    svg += plainText(col.cmd, y, truncate(row.cmd, cmdCharMax), {
+      fill: selected ? palette.selectedFg : palette.text,
+      weight: selected ? "700" : undefined,
+    });
+    svg += plainText(col.preview, y, truncate(row.preview, previewCharMax), {
+      fill: selected ? palette.selectedFg : palette.dim,
+      weight: selected ? "700" : undefined,
+    });
   });
-  y += 22;
+
+  return svg;
+}
+
+// The right-hand rail shown in wide terminals. Mirrors draw_context_rail.
+function drawContextRail({ rows: currentRows, selectedIndex }) {
+  let svg = "";
+  // Left border (Borders::LEFT on the rail block)
+  svg += line(RAIL_X, BODY_TOP, RAIL_X, BODY_BOTTOM, palette.dim, 1);
+
+  // Title "context"
+  const titleY = BODY_TOP + LINE_H;
+  svg += plainText(RAIL_TEXT_X, titleY, "context", {
+    fill: palette.label,
+    weight: "700",
+  });
+
+  const row = currentRows[selectedIndex] || currentRows[0];
+  if (!row) return svg;
+
+  // Labels + values block
+  const textMaxChars = Math.floor((RAIL_W - 14 - 8) / CHAR_W);
   const metaLines = [
-    `activity ${row.state}`,
-    `match ${row.match}`,
-    `watch ${row.match === "orphan" ? "-" : row.id}`,
-    `target ${row.target}`,
-    `tmux ${row.session}:${row.pane}`,
-    `pane id ${row.paneId}`,
-    `pid ${row.pid}`,
-    "",
-    `command ${row.command}`,
-    `cwd ${row.cwd}`,
-    `repo ${row.repo}`,
-    `branch ${row.branch}`,
-    `dirty ${row.dirty}`,
-    "",
-    row.match === "matched" || row.match === "orphan"
-      ? `attach enter | a -> ${row.target}`
-      : `attach unavailable, ${row.match}`,
-    row.match === "matched" || row.match === "orphan"
-      ? `capture c -> ${row.id}`
-      : `capture unavailable, ${row.match}`,
-  ];
-  for (const lineText of metaLines) {
-    if (lineText === "") {
-      y += 12;
-      continue;
-    }
-    output += text(leftX, y, truncate(lineText, 18), {
-      color:
-        lineText.includes(row.state)
-          ? styleForState(row.state)
-          : lineText.includes(row.match)
-            ? styleForMatch(row.match)
-            : palette.text,
-      size: 12,
-      weight: lineText.startsWith("activity") || lineText.startsWith("match") ? 700 : 400,
-    });
-    y += 18;
-    if (y > box.y + box.h - 20) break;
-  }
-
-  y = box.y + 56;
-  const statusLines = [];
-  if (row.changed?.length) {
-    statusLines.push(`Changed files (${row.changed.length})`, ...row.changed);
-  }
-  if (row.errors?.length) {
-    if (statusLines.length) statusLines.push("");
-    statusLines.push("Errors", ...row.errors);
-  }
-  if (row.candidates?.length) {
-    if (statusLines.length) statusLines.push("");
-    statusLines.push("Candidates", ...row.candidates);
-  }
-  if (row.shadowedBy) {
-    if (statusLines.length) statusLines.push("");
-    statusLines.push(`Shadowed by: ${row.shadowedBy}`);
-  }
-  for (const status of statusLines.slice(0, 9)) {
-    if (status === "") {
-      y += 10;
-      continue;
-    }
-    output += text(rightX, y, truncate(status, 25), {
-      color:
-        status === "Errors"
-          ? palette.missing
-          : status === "Candidates" || status.startsWith("Shadowed")
-            ? palette.dirty
-            : palette.text,
-      size: 12,
-      weight: status.includes("(") || status === "Errors" || status === "Candidates" ? 700 : 400,
-    });
-    y += 18;
-  }
-
-  y += statusLines.length ? 14 : 0;
-  output += text(rightX, y, "Recent output preview", {
-    color: palette.text,
-    size: 13,
-    weight: 700,
-  });
-  y += 22;
-  const outputLines = row.output?.length
-    ? row.output
-    : ["No recent output in cache.", "Capture or inspect this row."];
-  for (const value of outputLines.slice(-8)) {
-    output += text(rightX, y, truncate(value, 25), {
-      color: palette.text,
-      size: 12,
-      weight: value.startsWith("Changed files") ? 700 : 400,
-    });
-    y += 18;
-    if (y > box.y + box.h - 18) break;
-  }
-  return output;
-}
-
-function drawFooter(status, filter = "-", prompt = null) {
-  const box = layout.footer;
-  let output = rect(box.x, box.y, box.w, box.h, { fill: palette.footerBg });
-  if (prompt) {
-    output += text(28, 739, prompt.label, {
-      color: palette.dirty,
-      size: 15,
-      weight: 700,
-    });
-    output += text(142, 739, prompt.value, {
-      color: palette.text,
-      size: 15,
-    });
-    output += text(142 + prompt.value.length * 9.3, 739, " _", {
-      color: palette.active,
-      size: 15,
-      weight: 700,
-    });
-    output += text(382, 739, `| ${prompt.hint}`, {
-      color: palette.muted,
-      size: 15,
-    });
-    return output;
-  }
-
-  const keys = [
-    ["enter", " readonly | "],
-    ["a", " jump | "],
-    ["r", " refresh | "],
-    ["s", " sort | "],
-    ["/", " filter | "],
-    ["c", " capture | "],
-    ["i", " inspect | "],
-    ["k", " kill | "],
-    ["e", " rename | "],
-    ["n", " new | "],
-    ["p", " pane | "],
-    ["q", " quit"],
+    { label: "target", value: row.display },
+    { label: "host", value: row.host },
+    { label: "socket", value: row.socket || "default" },
+    { label: "state", value: row.state, valueFill: stateColor(row.state) },
+    { label: "cmd", value: row.cmd },
   ];
 
-  let x = 24;
-  for (const [key, label] of keys) {
-    output += text(x, 731, key, {
-      color: palette.active,
-      size: 12,
-      weight: 700,
-    });
-    const visibleLabel = label.trimStart();
-    x += key.length * 7.4 + 5;
-    output += text(x, 731, visibleLabel, { color: palette.text, size: 12 });
-    x += visibleLabel.length * 6.8 + 5;
+  let y = titleY + LINE_H;
+  for (const meta of metaLines) {
+    const labelText = `${meta.label} `;
+    const valueText = truncate(meta.value, textMaxChars - labelText.length);
+    svg += styledText(RAIL_TEXT_X, y, [
+      { value: labelText, fill: palette.label, weight: "700" },
+      { value: valueText, fill: meta.valueFill || palette.text },
+    ]);
+    y += LINE_H;
   }
-  output += text(24, 753, status, { color: palette.text, size: 12 });
-  output += text(1115, 753, `filter: ${filter || "-"}`, {
-    color: palette.text,
-    size: 12,
-  });
-  return output;
+
+  // Blank line between meta and capture age
+  y += LINE_H / 2;
+
+  if (row.captured) {
+    svg += plainText(RAIL_TEXT_X, y, `captured ${row.captured}`, {
+      fill: palette.dim,
+    });
+    y += LINE_H;
+
+    if (row.output) {
+      for (const outLine of row.output) {
+        svg += plainText(RAIL_TEXT_X, y, truncate(outLine, textMaxChars), {
+          fill: palette.text,
+        });
+        y += LINE_H;
+      }
+    }
+  } else {
+    svg += plainText(RAIL_TEXT_X, y, "no capture yet — press [i] to fetch", {
+      fill: palette.dim,
+    });
+    y += LINE_H;
+  }
+
+  // Hotkey hint pinned near bottom of rail.
+  const hintY = BODY_BOTTOM - 8;
+  svg += plainText(
+    RAIL_TEXT_X,
+    hintY,
+    "[i] refresh · [Enter] attach ro · [a] jump rw · [c] copy",
+    { fill: palette.dim, size: 13 },
+  );
+
+  return svg;
 }
 
-function renderSvg({
-  selectedId,
+// Full-body inspector content rendered when `?` help overlay is active.
+function drawHelp() {
+  let svg = "";
+  svg += plainText(PAD_LEFT, BODY_TOP + LINE_H, "keys", {
+    fill: palette.label,
+    weight: "700",
+  });
+  const lines = [
+    "[j/↓] select next",
+    "[k/↑] select previous",
+    "[r] refresh now",
+    "[s] cycle table sort",
+    "[/] filter",
+    "[Enter] readonly attach",
+    "[a] read-write jump",
+    "[c] capture into detail",
+    "[i] inspect and refresh detail",
+    "[x] kill selected pane",
+    "[e] rename selected session",
+    "[n] create session (<host>/<session>)",
+    "[p] spawn pane (<host>/<session>)",
+    "[d] toggle detail pane",
+    "[?] toggle this help",
+    "[q] quit",
+  ];
+  let y = BODY_TOP + LINE_H * 3;
+  for (const text of lines) {
+    svg += plainText(PAD_LEFT, y, text, { fill: palette.text });
+    y += LINE_H;
+  }
+  return svg;
+}
+
+// Bottom line: key hints + mode + short status.
+function drawFooter({ mode, status, editingFilter }) {
+  const keysText =
+    "[↑↓] move  [Enter] attach ro  [a] jump rw  [i] refresh  [/] filter  [d] details  [?] help  [x] kill  [q] quit   ";
+  const parts = [
+    { value: keysText, fill: palette.text },
+    { value: mode, fill: palette.cyan },
+    { value: "  " },
+    { value: status, fill: palette.dim },
+  ];
+  if (editingFilter) {
+    parts.push({ value: " _", fill: palette.selectedBg });
+  }
+  return styledText(PAD_LEFT, FOOTER_Y, parts);
+}
+
+// ---------------------------------------------------------------------------
+// Frame composition
+// ---------------------------------------------------------------------------
+
+function renderFrame({
   filter = "",
-  sortMode = "attention",
-  status = "ready | scan complete: 3/4 hosts | elapsed 287ms",
+  selectedIndex = 0,
+  summaryMode = "browse",
+  footerMode = "ready",
+  status = "scan complete: 3/3 hosts | polled in 0.4s · 2s ago",
+  elapsed = "polled in 0.4s · 2s ago",
   help = false,
-  prompt = null,
+  editingFilter = false,
 }) {
-  const tableRows = visibleRows(filter);
+  const currentRows = filterRows(filter);
+  const clampedSel = Math.min(Math.max(selectedIndex, 0), Math.max(currentRows.length - 1, 0));
+
+  let body = "";
+  if (help) {
+    body = drawHelp();
+  } else {
+    body = drawTable({ rows: currentRows, selectedIndex: clampedSel }) +
+      drawContextRail({ rows: currentRows, selectedIndex: clampedSel });
+  }
+
   return `<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
-  <style>text { font-family: "SFMono-Regular", "Cascadia Mono", "Menlo", "Consolas", "Liberation Mono", monospace; }</style>
-  ${rect(0, 0, width, height, { fill: palette.bg })}
-  ${drawKpi(filter, sortMode)}
-  ${drawTopology(tableRows, selectedId)}
-  ${drawTable(tableRows, selectedId)}
-  ${drawInspector(selectedId, { help })}
-  ${drawFooter(status, filter, prompt)}
+<svg xmlns="http://www.w3.org/2000/svg" width="${WIDTH}" height="${HEIGHT}" viewBox="0 0 ${WIDTH} ${HEIGHT}">
+  <style>text { font-family: ${FONT_FAMILY}; font-variant-ligatures: none; }</style>
+  ${drawBackground()}
+  ${drawSummary({ rows: currentRows, filter, mode: summaryMode, elapsed })}
+  ${body}
+  ${drawFooter({ mode: footerMode, status, editingFilter })}
 </svg>`;
 }
+
+// ---------------------------------------------------------------------------
+// Asset pipeline
+// ---------------------------------------------------------------------------
 
 async function writeSources() {
   await mkdir(workDir, { recursive: true });
 
-  const screenshot = renderSvg({
-    selectedId: "pi-agent",
+  // Still-frame screenshot: default browse view with a matched row selected.
+  const screenshot = renderFrame({
+    selectedIndex: 0, // local/agent:0.0
+    // summaryMode/footerMode/status use defaults that match real TUI output.
   });
   await writeFile(join(workDir, "remux-tui.svg"), screenshot);
 
+  // GIF story (four frames):
+  //   0: default browse, first row selected
+  //   1: filter entry — `/` pressed and "pi" typed, cursor visible
+  //   2: filter committed, cursor moved to a different pi row
+  //   3: `?` help overlay replaces the body
   const frames = [
     screenshot,
-    renderSvg({
-      selectedId: "pi-agent",
+    renderFrame({
       filter: "pi",
-      status: "filter | 3 rows match pi",
+      selectedIndex: 0,
+      summaryMode: "filter",
+      footerMode: "filter",
+      status: "3 rows match pi",
+      editingFilter: true,
     }),
-    renderSvg({
-      selectedId: "pi-service",
+    renderFrame({
       filter: "pi",
-      sortMode: "state",
-      status: "ready | sort: state",
+      selectedIndex: 2, // inside filtered set -> pi/ops:0.0
+      status: "selected pi/ops:0.0",
     }),
-    renderSvg({
-      selectedId: "pi-agent",
-      filter: "pi",
-      status: "ready | new session",
-      prompt: {
-        label: "new session",
-        value: "pi/scratch",
-        hint: "enter <host>/<session> (Esc to cancel)",
-      },
+    renderFrame({
+      status: "help",
+      help: true,
     }),
   ];
 
   for (const [index, frame] of frames.entries()) {
-    await writeFile(join(workDir, `frame-${String(index).padStart(2, "0")}.svg`), frame);
+    await writeFile(
+      join(workDir, `frame-${String(index).padStart(2, "0")}.svg`),
+      frame,
+    );
   }
 }
 
 function runMagick(args) {
-  const result = spawnSync("magick", args, {
-    stdio: "inherit",
-  });
+  const result = spawnSync("magick", args, { stdio: "inherit" });
   if (result.error) {
     throw new Error(`failed to run magick: ${result.error.message}`);
   }
@@ -857,9 +680,10 @@ async function main() {
     "png:exclude-chunk=time",
     join(assetDir, "remux-tui.png"),
   ]);
+
   runMagick([
     "-delay",
-    "110",
+    "140",
     "-loop",
     "0",
     join(workDir, "frame-00.svg"),

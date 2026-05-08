@@ -8,9 +8,9 @@ It is for engineers who keep coding agents, shells, builds, bots, and debug sess
 
 It does not summarize, score, orchestrate, spawn agents, install a daemon, or sync to the cloud.
 
-![remux TUI showing local and SSH tmux sessions](docs/assets/remux-tui.png)
+![remux TUI: single-line summary, live pane table (NAME/AGE/CMD/PREVIEW) with colored state glyphs, and a right-hand context rail showing the selected pane](docs/assets/remux-tui.png)
 
-![remux TUI demo filtering, inspecting, sorting, and prompting for sessions](docs/assets/remux-tui-demo.gif)
+![remux TUI demo: default browse view, filter entry, selection moving, and the help overlay](docs/assets/remux-tui-demo.gif)
 
 ## Why
 
@@ -202,6 +202,18 @@ Watch match state:
 
 State aging is based on captured output hashes cached at `~/.local/share/remux/cache.json`.
 
+The TUI collapses activity + match status into a smaller canonical vocabulary shown in the name column color and the context rail `state` field:
+
+| TUI state | Derived from |
+| --- | --- |
+| `ready` | `active` |
+| `busy` | `quiet` |
+| `stale` | `idle` |
+| `drift` | `shadowed` (watch's pane identity moved) |
+| `missing` | `missing` or `unreachable` |
+| `ambiguous` | `ambiguous` |
+| `-` | `unknown` with no other signal |
+
 ## Known Limitations
 
 - Alpha-quality TUI.
@@ -250,14 +262,32 @@ Verify with `ssh -G <hostname> | grep -iE '^control(master|path|persist) '` — 
 
 ## TUI Keys
 
+The footer shows the primary navigation and action keys:
+
 ```text
-enter readonly attach | a read-write jump | r refresh | s sort | / filter | c capture | i inspect | k kill | e rename | n new session | p new pane | ? help | q quit
+[↑↓] move  [Enter] attach ro  [a] jump rw  [i] refresh  [/] filter  [d] details  [?] help  [x] kill  [q] quit
 ```
+
+Press `?` at any time for the full key list, which additionally includes:
+
+| Key | Action |
+| --- | --- |
+| `j` / `k` | Select next / previous row (aliases for `↓` / `↑`) |
+| `r` | Force a refresh (same as `[i]` when a row is selected) |
+| `s` | Cycle the table sort mode |
+| `c` | Capture selected pane output into the detail view |
+| `e` | Rename the selected session |
+| `n` | Create a new tmux session on a host (`<host>/<session>`) |
+| `p` | Spawn a new pane in an existing session |
+| `d` | Toggle the right-hand context rail / detail pane |
+| `Esc` | Close the current overlay (help, inspect, filter, or prompt) |
+
+The top summary line shows, left to right: `remux | / <filter> | N panes  •N free  ◆N watched  [!N issues] | N/N hosts polled in <last> · <age> ago | <mode>`. `free` is orphan panes (live but not watched), `watched` is matched watches, `issues` counts rows that need attention (missing, unreachable, ambiguous, shadowed). `mode` is one of `browse`, `filter`, or `inspect`.
 
 Passive discovery commands stay read-only: `hosts`, `list`, `snapshot`,
 `inspect`, `capture`, and TUI polling do not enter a remote session. Read-write
 attach only happens from intentional CLI attach/jump actions or the TUI `a`
-key. Kill only happens from `remux kill` or a confirmed TUI `k` prompt.
+key. Kill only happens from `remux kill` or a confirmed TUI `x` prompt.
 
 ## Development
 

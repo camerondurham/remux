@@ -28,4 +28,4 @@ The script writes temporary SVG sources to `/tmp/remux-demo-assets` by default, 
 REMUX_ASSET_WORKDIR=/tmp/remux-assets node docs/assets/generate-demo-assets.mjs
 ```
 
-The mock data intentionally shows local and SSH hosts, the KPI header, topology tree, live table, inspector detail, attention states, sort/filter state, repo dirty counts, output previews, attach/capture hints, and lifecycle prompts. Update the data in `generate-demo-assets.mjs` when the README needs a new public demo story or when the TUI layout changes enough that the current assets are misleading.
+The mock data covers local and SSH hosts, the single-line summary bar (pane counts, free/watched/issues, host poll status), the four-column live table with colored state glyphs, and the right-hand context rail (target/host/socket/state/cmd + captured output preview + hotkey hints). Update the data in `generate-demo-assets.mjs` when the README needs a new public demo story or when the TUI layout drifts from `src/tui.rs` (`draw_summary`, `draw_live_table`, `draw_context_rail`, `draw_status`) enough that the current assets are misleading.
