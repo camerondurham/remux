@@ -29,11 +29,6 @@ jobs:
             target: aarch64-unknown-linux-gnu
             archive_suffix: aarch64-linux
             binary_name: remux
-          - name: macos-x86_64
-            runner: macos-13
-            target: x86_64-apple-darwin
-            archive_suffix: x86_64-macos
-            binary_name: remux
           - name: macos-aarch64
             runner: macos-14
             target: aarch64-apple-darwin
