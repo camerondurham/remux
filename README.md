@@ -122,6 +122,17 @@ Default config path: `~/.config/remux/config.yaml`.
 
 Legacy `sessions` entries are still accepted as exact tmux-coordinate watches.
 
+## Releases
+
+Tagged `v*` pushes publish prebuilt archives to GitHub Releases for:
+
+- Linux x86_64
+- Linux aarch64
+- macOS x86_64
+- macOS aarch64
+
+Each release includes per-archive SHA-256 files plus a combined `SHA256SUMS` manifest.
+
 ## Commands
 
 ```bash
