@@ -118,6 +118,12 @@ pub struct TmuxSnapshot {
     pub pane: Option<String>,
     pub pane_id: Option<String>,
     pub session_attached: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_short: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -689,6 +695,9 @@ fn snapshot_for_pane(
             pane: Some(pane.pane.clone()),
             pane_id: Some(pane.pane_id.clone()),
             session_attached: Some(pane.session_attached),
+            window_name: pane.window_name.clone(),
+            pane_title: pane.pane_title.clone(),
+            host_short: pane.host_short.clone(),
         },
         process: Some(ProcessSnapshot {
             pid: pane.pid,
@@ -771,6 +780,9 @@ fn watch_without_pane_snapshot(
                 .and_then(|tmux| tmux.pane.map(|pane| pane.to_string())),
             pane_id: None,
             session_attached: None,
+            window_name: None,
+            pane_title: None,
+            host_short: None,
         },
         process: None,
         repo: None,
@@ -1073,6 +1085,9 @@ mod tests {
             command: command.to_string(),
             cwd: cwd.to_string(),
             session_attached: false,
+            window_name: None,
+            pane_title: None,
+            host_short: None,
         }
     }
 

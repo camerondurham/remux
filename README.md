@@ -8,7 +8,7 @@ It is for engineers who keep coding agents, shells, builds, bots, and debug sess
 
 It does not summarize, score, orchestrate, spawn agents, install a daemon, or sync to the cloud.
 
-![remux TUI: single-line summary, live pane table (NAME/AGE/CMD/PREVIEW) with colored state glyphs, and a right-hand context rail showing the selected pane](docs/assets/remux-tui.png)
+![remux TUI: single-line summary, live pane table (NAME/AGE/CMD/PREVIEW) with colored state glyphs and dim window-name/pane-title chips next to each id, plus a right-hand context rail showing the selected pane](docs/assets/remux-tui.png)
 
 ![remux TUI demo: default browse view, filter entry, selection moving, and the help overlay](docs/assets/remux-tui-demo.gif)
 

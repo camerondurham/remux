@@ -4,7 +4,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt;
 
-pub const INVENTORY_FORMAT: &str = "'#S\t#I\t#P\t#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}\t#{session_attached}'";
+pub const INVENTORY_FORMAT: &str = "'#S\t#I\t#P\t#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}\t#{session_attached}\t#W\t#{pane_title}\t#{host_short}'";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PaneTarget {
@@ -27,6 +27,9 @@ pub struct Pane {
     pub command: String,
     pub cwd: String,
     pub session_attached: bool,
+    pub window_name: Option<String>,
+    pub pane_title: Option<String>,
+    pub host_short: Option<String>,
 }
 
 impl PaneTarget {
@@ -76,9 +79,11 @@ pub fn parse_inventory(host: &str, output: &str) -> Result<Vec<Pane>> {
             continue;
         }
         let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() != 8 {
+        // Accept legacy 8-field rows (no window/pane title metadata) for
+        // backwards-compat, plus the current 11-field layout.
+        if fields.len() != 8 && fields.len() != 11 {
             bail!(
-                "failed to parse tmux inventory line {} for host `{}`: expected 8 tab-separated fields, got {}",
+                "failed to parse tmux inventory line {} for host `{}`: expected 8 or 11 tab-separated fields, got {}",
                 index + 1,
                 host,
                 fields.len()
@@ -88,6 +93,18 @@ pub fn parse_inventory(host: &str, output: &str) -> Result<Vec<Pane>> {
         let window = fields[1].to_string();
         let pane = fields[2].to_string();
         let target = format!("{host}/{session}:{window}.{pane}");
+        let window_name = fields
+            .get(8)
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty());
+        let pane_title = fields
+            .get(9)
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty());
+        let host_short = fields
+            .get(10)
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty());
         panes.push(Pane {
             target,
             host: host.to_string(),
@@ -99,6 +116,9 @@ pub fn parse_inventory(host: &str, output: &str) -> Result<Vec<Pane>> {
             command: fields[5].to_string(),
             cwd: fields[6].to_string(),
             session_attached: parse_tmux_bool(fields[7]),
+            window_name,
+            pane_title,
+            host_short,
         });
     }
     Ok(panes)

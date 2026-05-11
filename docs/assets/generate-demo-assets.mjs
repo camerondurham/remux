@@ -156,6 +156,12 @@ const hosts = [
 // Derived values:
 //   - glyph from match ("matched" -> ◆, "orphan" -> •, else !)
 //   - canonical state label + color from state (see canonical_state in tui.rs)
+//
+// `label` is the dim suffix the live table appends after the display id,
+// derived from tmux's window-name / pane-title metadata. See
+// `friendly_label_suffix` in src/tui.rs. We omit the field on rows where
+// the metadata wouldn't surface a useful label (e.g. window name == cmd,
+// pane title == hostname).
 const rows = [
   {
     display: "local/agent:0.0",
@@ -165,6 +171,7 @@ const rows = [
     state: "ready",
     age: "5s",
     cmd: "codex",
+    label: "[readme-assets]",
     preview: "regenerating README assets",
     captured: "5s ago",
     output: [
@@ -182,6 +189,7 @@ const rows = [
     state: "stale",
     age: "4m",
     cmd: "cargo",
+    label: null,
     preview: "Finished `dev` profile [unoptimized + debuginfo]",
     captured: "4m ago",
     output: [
@@ -198,6 +206,7 @@ const rows = [
     state: "stale",
     age: "2h",
     cmd: "zsh",
+    label: null,
     preview: "waiting for next maintenance window",
     captured: "2h ago",
     output: [
@@ -213,6 +222,7 @@ const rows = [
     state: "busy",
     age: "38s",
     cmd: "node",
+    label: "[transport-rewrite | ✳ Claude Code]",
     preview: "agent: editing transport adapter",
     captured: "38s ago",
     output: [
@@ -229,6 +239,7 @@ const rows = [
     state: "ready",
     age: "12s",
     cmd: "bash",
+    label: "[journalctl]",
     preview: "$ journalctl -u remux -f",
     captured: "12s ago",
     output: [
@@ -244,6 +255,7 @@ const rows = [
     state: "ready",
     age: "1m",
     cmd: "bash",
+    label: "[health-loop]",
     preview: "serving 200 req/s",
     captured: "1m ago",
     output: [
@@ -259,6 +271,7 @@ const rows = [
     state: "busy",
     age: "6s",
     cmd: "python",
+    label: "[smoke-eval]",
     preview: "processed 12 jobs",
     captured: "6s ago",
     output: [
@@ -275,6 +288,7 @@ const rows = [
     state: "ready",
     age: "3s",
     cmd: "python",
+    label: "[trace-tail]",
     preview: "tail -f logs/trace.log",
     captured: "3s ago",
     output: [
@@ -290,6 +304,7 @@ const rows = [
     state: "missing",
     age: "-",
     cmd: "-",
+    label: null,
     preview: "ssh: connect: no route to host",
     captured: null,
     output: null,
@@ -326,7 +341,11 @@ function filterRows(filter) {
   const needle = (filter || "").trim().toLowerCase();
   if (!needle) return rows;
   return rows.filter((row) =>
-    [row.display, row.host, row.cmd, row.preview].join(" ").toLowerCase().includes(needle),
+    [row.display, row.host, row.cmd, row.preview, row.label]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase()
+      .includes(needle),
   );
 }
 
@@ -427,11 +446,31 @@ function drawTable({ rows: currentRows, selectedIndex }) {
         weight: "700",
       });
     }
+    // Reserve space for the dim window-name/pane-title suffix that
+    // friendly_label_suffix() in src/tui.rs appends after the display id.
+    const socketCost = row.socket ? 2 : 0;
+    const labelText = row.label ? ` ${row.label}` : "";
+    const labelBudget = labelText.length;
+    const displayBudget = Math.max(
+      nameCharMax - socketCost - labelBudget,
+      8,
+    );
     nameParts.push({
-      value: truncate(row.display, nameCharMax - (row.socket ? 2 : 0)),
+      value: truncate(row.display, displayBudget),
       fill: nameFill,
       weight,
     });
+    if (labelText) {
+      const remaining = nameCharMax - socketCost - Math.min(row.display.length, displayBudget);
+      const trimmedLabel = remaining > 1 ? truncate(labelText, remaining) : "";
+      if (trimmedLabel) {
+        nameParts.push({
+          value: trimmedLabel,
+          fill: selected ? palette.selectedFg : palette.dim,
+          weight: selected ? "700" : undefined,
+        });
+      }
+    }
     svg += styledText(col.name, y, nameParts);
 
     svg += plainText(col.age, y, row.age, {

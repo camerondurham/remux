@@ -1090,6 +1090,74 @@ fn row_glyph(session: &SessionSnapshot) -> &'static str {
     }
 }
 
+/// Build a "[window-name | pane-title]" suffix for the live table row.
+///
+/// We only show pieces that are informative — tmux fills these fields with
+/// defaults (window-name == command, pane-title == host_short) that just
+/// repeat info already on the row, so we drop them.
+fn friendly_label_suffix(session: &SessionSnapshot) -> Option<String> {
+    let cmd = session.process.as_ref().map(|p| p.command.as_str());
+    let host_short = session.tmux.host_short.as_deref();
+    let window_idx = session.tmux.window.as_deref();
+
+    let window_name = session
+        .tmux
+        .window_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .filter(|name| Some(*name) != cmd)
+        .filter(|name| Some(*name) != window_idx);
+
+    let pane_title = session
+        .tmux
+        .pane_title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .filter(|title| !is_default_host_title(title, host_short))
+        .filter(|title| Some(*title) != cmd)
+        .filter(|title| Some(*title) != window_name);
+
+    match (window_name, pane_title) {
+        (None, None) => None,
+        (Some(w), None) => Some(format!("[{w}]")),
+        (None, Some(t)) => Some(format!("[{t}]")),
+        (Some(w), Some(t)) => Some(format!("[{w} | {t}]")),
+    }
+}
+
+/// Tmux's default `pane_title` is the remote hostname (often the FQDN even
+/// though `#{host_short}` is just the short form). Treat any title that
+/// equals the short host or has it as a leading dotted segment (the FQDN
+/// case, plus the common `user@host:cwd` shell prompt) as a default.
+fn is_default_host_title(title: &str, host_short: Option<&str>) -> bool {
+    let Some(host) = host_short.filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    if title == host {
+        return true;
+    }
+    if let Some(rest) = title.strip_prefix(host) {
+        // FQDN: "host.us-west-2.amazon.com"
+        if rest.starts_with('.') {
+            return true;
+        }
+    }
+    if let Some((_, after_at)) = title.split_once('@') {
+        // "user@host:~/path" — strip the user, then check the host portion.
+        let host_part = after_at.split(':').next().unwrap_or(after_at);
+        if host_part == host
+            || host_part
+                .strip_prefix(host)
+                .is_some_and(|r| r.starts_with('.'))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn draw_live_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let rows = app.rows();
     if rows.is_empty() {
@@ -1127,6 +1195,10 @@ fn draw_live_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                 session.display_id.clone(),
                 canonical_state_style(session),
             ));
+            if let Some(label) = friendly_label_suffix(session) {
+                name_spans.push(Span::raw(" "));
+                name_spans.push(Span::styled(label, muted_style()));
+            }
             let name_cell = Cell::from(Line::from(name_spans));
 
             let age_cell = Cell::from(last_output_age(session));
@@ -1554,6 +1626,16 @@ fn detail_meta_lines(row: &SessionSnapshot) -> Vec<Line<'static>> {
             Span::styled("pid: ", label_style()),
             Span::raw(pid.clone()),
         ]),
+    ];
+
+    if let Some(label) = friendly_label_suffix(row) {
+        lines.push(Line::from(vec![
+            Span::styled("label: ", label_style()),
+            Span::raw(label.trim_matches(|c| c == '[' || c == ']').to_string()),
+        ]));
+    }
+
+    lines.extend([
         Line::from(""),
         Line::from(vec![
             Span::styled("command: ", label_style()),
@@ -1583,7 +1665,7 @@ fn detail_meta_lines(row: &SessionSnapshot) -> Vec<Line<'static>> {
             Span::styled("capture: ", label_style()),
             Span::raw(capture_hint(row)),
         ]),
-    ];
+    ]);
     if let Some(agent) = &row.agent_hint {
         lines.push(Line::from(vec![
             Span::styled("hint: ", label_style()),
@@ -2082,6 +2164,9 @@ mod tests {
                 pane: None,
                 pane_id: None,
                 session_attached: None,
+                window_name: None,
+                pane_title: None,
+                host_short: None,
             },
             process: None,
             repo: None,
@@ -2113,5 +2198,86 @@ mod tests {
                 "canonical_state({ms:?}, {ss:?})"
             );
         }
+    }
+
+    use crate::snapshot::ProcessSnapshot;
+
+    fn row_with_meta(
+        cmd: &str,
+        window_idx: Option<&str>,
+        window_name: Option<&str>,
+        pane_title: Option<&str>,
+        host_short: Option<&str>,
+    ) -> SessionSnapshot {
+        let mut row = make_row(MatchStatus::Orphan, SessionState::Active);
+        row.process = Some(ProcessSnapshot {
+            pid: None,
+            command: cmd.to_string(),
+            cwd: "/".to_string(),
+        });
+        row.tmux.window = window_idx.map(str::to_string);
+        row.tmux.window_name = window_name.map(str::to_string);
+        row.tmux.pane_title = pane_title.map(str::to_string);
+        row.tmux.host_short = host_short.map(str::to_string);
+        row
+    }
+
+    #[test]
+    fn friendly_label_drops_default_window_and_title() {
+        // window_name == cmd, pane_title == FQDN starting with host_short.
+        let row = row_with_meta(
+            "kiro-cli",
+            Some("0"),
+            Some("kiro-cli"),
+            Some("dev-dsk-cam.us-west-2.amazon.com"),
+            Some("dev-dsk-cam"),
+        );
+        assert_eq!(friendly_label_suffix(&row), None);
+    }
+
+    #[test]
+    fn friendly_label_keeps_meaningful_window_name() {
+        let row = row_with_meta(
+            "kiro-cli",
+            Some("3"),
+            Some("lrcp"),
+            Some("dev-dsk-cam.us-west-2.amazon.com"),
+            Some("dev-dsk-cam"),
+        );
+        assert_eq!(friendly_label_suffix(&row).as_deref(), Some("[lrcp]"));
+    }
+
+    #[test]
+    fn friendly_label_keeps_meaningful_pane_title() {
+        let row = row_with_meta(
+            "claude",
+            Some("5"),
+            Some("ticket"),
+            Some("✳ Claude Code"),
+            Some("dev-dsk-cam"),
+        );
+        assert_eq!(
+            friendly_label_suffix(&row).as_deref(),
+            Some("[ticket | ✳ Claude Code]")
+        );
+    }
+
+    #[test]
+    fn friendly_label_drops_user_at_host_prompt_title() {
+        // tmux often sets pane_title to a `user@host:cwd` shell prompt.
+        let row = row_with_meta(
+            "zsh",
+            Some("0"),
+            Some("zsh"),
+            Some("benchmark@dev-dsk-cam.us-west-2.amazon.com:~/scripts"),
+            Some("dev-dsk-cam"),
+        );
+        assert_eq!(friendly_label_suffix(&row), None);
+    }
+
+    #[test]
+    fn friendly_label_drops_window_name_matching_window_index() {
+        let row = row_with_meta("zsh", Some("2"), Some("2"), None, Some("dev-dsk-cam"));
+        assert_eq!(friendly_label_suffix(&row), None);
     }
 }
