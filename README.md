@@ -151,7 +151,6 @@ Tagged `v*` pushes publish prebuilt archives to GitHub Releases for:
 
 - Linux x86_64
 - Linux aarch64
-- macOS x86_64
 - macOS aarch64
 
 Each release includes per-archive SHA-256 files plus a combined `SHA256SUMS` manifest.
