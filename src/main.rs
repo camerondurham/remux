@@ -9,6 +9,7 @@ mod git;
 mod host;
 mod lifecycle;
 mod local;
+mod onboard;
 mod picker;
 mod render;
 mod sessions;
@@ -37,11 +38,22 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    let config = config::Config::load(cli.config.as_deref())?;
     let config_path = cli.config.clone();
     let verbose = cli.verbose;
 
+    if let Command::Onboard {
+        hosts,
+        write,
+        force,
+    } = &cli.command
+    {
+        return onboard::run(config_path.as_deref(), hosts.as_deref(), *write, *force);
+    }
+
+    let config = config::Config::load(cli.config.as_deref())?;
+
     match cli.command {
+        Command::Onboard { .. } => unreachable!(),
         Command::Hosts => render::hosts(&config),
         Command::Doctor { json } => doctor::run(&config, json),
         Command::Snapshot { host, json } => {

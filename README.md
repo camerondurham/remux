@@ -2,43 +2,30 @@
 
 `remux` is a local-first CLI/TUI for finding, inspecting, and attaching to tmux panes across local and SSH hosts.
 
-**Status: alpha.** Built for personal/local use first. Tested with local and SSH tmux hosts. Expect rough edges.
-
-It is for engineers who keep coding agents, shells, builds, bots, and debug sessions alive in tmux across multiple machines. `remux` gives you one factual index of those panes: command, cwd, repo, output activity, match state, and attach/capture targets.
-
-It does not summarize, score, orchestrate, spawn agents, install a daemon, or sync to the cloud.
+![remux TUI demo: default browse view, filter entry, selection moving, and the help overlay](docs/assets/remux-tui-demo.gif)
 
 ![remux TUI: single-line summary, live pane table (NAME/AGE/CMD/PREVIEW) with colored state glyphs and dim window-name/pane-title chips next to each id, plus a right-hand context rail showing the selected pane](docs/assets/remux-tui.png)
 
-![remux TUI demo: default browse view, filter entry, selection moving, and the help overlay](docs/assets/remux-tui-demo.gif)
+`remux` is for engineers who keep shells, builds, coding agents, bots, and debug sessions alive in tmux across multiple machines and want one factual place to find them again.
 
-## Why
+## Quick start
 
-When running multiple coding agents or long-running tasks in tmux across local and remote machines, it is easy to lose track of what is running where.
+### Install
 
-`remux` gives you a single factual view over those sessions without requiring a daemon, cloud account, new agent framework, or custom workflow. It reuses tmux and SSH.
+#### Homebrew
 
-## How is this different?
+```bash
+brew tap camerondurham/tap
+brew install remux
+```
 
-| Tool type | Examples | Focus | remux difference |
-| --- | --- | --- | --- |
-| AI-agent monitors | `abtop` | Local Claude Code/Codex telemetry: tokens, context, rate limits, ports, child processes | `remux` is process-agnostic tmux inventory across local and SSH hosts. |
-| Claude tmux dashboards | `recon` | Managing Claude Code sessions in tmux, including switching/spawning/killing/resume workflows | `remux` does not manage agents; it inventories any tmux pane and gives attach/capture targets. |
-| Agent orchestrators | Gas Town | Coordinating multiple AI coding agents and persistent multi-agent work state | `remux` does not orchestrate. It observes existing sessions and helps you jump into them. |
-| Local tmux agent helpers | `amux`, fzf scripts, shell scripts | Local organization or launching of agent sessions | `remux` adds SSH hosts, watches, match states, repo metadata, capture, and activity aging. |
-| Generic tmux wrappers | tmux aliases/wrappers | Shorter tmux commands | `remux` builds a remote session index over tmux panes instead of replacing tmux. |
+#### Nix
 
-## Requirements
+```bash
+nix profile install github:camerondurham/remux
+```
 
-- tmux on each monitored host
-- fzf only for `remux pick`
-- ssh for remote hosts
-- git only if repo metadata is configured
-- Rust only when building from source
-
-## Quick Start
-
-From this checkout:
+#### Build from source
 
 ```bash
 cargo install --path .
@@ -46,68 +33,26 @@ mkdir -p ~/.config/remux
 cp examples/config.yaml ~/.config/remux/config.yaml
 ```
 
-## Install via Nix
+### Configure
 
-If you use Nix with flakes enabled:
-
-```bash
-nix profile install github:camerondurham/remux
-```
-
-Or add as a flake input:
-
-```nix
-inputs.remux = {
-  url = "github:camerondurham/remux";
-  inputs.nixpkgs.follows = "nixpkgs";
-};
-# ...then in your home.packages:
-# inputs.remux.packages.${system}.default
-```
-
-Edit `~/.config/remux/config.yaml`, then run:
+Generate a starter config:
 
 ```bash
-remux doctor
-remux hosts
-remux list
-remux sessions
-remux pick
-remux attach --readonly pi-agent
-remux attach pi-agent
-remux tui
+remux onboard
+remux onboard --write
 ```
 
-Useful commands:
+If `~/.ssh/config` has aliases, `remux onboard` will prompt you to choose which ones to include.
+
+If you want to limit the generated SSH hosts:
 
 ```bash
-remux snapshot <host> [--json]
-remux inspect <watch-id-or-pane-target> [--json]
-remux capture <watch-id-or-pane-target> [--lines N] [--color]
-remux attach --readonly <watch-id-or-pane-target>
-remux attach <watch-id-or-pane-target>
-remux new <host> <session-name> [--cwd PATH] [--window-name NAME]
-remux kill <watch-id-or-pane-target> --yes
+remux onboard --hosts pi,prod --write
 ```
 
-Pane targets look like:
+`remux onboard` scans `~/.ssh/config`, generates a minimal `~/.config/remux/config.yaml`, and leaves a commented watch example you can fill in later.
 
-```text
-pi/work:0.1
-```
-
-Direct pane targets also work:
-
-```bash
-remux inspect 'pi/work:0.1'
-remux capture 'pi/work:0.1'
-remux attach --readonly 'pi/work:0.1'
-remux attach 'pi/work:0.1'
-```
-
-## Configuration
-
-Hosts are local or SSH. Watches give live panes friendly IDs. Match fields are exact and combined with AND semantics.
+Or edit `~/.config/remux/config.yaml` directly:
 
 ```yaml
 poll:
@@ -121,13 +66,9 @@ poll:
 hosts:
   - id: local
     type: local
-    # Optional: inspect a non-default tmux server socket.
-    # tmux_socket: ~/.work-os/tmux.sock
 
   - id: pi
     type: ssh
-    # Optional: evaluated on the remote host for SSH targets.
-    # tmux_socket: ~/.work-os/tmux.sock
     ssh:
       target: cam@192.168.0.197
 
@@ -141,36 +82,68 @@ watches:
     agent_hint: codex
 ```
 
-Default config path: `~/.config/remux/config.yaml`.
-
-Legacy `sessions` entries are still accepted as exact tmux-coordinate watches.
-
-## Releases
-
-Tagged `v*` pushes publish prebuilt archives to GitHub Releases for:
-
-- Linux x86_64
-- Linux aarch64
-- macOS aarch64
-
-Each release includes per-archive SHA-256 files plus a combined `SHA256SUMS` manifest.
-
-## Commands
+### Use it
 
 ```bash
+remux onboard
+remux doctor
+remux list
+remux tui
+```
+
+Once you know a pane target or add a watch ID, you can inspect or attach directly:
+
+```bash
+remux inspect 'pi/work:0.1'
+remux attach --readonly 'pi/work:0.1'
+```
+
+Pane targets look like:
+
+```text
+pi/work:0.1
+```
+
+Direct pane targets work anywhere a watch ID works:
+
+```bash
+remux inspect 'pi/work:0.1'
+remux capture 'pi/work:0.1'
+remux attach --readonly 'pi/work:0.1'
+remux attach 'pi/work:0.1'
+```
+
+## What it does
+
+- indexes tmux panes across local and SSH hosts
+- shows command, cwd, repo, activity, and match state
+- lets you inspect output, capture panes, and jump in read-only or read-write
+- gives friendly watch IDs for important panes you revisit often
+
+## What it does not do
+
+- no daemon
+- no cloud sync
+- no agent orchestration
+- no AI summaries or scoring
+
+## Core commands
+
+```bash
+remux onboard [--hosts HOST[,HOST...]] [--write] [--force]
 remux hosts
 remux doctor [--json]
-remux snapshot <host> [--json]
 remux list [--json] [--group panes|sessions]
 remux sessions [--host HOST] [--json]
-remux pick [--host HOST] [--filter TEXT] [--sessions] [--color] [--no-fzf]
+remux snapshot <host> [--json]
 remux inspect <watch-id-or-pane-target> [--json] [--color]
 remux capture <watch-id-or-pane-target> [--lines N] [--color]
 remux attach --readonly <watch-id-or-pane-target>
 remux attach <watch-id-or-pane-target>
+remux pick [--host HOST] [--filter TEXT] [--sessions] [--color] [--no-fzf]
+remux tui [--host HOST] [--filter TEXT]
 remux new <host> <session-name> [--cwd PATH] [--window-name NAME]
 remux kill <watch-id-or-pane-target> [--yes]
-remux tui [--host HOST] [--filter TEXT]
 ```
 
 Aliases:
@@ -182,11 +155,52 @@ remux i <watch-id-or-pane-target>
 remux a [--readonly] <watch-id-or-pane-target>
 ```
 
-`attach --readonly` is a peek. `attach` without `--readonly` is an explicit
-read-write jump. `pick` uses fzf when available; without fzf, `pick --no-fzf`
-prints the same tab-separated rows and exits `2`.
+## Requirements
 
-## Status Semantics
+- tmux on each monitored host
+- ssh for remote hosts
+- fzf only for `remux pick`
+- git only if repo metadata is configured
+- Rust only when building from source
+
+## Why
+
+When you run long-lived tmux sessions across local and remote machines, it gets annoyingly easy to lose track of what is running where.
+
+`remux` gives you one factual view over those panes without asking you to adopt a daemon, cloud service, or new orchestration model. It reuses tmux and SSH.
+
+## Configuration notes
+
+- hosts can be local or SSH
+- `remux onboard` reuses your SSH aliases by default, so `ssh pi` can become `target: pi`
+- watches give important panes stable IDs
+- match fields are exact and combined with AND semantics
+- default config path is `~/.config/remux/config.yaml`
+- legacy `sessions` entries are still accepted as exact tmux-coordinate watches
+
+## TUI keys
+
+Main keys:
+
+```text
+[↑↓] move  [Enter] attach ro  [a] jump rw  [i] refresh  [/] filter  [d] details  [?] help  [x] kill  [q] quit
+```
+
+More keys available in the help overlay (`?`):
+
+| Key | Action |
+| --- | --- |
+| `j` / `k` | Select next / previous row |
+| `r` | Re-poll every configured host |
+| `s` | Cycle the table sort mode |
+| `c` | Capture selected pane output into the detail view |
+| `e` | Rename the selected session |
+| `n` | Create a new tmux session on a host (`<host>/<session>`) |
+| `p` | Spawn a new pane in an existing session |
+| `d` | Toggle the detail pane |
+| `Esc` | Close the current overlay |
+
+## Status semantics
 
 Activity state:
 
@@ -212,30 +226,19 @@ Watch match state:
 
 State aging is based on captured output hashes cached at `~/.local/share/remux/cache.json`.
 
-The TUI collapses activity + match status into a smaller canonical vocabulary shown in the name column color and the context rail `state` field:
+The TUI collapses activity + match status into a smaller vocabulary:
 
 | TUI state | Derived from |
 | --- | --- |
 | `ready` | `active` |
 | `busy` | `quiet` |
 | `stale` | `idle` |
-| `drift` | `shadowed` (watch's pane identity moved) |
+| `drift` | `shadowed` |
 | `missing` | `missing` or `unreachable` |
 | `ambiguous` | `ambiguous` |
 | `-` | `unknown` with no other signal |
 
-## Known Limitations
-
-- Alpha-quality TUI.
-- No remote daemon; polling uses generated SSH commands.
-- No Windows support claimed.
-- Activity state is based on captured output hash changes, not semantic task state.
-- Pane capture may write recent terminal output into the local cache.
-- No token/context tracking.
-- No AI summaries or risk scoring.
-- The name `remux` may need reconsideration before crates.io publishing.
-
-## SSH And Security
+## SSH and security
 
 `remux` uses your system `ssh` binary and normal SSH config. It does not install a remote daemon or open inbound ports.
 
@@ -247,17 +250,13 @@ For SSH hosts, observation is limited to generated commands for:
 
 SSH polling defaults to `BatchMode=yes`, `ConnectTimeout=<poll.ssh_timeout>`, and `poll.command_timeout`. Host key checking is not disabled by default. Remote commands run as the configured SSH user.
 
-Attach is always explicit. `remux attach --readonly ...` uses `tmux attach-session -r`; read-write attach only happens when requested.
+Attach is explicit:
 
-Lifecycle commands are explicit mutations. `remux new` creates a detached tmux
-session. `remux kill` kills a resolved session or pane, requires confirmation on
-a TTY, and requires `--yes` from non-interactive scripts.
+- `remux attach --readonly ...` uses `tmux attach-session -r`
+- read-write attach only happens when requested
+- `remux new` and `remux kill` are explicit mutations
 
 ### Speed up remote polling with SSH multiplexing
-
-Each poll cycle sends one command per host. Without multiplexing, every command opens a fresh SSH connection — TCP handshake, key exchange, authentication — which typically costs 100–500ms per call. With `ControlMaster` enabled, the first connection establishes a persistent master socket and every subsequent `ssh` invocation reuses it at local-pipe speed (usually under 20ms).
-
-Add this to `~/.ssh/config` for the hosts you monitor with `remux`:
 
 ```text
 Host your-remote-hosts
@@ -266,40 +265,25 @@ Host your-remote-hosts
     ControlPersist 10m
 ```
 
-The first `remux` poll after opening the TUI warms the master; subsequent polls feel noticeably faster, especially on high-latency links. `ControlPersist 10m` keeps the connection alive for 10 minutes after the last command; tune to taste.
+That keeps subsequent SSH polls fast by reusing the connection.
 
-Verify with `ssh -G <hostname> | grep -iE '^control(master|path|persist) '` — `controlmaster` should read `auto` (not `false`).
+## Releases
 
-## TUI Keys
+Tagged `v*` pushes publish prebuilt archives to GitHub Releases for:
 
-The footer shows the primary navigation and action keys:
+- Linux x86_64
+- Linux aarch64
+- macOS aarch64
 
-```text
-[↑↓] move  [Enter] attach ro  [a] jump rw  [i] refresh  [/] filter  [d] details  [?] help  [x] kill  [q] quit
-```
+Each release includes per-archive SHA-256 files plus a combined `SHA256SUMS` manifest.
 
-The footer labels `[i]` as "refresh", which is a shorthand — `[i]` opens the inspect pane for the selected row and re-captures that pane's output. Use `[r]` for a full re-poll of every configured host.
+## Known limitations
 
-Press `?` at any time for the full key list, which additionally includes:
-
-| Key | Action |
-| --- | --- |
-| `j` / `k` | Select next / previous row (aliases for `↓` / `↑`) |
-| `r` | Re-poll every configured host to refresh the full pane inventory |
-| `s` | Cycle the table sort mode |
-| `c` | Capture selected pane output into the detail view |
-| `e` | Rename the selected session |
-| `n` | Create a new tmux session on a host (`<host>/<session>`) |
-| `p` | Spawn a new pane in an existing session |
-| `d` | Toggle the right-hand context rail / detail pane |
-| `Esc` | Close the current overlay (help, inspect, filter, or prompt) |
-
-The top summary line shows, left to right: `remux | / <filter> | N panes  •N free  ◆N watched  [!N issues] | N/N hosts polled in <last> · <age> ago | <mode>`. `free` is orphan panes (live but not watched), `watched` is matched watches, `issues` counts rows that need attention (missing, unreachable, ambiguous, shadowed). `mode` is one of `browse`, `filter`, or `inspect`.
-
-Passive discovery commands stay read-only: `hosts`, `list`, `snapshot`,
-`inspect`, `capture`, and TUI polling do not enter a remote session. Read-write
-attach only happens from intentional CLI attach/jump actions or the TUI `a`
-key. Kill only happens from `remux kill` or a confirmed TUI `x` prompt.
+- alpha-quality TUI
+- no Windows support claimed
+- activity state is based on output hash changes, not semantic task state
+- pane capture may write recent terminal output into the local cache
+- the name `remux` may need reconsideration before crates.io publishing
 
 ## Development
 
@@ -309,4 +293,4 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets --all-features
 ```
 
-The integration tests use fake `ssh` and `tmux` binaries, so they do not require a live remote host.
+Integration tests use fake `ssh` and `tmux` binaries, so they do not require a live remote host.

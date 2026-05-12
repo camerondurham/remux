@@ -21,6 +21,18 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Generate a starter config and onboarding steps.
+    Onboard {
+        /// Comma-separated SSH host aliases to include.
+        #[arg(long, value_name = "HOST[,HOST...]")]
+        hosts: Option<String>,
+        /// Write the generated config to disk.
+        #[arg(long)]
+        write: bool,
+        /// Overwrite an existing config file when used with --write.
+        #[arg(long)]
+        force: bool,
+    },
     /// Show configured hosts.
     Hosts,
     /// Validate local tools and host connectivity.
