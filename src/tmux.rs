@@ -4,7 +4,15 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt;
 
-pub const INVENTORY_FORMAT: &str = "'#S\t#I\t#P\t#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}\t#{session_attached}'";
+// Several inventory fields are free-form and user/app-controlled — session
+// names, window names, pane titles, and the current command/path can all
+// contain literal tabs or newlines that would split or stretch a tab-
+// separated row. We use ASCII Unit Separator (\x1f, "INVENTORY_FIELD_SEP")
+// as the field delimiter so any tab or newline a user/app might inject
+// into a tmux variable stays inside its own field instead of corrupting
+// the row layout.
+pub const INVENTORY_FIELD_SEP: char = '\x1f';
+pub const INVENTORY_FORMAT: &str = "'#S\x1f#I\x1f#P\x1f#{pane_id}\x1f#{pane_pid}\x1f#{pane_current_command}\x1f#{pane_current_path}\x1f#{session_attached}\x1f#W\x1f#{pane_title}\x1f#{host_short}'";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PaneTarget {
@@ -27,6 +35,9 @@ pub struct Pane {
     pub command: String,
     pub cwd: String,
     pub session_attached: bool,
+    pub window_name: Option<String>,
+    pub pane_title: Option<String>,
+    pub host_short: Option<String>,
 }
 
 impl PaneTarget {
@@ -75,10 +86,18 @@ pub fn parse_inventory(host: &str, output: &str) -> Result<Vec<Pane>> {
         if line.trim().is_empty() {
             continue;
         }
-        let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() != 8 {
+        // Accept both the new \x1f-separated layout (used by INVENTORY_FORMAT
+        // so user-controlled fields can safely contain tabs) and legacy
+        // 8-field tab-separated rows from older tmux output captured in
+        // tests or pre-upgrade fixtures.
+        let fields: Vec<&str> = if line.contains(INVENTORY_FIELD_SEP) {
+            line.split(INVENTORY_FIELD_SEP).collect()
+        } else {
+            line.split('\t').collect()
+        };
+        if fields.len() != 8 && fields.len() != 11 {
             bail!(
-                "failed to parse tmux inventory line {} for host `{}`: expected 8 tab-separated fields, got {}",
+                "failed to parse tmux inventory line {} for host `{}`: expected 8 or 11 fields, got {}",
                 index + 1,
                 host,
                 fields.len()
@@ -88,6 +107,18 @@ pub fn parse_inventory(host: &str, output: &str) -> Result<Vec<Pane>> {
         let window = fields[1].to_string();
         let pane = fields[2].to_string();
         let target = format!("{host}/{session}:{window}.{pane}");
+        let window_name = fields
+            .get(8)
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty());
+        let pane_title = fields
+            .get(9)
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty());
+        let host_short = fields
+            .get(10)
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty());
         panes.push(Pane {
             target,
             host: host.to_string(),
@@ -99,6 +130,9 @@ pub fn parse_inventory(host: &str, output: &str) -> Result<Vec<Pane>> {
             command: fields[5].to_string(),
             cwd: fields[6].to_string(),
             session_attached: parse_tmux_bool(fields[7]),
+            window_name,
+            pane_title,
+            host_short,
         });
     }
     Ok(panes)
@@ -453,6 +487,40 @@ mod tests {
         assert_eq!(panes[0].pid, Some(1234));
         assert_eq!(panes[0].command, "zsh");
         assert!(panes[0].session_attached);
+    }
+
+    #[test]
+    fn parses_unit_separator_inventory_with_window_metadata() {
+        // 11-field row using \x1f as the field delimiter (matches what the
+        // current INVENTORY_FORMAT emits via tmux).
+        let output = "codex\u{1f}0\u{1f}1\u{1f}%3\u{1f}1234\u{1f}zsh\u{1f}/home/cam/work\u{1f}1\u{1f}lrcp\u{1f}✳ Claude Code\u{1f}rpi\n";
+        let panes = parse_inventory("pi", output).unwrap();
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].target, "pi/codex:0.1");
+        assert_eq!(panes[0].window_name.as_deref(), Some("lrcp"));
+        assert_eq!(panes[0].pane_title.as_deref(), Some("✳ Claude Code"));
+        assert_eq!(panes[0].host_short.as_deref(), Some("rpi"));
+    }
+
+    #[test]
+    fn unit_separator_protects_against_tab_in_window_name() {
+        // A user can rename a window to include a literal tab; with the old
+        // tab-separated format this would have produced 12 fields and a
+        // parse error. With \x1f the tab stays inside the window_name field.
+        let output = "work\u{1f}0\u{1f}0\u{1f}%1\u{1f}100\u{1f}zsh\u{1f}/home/cam\u{1f}1\u{1f}foo\tbar\u{1f}\u{1f}rpi\n";
+        let panes = parse_inventory("pi", output).unwrap();
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].window_name.as_deref(), Some("foo\tbar"));
+        assert_eq!(panes[0].pane_title, None);
+    }
+
+    #[test]
+    fn inventory_format_uses_unit_separator_field_delimiter() {
+        // Anchor: if the format string is changed back to tab-separated,
+        // the parser's split heuristic and SSH transport assumptions need
+        // to be revisited together.
+        assert!(INVENTORY_FORMAT.contains(INVENTORY_FIELD_SEP));
+        assert!(!INVENTORY_FORMAT.contains('\t'));
     }
 
     #[test]
