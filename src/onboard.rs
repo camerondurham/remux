@@ -2,44 +2,168 @@ use crate::config;
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
-pub fn run(config_path_arg: Option<&Path>, hosts_arg: Option<&str>, write: bool, force: bool) -> Result<()> {
+pub fn run(
+    config_path_arg: Option<&Path>,
+    hosts_arg: Option<&str>,
+    write: bool,
+    force: bool,
+) -> Result<()> {
     let config_path = config::resolve_config_path(config_path_arg)?;
     let discovered = discover_ssh_aliases()?;
-    let selected = selected_hosts(hosts_arg, &discovered);
-    let rendered = render_config(&selected);
+    let selection = choose_hosts(hosts_arg, &discovered)?;
+    let rendered = render_config(&selection.hosts);
 
     if write {
         write_config(&config_path, &rendered, force)?;
-        print_written_summary(&config_path, &selected, discovered.is_empty());
+        print_written_summary(&config_path, &selection.hosts, discovered.is_empty());
         return Ok(());
     }
 
-    print_preview(&config_path, &rendered, &discovered, &selected);
+    print_preview(&config_path, &rendered, &discovered, &selection.hosts, selection.mode);
     Ok(())
 }
 
-fn print_preview(config_path: &Path, rendered: &str, discovered: &[String], selected: &[String]) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectionMode {
+    Explicit,
+    Interactive,
+    AutoAll,
+    None,
+}
+
+#[derive(Debug)]
+struct HostSelection {
+    hosts: Vec<String>,
+    mode: SelectionMode,
+}
+
+fn choose_hosts(hosts_arg: Option<&str>, discovered: &[String]) -> Result<HostSelection> {
+    if let Some(raw) = hosts_arg {
+        return Ok(HostSelection {
+            hosts: parse_hosts_arg(raw),
+            mode: SelectionMode::Explicit,
+        });
+    }
+
+    if discovered.is_empty() {
+        return Ok(HostSelection {
+            hosts: Vec::new(),
+            mode: SelectionMode::None,
+        });
+    }
+
+    if should_prompt_interactively() {
+        return Ok(HostSelection {
+            hosts: prompt_for_hosts(discovered)?,
+            mode: SelectionMode::Interactive,
+        });
+    }
+
+    Ok(HostSelection {
+        hosts: discovered.to_vec(),
+        mode: SelectionMode::AutoAll,
+    })
+}
+
+fn should_prompt_interactively() -> bool {
+    if std::env::var_os("REMUX_ONBOARD_FORCE_INTERACTIVE").is_some() {
+        return true;
+    }
+    io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
+fn prompt_for_hosts(discovered: &[String]) -> Result<Vec<String>> {
+    println!("Discovered SSH aliases from ~/.ssh/config:");
+    for (idx, host) in discovered.iter().enumerate() {
+        println!("  {}) {}", idx + 1, host);
+    }
+    println!();
+    println!("Select hosts to include in remux.");
+    println!("- Press Enter to include all discovered hosts");
+    println!("- Type numbers like `1,3` to include specific hosts");
+    println!("- Type `none` to generate a local-only config");
+    print!("> ");
+    io::stdout().flush().context("failed to flush prompt")?;
+
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .context("failed to read host selection")?;
+    let trimmed = input.trim();
+
+    if trimmed.is_empty() {
+        return Ok(discovered.to_vec());
+    }
+    if trimmed.eq_ignore_ascii_case("none") {
+        return Ok(Vec::new());
+    }
+
+    let mut selected = Vec::new();
+    let mut seen = BTreeSet::new();
+    for token in trimmed.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let index: usize = token
+            .parse()
+            .with_context(|| format!("invalid selection `{token}`; expected numbers like 1,3"))?;
+        if index == 0 || index > discovered.len() {
+            bail!(
+                "selection `{token}` is out of range; choose between 1 and {}",
+                discovered.len()
+            );
+        }
+        let host = discovered[index - 1].clone();
+        if seen.insert(host.clone()) {
+            selected.push(host);
+        }
+    }
+    Ok(selected)
+}
+
+fn print_preview(
+    config_path: &Path,
+    rendered: &str,
+    discovered: &[String],
+    selected: &[String],
+    mode: SelectionMode,
+) {
     println!("remux onboard");
     println!("config path: {}", config_path.display());
     println!();
 
-    if !selected.is_empty() {
-        println!("Using selected SSH aliases:");
-        for host in selected {
-            println!("- {host}");
+    match mode {
+        SelectionMode::Explicit => {
+            println!("Using selected SSH aliases:");
+            for host in selected {
+                println!("- {host}");
+            }
         }
-    } else if discovered.is_empty() {
-        println!("No SSH aliases were discovered from ~/.ssh/config.");
-        println!("The starter config below includes only `local`. Add SSH hosts later by editing the file.");
-    } else {
-        println!("Discovered SSH aliases from ~/.ssh/config:");
-        for host in discovered {
-            println!("- {host}");
+        SelectionMode::Interactive => {
+            if selected.is_empty() {
+                println!("Selected SSH aliases: none");
+                println!("Previewing a local-only starter config.");
+            } else {
+                println!("Selected SSH aliases:");
+                for host in selected {
+                    println!("- {host}");
+                }
+            }
         }
-        println!();
-        println!("Previewing a starter config with `local` plus all discovered aliases.");
+        SelectionMode::AutoAll => {
+            println!("Discovered SSH aliases from ~/.ssh/config:");
+            for host in discovered {
+                println!("- {host}");
+            }
+            println!();
+            println!("Previewing a starter config with `local` plus all discovered aliases.");
+        }
+        SelectionMode::None => {
+            println!("No SSH aliases were discovered from ~/.ssh/config.");
+            println!(
+                "The starter config below includes only `local`. Add SSH hosts later by editing the file."
+            );
+        }
     }
 
     println!();
@@ -47,11 +171,13 @@ fn print_preview(config_path: &Path, rendered: &str, discovered: &[String], sele
     println!("{rendered}");
     println!("---");
     println!();
-    if selected.is_empty() && !discovered.is_empty() {
+
+    if mode == SelectionMode::AutoAll {
         println!("To limit the generated SSH hosts:");
         println!("  remux onboard --hosts {}", discovered.join(","));
         println!();
     }
+
     println!("To write this config:");
     println!("  remux onboard --write");
     if !selected.is_empty() || !discovered.is_empty() {
@@ -60,7 +186,9 @@ fn print_preview(config_path: &Path, rendered: &str, discovered: &[String], sele
         } else {
             selected.join(",")
         };
-        println!("  remux onboard --hosts {host_list} --write");
+        if !host_list.is_empty() {
+            println!("  remux onboard --hosts {host_list} --write");
+        }
     }
     println!();
     println!("Then run:");
@@ -76,7 +204,7 @@ fn print_written_summary(config_path: &Path, selected: &[String], no_discovered_
         if no_discovered_hosts {
             println!("configured hosts: local");
         } else {
-            println!("configured hosts: local plus discovered SSH aliases");
+            println!("configured hosts: local only");
         }
     } else {
         println!("configured hosts: local, {}", selected.join(", "));
@@ -88,16 +216,12 @@ fn print_written_summary(config_path: &Path, selected: &[String], no_discovered_
     println!("  remux tui");
 }
 
-fn selected_hosts(hosts_arg: Option<&str>, discovered: &[String]) -> Vec<String> {
-    match hosts_arg {
-        Some(raw) => raw
-            .split(',')
-            .map(str::trim)
-            .filter(|part| !part.is_empty())
-            .map(str::to_string)
-            .collect(),
-        None => discovered.to_vec(),
-    }
+fn parse_hosts_arg(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn write_config(path: &Path, rendered: &str, force: bool) -> Result<()> {
@@ -191,7 +315,7 @@ fn parse_ssh_aliases(raw: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_ssh_aliases, render_config, sanitize_id};
+    use super::{parse_ssh_aliases, parse_hosts_arg, render_config, sanitize_id};
 
     #[test]
     fn parses_host_aliases_and_ignores_wildcards() {
@@ -225,5 +349,10 @@ Host github.com
     fn sanitize_id_normalizes_non_identifier_characters() {
         assert_eq!(sanitize_id("github.com"), "github-com");
         assert_eq!(sanitize_id("Prod_Box"), "prod_box");
+    }
+
+    #[test]
+    fn parses_hosts_arg() {
+        assert_eq!(parse_hosts_arg("pi, prod,,"), vec!["pi", "prod"]);
     }
 }

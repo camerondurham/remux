@@ -42,6 +42,8 @@ remux onboard
 remux onboard --write
 ```
 
+If `~/.ssh/config` has aliases, `remux onboard` will prompt you to choose which ones to include.
+
 If you want to limit the generated SSH hosts:
 
 ```bash

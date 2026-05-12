@@ -1,9 +1,10 @@
 use serde_json::Value;
 use std::ffi::OsString;
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
@@ -557,7 +558,7 @@ Host *
     let out = env.remux(["onboard"]);
     assert_success(&out);
     let stdout = stdout(&out);
-    assert!(stdout.contains("Using selected SSH aliases"));
+    assert!(stdout.contains("Discovered SSH aliases from ~/.ssh/config"));
     assert!(stdout.contains("- pi"));
     assert!(stdout.contains("- prod"));
     assert!(stdout.contains("target: pi"));
@@ -581,6 +582,27 @@ Host pi prod
     assert!(written.contains("- id: prod"));
     assert!(written.contains("target: prod"));
     assert!(!written.contains("target: pi"));
+}
+
+#[test]
+fn onboard_interactively_selects_hosts() {
+    let env = OnboardEnv::new(
+        r#"
+Host pi prod stage
+  User cam
+"#,
+    );
+
+    let out = env.remux_with_input(["onboard"], Some("1,3\n"), true);
+    assert_success(&out);
+    let stdout = stdout(&out);
+    assert!(stdout.contains("Select hosts to include in remux."));
+    assert!(stdout.contains("Selected SSH aliases:"));
+    assert!(stdout.contains("- pi"));
+    assert!(stdout.contains("- stage"));
+    assert!(stdout.contains("target: pi"));
+    assert!(stdout.contains("target: stage"));
+    assert!(!stdout.contains("target: prod"));
 }
 
 struct TestEnv {
@@ -617,6 +639,34 @@ impl OnboardEnv {
             .env("HOME", &self.home)
             .output()
             .unwrap()
+    }
+
+    fn remux_with_input<const N: usize>(
+        &self,
+        args: [&str; N],
+        input: Option<&str>,
+        force_interactive: bool,
+    ) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_remux"));
+        command.args(args).env("HOME", &self.home);
+        if force_interactive {
+            command.env("REMUX_ONBOARD_FORCE_INTERACTIVE", "1");
+        }
+        if input.is_some() {
+            command.stdin(Stdio::piped());
+        }
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        let mut child = command.spawn().unwrap();
+        if let Some(input) = input {
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(input.as_bytes())
+                .unwrap();
+        }
+        child.wait_with_output().unwrap()
     }
 }
 
