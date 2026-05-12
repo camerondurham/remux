@@ -2,26 +2,39 @@
 
 `remux` helps you find, inspect, and reattach to tmux panes across local and SSH hosts.
 
-![remux TUI demo: default browse view, filter entry, selection moving, and the help overlay](docs/assets/remux-tui-demo.gif)
-
-![remux TUI: single-line summary, live pane table (NAME/AGE/CMD/PREVIEW) with colored state glyphs, and a right-hand context rail showing the selected pane](docs/assets/remux-tui.png)
-
-It is for the case where you already use tmux across multiple machines and want a quick way to answer:
+If you already use tmux across multiple machines, `remux` helps you answer:
 
 - what is running
 - where it is running
 - whether it is still active
 - how to get back to it
 
-`remux` reuses tmux and SSH. It does not require a daemon, a cloud service, or a new workflow.
+It reuses tmux and SSH. It does not require a daemon, a cloud service, or a new workflow.
+
+![remux TUI demo: default browse view, filter entry, selection moving, and the help overlay](docs/assets/remux-tui-demo.gif)
 
 ## Why
 
 If you keep long-lived shells, builds, agents, or debug sessions running in tmux across multiple hosts, it becomes easy to lose track of which pane is doing what.
 
-`remux` gives you a cross-host view of live tmux panes so you can inspect the right one, capture output, and attach without manually hopping through each machine.
+`remux` gives you a cross-host view of live tmux panes so you can inspect the right one, capture output, and attach without manually checking each host.
 
-## Scope
+## Why this instead of tmux built-ins, sesh, tmuxp, or fzf scripts?
+
+`remux` is for a different problem.
+
+- `tmux ls`, `list-sessions`, and `list-panes` tell you about one host at a time.
+- `sesh`, `tmuxp`, and tmuxinator help create, restore, or switch between known sessions.
+- ad hoc `ssh` + `fzf` + shell scripts can work, but usually need host-specific glue and do not give you one consistent inspect-and-attach flow.
+
+`remux` is for the moment when the session already exists and the problem is:
+
+- "I know I left this running somewhere."
+- "Which host has the live pane I need?"
+- "Show me the pane before I attach to it."
+- "Let me jump back in without SSHing host-by-host."
+
+## What remux is and is not
 
 `remux` is:
 
@@ -148,6 +161,8 @@ remux attach 'pi/work:0.1'
 - show command, cwd, repo, activity, and match state
 - inspect output, capture panes, and jump in read-only or read-write
 - assign friendly watch IDs to panes you revisit often
+
+![remux TUI: single-line summary, live pane table (NAME/AGE/CMD/PREVIEW) with colored state glyphs, and a right-hand context rail showing the selected pane](docs/assets/remux-tui.png)
 
 ## Core commands
 
