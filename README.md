@@ -1,41 +1,41 @@
 # remux
 
-**Find the tmux pane you forgot about — even if it's on another machine.**
-
-`remux` is a local-first CLI/TUI for finding, inspecting, and reattaching to tmux panes across local and SSH hosts.
+`remux` helps you find, inspect, and reattach to tmux panes across local and SSH hosts.
 
 ![remux TUI demo: default browse view, filter entry, selection moving, and the help overlay](docs/assets/remux-tui-demo.gif)
 
 ![remux TUI: single-line summary, live pane table (NAME/AGE/CMD/PREVIEW) with colored state glyphs, and a right-hand context rail showing the selected pane](docs/assets/remux-tui.png)
 
-`remux` is built for engineers who already live in tmux and SSH, keep long-lived shells/builds/agents/debug sessions running across machines, and want one factual place to find them again.
+It is for the case where you already use tmux across multiple machines and want a quick way to answer:
 
-It does **not** ask you to adopt a daemon, a cloud control plane, or a new terminal workspace. It reuses the tmux sessions and SSH aliases you already have.
+- what is running
+- where it is running
+- whether it is still active
+- how to get back to it
 
-## Why `remux` exists
+`remux` reuses tmux and SSH. It does not require a daemon, a cloud service, or a new workflow.
 
-If you run long-lived tmux sessions across a laptop, a homelab box, a remote dev host, and maybe a build machine or two, the failure mode is simple:
+## Why
 
-- you remember *something* is still running
-- you do **not** remember which host/session/pane it lives in
-- `tmux ls` and ad hoc SSHing turn into a scavenger hunt
+If you keep long-lived shells, builds, agents, or debug sessions running in tmux across multiple hosts, it becomes easy to lose track of which pane is doing what.
 
-`remux` gives you a cross-host index over live tmux panes so you can inspect the right shell, capture output, and jump back in quickly.
+`remux` gives you a cross-host view of live tmux panes so you can inspect the right one, capture output, and attach without manually hopping through each machine.
 
-## What `remux` is
+## Scope
 
-- a cross-host finder for live tmux panes
-- a factual index over command, cwd, repo, activity, and watch state
-- a fast path to inspect, capture, or attach read-only/read-write
-- a thin layer over tmux + SSH, not a replacement for them
+`remux` is:
 
-## What `remux` is not
+- a cross-host index over live tmux panes
+- a way to inspect command, cwd, repo, activity, and watch state
+- a fast path to capture output or attach read-only/read-write
 
-- not a tmux replacement
-- not a session-layout tool like tmuxinator/tmuxp
-- not a daemon or cloud sync service
-- not an agent orchestrator
-- not an AI scoring/summarization layer
+`remux` is not:
+
+- a tmux replacement
+- a session-layout tool like tmuxinator or tmuxp
+- a daemon or cloud sync service
+- an agent orchestrator
+- an AI layer
 
 ## Quick start
 
