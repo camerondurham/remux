@@ -1,12 +1,41 @@
 # remux
 
-`remux` is a local-first CLI/TUI for finding, inspecting, and attaching to tmux panes across local and SSH hosts.
+**Find the tmux pane you forgot about — even if it's on another machine.**
+
+`remux` is a local-first CLI/TUI for finding, inspecting, and reattaching to tmux panes across local and SSH hosts.
 
 ![remux TUI demo: default browse view, filter entry, selection moving, and the help overlay](docs/assets/remux-tui-demo.gif)
 
-![remux TUI: single-line summary, live pane table (NAME/AGE/CMD/PREVIEW) with colored state glyphs and dim window-name/pane-title chips next to each id, plus a right-hand context rail showing the selected pane](docs/assets/remux-tui.png)
+![remux TUI: single-line summary, live pane table (NAME/AGE/CMD/PREVIEW) with colored state glyphs, and a right-hand context rail showing the selected pane](docs/assets/remux-tui.png)
 
-`remux` is for engineers who keep shells, builds, coding agents, bots, and debug sessions alive in tmux across multiple machines and want one factual place to find them again.
+`remux` is built for engineers who already live in tmux and SSH, keep long-lived shells/builds/agents/debug sessions running across machines, and want one factual place to find them again.
+
+It does **not** ask you to adopt a daemon, a cloud control plane, or a new terminal workspace. It reuses the tmux sessions and SSH aliases you already have.
+
+## Why `remux` exists
+
+If you run long-lived tmux sessions across a laptop, a homelab box, a remote dev host, and maybe a build machine or two, the failure mode is simple:
+
+- you remember *something* is still running
+- you do **not** remember which host/session/pane it lives in
+- `tmux ls` and ad hoc SSHing turn into a scavenger hunt
+
+`remux` gives you a cross-host index over live tmux panes so you can inspect the right shell, capture output, and jump back in quickly.
+
+## What `remux` is
+
+- a cross-host finder for live tmux panes
+- a factual index over command, cwd, repo, activity, and watch state
+- a fast path to inspect, capture, or attach read-only/read-write
+- a thin layer over tmux + SSH, not a replacement for them
+
+## What `remux` is not
+
+- not a tmux replacement
+- not a session-layout tool like tmuxinator/tmuxp
+- not a daemon or cloud sync service
+- not an agent orchestrator
+- not an AI scoring/summarization layer
 
 ## Quick start
 
@@ -113,19 +142,12 @@ remux attach --readonly 'pi/work:0.1'
 remux attach 'pi/work:0.1'
 ```
 
-## What it does
+## Core capabilities
 
-- indexes tmux panes across local and SSH hosts
-- shows command, cwd, repo, activity, and match state
-- lets you inspect output, capture panes, and jump in read-only or read-write
-- gives friendly watch IDs for important panes you revisit often
-
-## What it does not do
-
-- no daemon
-- no cloud sync
-- no agent orchestration
-- no AI summaries or scoring
+- index tmux panes across local and SSH hosts
+- show command, cwd, repo, activity, and match state
+- inspect output, capture panes, and jump in read-only or read-write
+- assign friendly watch IDs to panes you revisit often
 
 ## Core commands
 
@@ -162,12 +184,6 @@ remux a [--readonly] <watch-id-or-pane-target>
 - fzf only for `remux pick`
 - git only if repo metadata is configured
 - Rust only when building from source
-
-## Why
-
-When you run long-lived tmux sessions across local and remote machines, it gets annoyingly easy to lose track of what is running where.
-
-`remux` gives you one factual view over those panes without asking you to adopt a daemon, cloud service, or new orchestration model. It reuses tmux and SSH.
 
 ## Configuration notes
 
