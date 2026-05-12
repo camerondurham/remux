@@ -47,12 +47,7 @@ fn run() -> Result<()> {
         force,
     } = &cli.command
     {
-        return onboard::run(
-            config_path.as_deref(),
-            hosts.as_deref(),
-            *write,
-            *force,
-        );
+        return onboard::run(config_path.as_deref(), hosts.as_deref(), *write, *force);
     }
 
     let config = config::Config::load(cli.config.as_deref())?;

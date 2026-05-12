@@ -22,7 +22,13 @@ pub fn run(
         return Ok(());
     }
 
-    print_preview(&config_path, &rendered, &discovered, &selection.hosts, selection.mode);
+    print_preview(
+        &config_path,
+        &rendered,
+        &discovered,
+        &selection.hosts,
+        selection.mode,
+    );
     Ok(())
 }
 
@@ -234,8 +240,7 @@ fn write_config(path: &Path, rendered: &str, force: bool) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("config path {} has no parent directory", path.display()))?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create {}", parent.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
     fs::write(path, rendered).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }
@@ -284,8 +289,8 @@ fn discover_ssh_aliases() -> Result<Vec<String>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let raw = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    let raw =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
     Ok(parse_ssh_aliases(&raw))
 }
 
@@ -315,7 +320,7 @@ fn parse_ssh_aliases(raw: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_ssh_aliases, parse_hosts_arg, render_config, sanitize_id};
+    use super::{parse_hosts_arg, parse_ssh_aliases, render_config, sanitize_id};
 
     #[test]
     fn parses_host_aliases_and_ignores_wildcards() {
