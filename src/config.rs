@@ -403,6 +403,13 @@ fn default_config_path() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".config/remux/config.yaml"))
 }
 
+pub fn resolve_config_path(path: Option<&Path>) -> Result<PathBuf> {
+    match path {
+        Some(path) => Ok(expand_home_path(path)),
+        None => default_config_path(),
+    }
+}
+
 fn default_active_after() -> Duration {
     Duration::from_secs(5 * 60)
 }

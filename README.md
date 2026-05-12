@@ -35,7 +35,22 @@ cp examples/config.yaml ~/.config/remux/config.yaml
 
 ### Configure
 
-Edit `~/.config/remux/config.yaml`:
+Generate a starter config:
+
+```bash
+remux onboard
+remux onboard --write
+```
+
+If you want to limit the generated SSH hosts:
+
+```bash
+remux onboard --hosts pi,prod --write
+```
+
+`remux onboard` scans `~/.ssh/config`, generates a minimal `~/.config/remux/config.yaml`, and leaves a commented watch example you can fill in later.
+
+Or edit `~/.config/remux/config.yaml` directly:
 
 ```yaml
 poll:
@@ -68,11 +83,17 @@ watches:
 ### Use it
 
 ```bash
+remux onboard
 remux doctor
 remux list
-remux inspect pi-agent
-remux attach --readonly pi-agent
 remux tui
+```
+
+Once you know a pane target or add a watch ID, you can inspect or attach directly:
+
+```bash
+remux inspect 'pi/work:0.1'
+remux attach --readonly 'pi/work:0.1'
 ```
 
 Pane targets look like:
@@ -107,6 +128,7 @@ remux attach 'pi/work:0.1'
 ## Core commands
 
 ```bash
+remux onboard [--hosts HOST[,HOST...]] [--write] [--force]
 remux hosts
 remux doctor [--json]
 remux list [--json] [--group panes|sessions]
@@ -148,6 +170,7 @@ When you run long-lived tmux sessions across local and remote machines, it gets 
 ## Configuration notes
 
 - hosts can be local or SSH
+- `remux onboard` reuses your SSH aliases by default, so `ssh pi` can become `target: pi`
 - watches give important panes stable IDs
 - match fields are exact and combined with AND semantics
 - default config path is `~/.config/remux/config.yaml`

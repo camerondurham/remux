@@ -542,11 +542,88 @@ fn ssh_keepalive_options_are_present() {
     assert!(stdout(&out).contains("fast"));
 }
 
+#[test]
+fn onboard_previews_generated_config_from_ssh_aliases() {
+    let env = OnboardEnv::new(
+        r#"
+Host pi prod
+  User cam
+
+Host *
+  ServerAliveInterval 60
+"#,
+    );
+
+    let out = env.remux(["onboard"]);
+    assert_success(&out);
+    let stdout = stdout(&out);
+    assert!(stdout.contains("Using selected SSH aliases"));
+    assert!(stdout.contains("- pi"));
+    assert!(stdout.contains("- prod"));
+    assert!(stdout.contains("target: pi"));
+    assert!(stdout.contains("target: prod"));
+    assert!(stdout.contains("remux onboard --write"));
+}
+
+#[test]
+fn onboard_write_creates_config_for_selected_hosts() {
+    let env = OnboardEnv::new(
+        r#"
+Host pi prod
+  User cam
+"#,
+    );
+
+    let out = env.remux(["onboard", "--hosts", "prod", "--write"]);
+    assert_success(&out);
+    let written = fs::read_to_string(env.config_path()).unwrap();
+    assert!(written.contains("- id: local"));
+    assert!(written.contains("- id: prod"));
+    assert!(written.contains("target: prod"));
+    assert!(!written.contains("target: pi"));
+}
+
 struct TestEnv {
     root: PathBuf,
     config: PathBuf,
     cache: PathBuf,
     path: OsString,
+}
+
+struct OnboardEnv {
+    root: PathBuf,
+    home: PathBuf,
+    config: PathBuf,
+}
+
+impl OnboardEnv {
+    fn new(ssh_config: &str) -> Self {
+        let root = unique_temp_dir();
+        let home = root.join("home");
+        let ssh_dir = home.join(".ssh");
+        fs::create_dir_all(&ssh_dir).unwrap();
+        fs::write(ssh_dir.join("config"), ssh_config).unwrap();
+        let config = home.join(".config/remux/config.yaml");
+        Self { root, home, config }
+    }
+
+    fn config_path(&self) -> &PathBuf {
+        &self.config
+    }
+
+    fn remux<const N: usize>(&self, args: [&str; N]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_remux"))
+            .args(args)
+            .env("HOME", &self.home)
+            .output()
+            .unwrap()
+    }
+}
+
+impl Drop for OnboardEnv {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
 }
 
 impl TestEnv {
