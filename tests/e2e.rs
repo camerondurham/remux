@@ -207,6 +207,25 @@ fn lifecycle_new_and_kill_route_to_tmux_commands() {
     let kill_session = env.remux(["--config", env.config_path(), "kill", "pi/scratch", "--yes"]);
     assert_success(&kill_session);
 
+    let send_pane = env.remux([
+        "--config",
+        env.config_path(),
+        "send-keys",
+        "pi/work:0.1",
+        "cargo test",
+    ]);
+    assert_success(&send_pane);
+
+    let send_session = env.remux([
+        "--config",
+        env.config_path(),
+        "send-keys",
+        "pi/work",
+        "clear",
+        "--no-enter",
+    ]);
+    assert_success(&send_session);
+
     let missing_host = env.remux([
         "--config",
         env.config_path(),
@@ -216,6 +235,21 @@ fn lifecycle_new_and_kill_route_to_tmux_commands() {
     ]);
     assert_code(&missing_host, 3);
     assert!(stderr(&missing_host).contains("could not be resolved"));
+}
+
+#[test]
+fn send_keys_submits_text_with_symbolic_enter() {
+    let env = TestEnv::new();
+
+    let send = env.remux([
+        "--config",
+        env.config_path(),
+        "send-keys",
+        "codex-agent",
+        "submit-regression",
+    ]);
+
+    assert_success(&send);
 }
 
 #[test]
@@ -1035,6 +1069,18 @@ if [[ "$remote" == "tmux kill-pane -t 'work:0.1'" ]]; then
 fi
 
 if [[ "$remote" == "tmux kill-session -t 'scratch'" ]]; then
+  exit 0
+fi
+
+if [[ "$remote" == "tmux send-keys -t 'work:0.1' -l 'cargo test' && sleep 0.05 && tmux send-keys -t 'work:0.1' Enter" ]]; then
+  exit 0
+fi
+
+if [[ "$remote" == "tmux send-keys -t 'work:0.1' -l 'submit-regression' && sleep 0.05 && tmux send-keys -t 'work:0.1' Enter" ]]; then
+  exit 0
+fi
+
+if [[ "$remote" == "tmux send-keys -t 'work' -l 'clear'" ]]; then
   exit 0
 fi
 

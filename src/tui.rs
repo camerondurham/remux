@@ -147,6 +147,7 @@ enum InputPromptKind {
     RenameSession { host: String, current: String },
     NewSession,
     NewPane,
+    SendKeys { target: String },
 }
 
 #[derive(Clone)]
@@ -720,6 +721,10 @@ fn handle_key(
             app.status = "new pane: enter <host>/<session>".to_string();
             Ok(false)
         }
+        KeyCode::Char('t') => {
+            begin_send_keys_prompt(config, app);
+            Ok(false)
+        }
         KeyCode::Enter => {
             attach_selected(config, app, terminal, true)?;
             Ok(false)
@@ -787,6 +792,34 @@ fn begin_rename_prompt(app: &mut App) {
         value: row.tmux.session.clone(),
     });
     app.status = "rename session: edit name and press enter".to_string();
+}
+
+fn begin_send_keys_prompt(config: &Config, app: &mut App) {
+    let Some(row) = app.selected_row() else {
+        app.status = "no selected row".to_string();
+        return;
+    };
+    let target = if let Some(watch_id) = &row.watch_id {
+        match snapshot::target_for_action(config, watch_id, "send keys") {
+            Ok(_) => watch_id.clone(),
+            Err(err) => {
+                app.status = format!("{err:#}");
+                return;
+            }
+        }
+    } else if let Some(raw_target) = &row.raw_target {
+        raw_target.clone()
+    } else {
+        app.status = "selected row has no live pane".to_string();
+        return;
+    };
+    app.input_prompt = Some(InputPrompt {
+        kind: InputPromptKind::SendKeys {
+            target: target.clone(),
+        },
+        value: String::new(),
+    });
+    app.status = format!("send keys to {target}: type command and press enter");
 }
 
 fn handle_input_prompt_key(
@@ -889,6 +922,20 @@ fn execute_input_prompt(
                 Ok(()) => {
                     app.status = format!("spawned pane in {host_id}/{session_name}");
                     spawn_refresh(config, Some(host_id.to_string()), tx, app)?;
+                }
+                Err(err) => app.status = format!("{err:#}"),
+            }
+        }
+        InputPromptKind::SendKeys { target } => {
+            let keys = prompt.value;
+            if keys.is_empty() {
+                app.status = "send keys cancelled: empty input".to_string();
+                return Ok(());
+            }
+            match lifecycle::send_keys(config, &target, &keys, true, false) {
+                Ok(()) => {
+                    app.status = format!("sent keys to {target}");
+                    spawn_refresh(config, scoped_host, tx, app)?;
                 }
                 Err(err) => app.status = format!("{err:#}"),
             }
@@ -1224,6 +1271,7 @@ fn draw_live_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                         .rfind(|l| !l.trim().is_empty())
                         .map(|l| l.to_string())
                 })
+                .or_else(|| row_issue_summary(session))
                 .unwrap_or_else(|| "(no capture)".to_string());
             let preview_cell = Cell::from(preview_text).style(muted_style());
 
@@ -1280,6 +1328,7 @@ fn draw_inspector(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             Line::from("[e] rename selected session"),
             Line::from("[n] create session (<host>/<session>)"),
             Line::from("[p] spawn pane (<host>/<session>)"),
+            Line::from("[t] send keys to selected pane"),
             Line::from("[d] toggle detail pane"),
             Line::from("[?] toggle this help"),
             Line::from("[q] quit"),
@@ -1365,7 +1414,7 @@ fn draw_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     };
     let mut spans = vec![
         Span::raw(
-            "[↑↓] move  [Enter] attach ro  [a] jump rw  [i] refresh  [/] filter  [d] details  [?] help  [x] kill  [q] quit   ",
+            "[↑↓] move  [Enter] attach ro  [a] jump rw  [t] send keys  [i] refresh  [/] filter  [d] details  [?] help  [x] kill  [q] quit   ",
         ),
         Span::styled(mode, Style::default().fg(Color::Cyan)),
         Span::raw("  "),
@@ -1397,7 +1446,7 @@ fn draw_context_rail(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         ))
     } else {
         Line::from(Span::styled(
-            "[i] refresh · [Enter] attach ro · [a] jump rw · [c] copy",
+            "[i] refresh · [Enter] attach ro · [a] jump rw · [t] send keys · [c] capture",
             muted_style(),
         ))
     };
@@ -1462,6 +1511,16 @@ fn draw_context_rail(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             Span::styled(canonical_state(selected), canonical_state_style(selected)),
         ]),
         Line::from(vec![
+            Span::styled("match ", label_style()),
+            Span::styled(
+                selected.match_status.as_str(),
+                match_style(selected.match_status),
+            ),
+            Span::raw("  "),
+            Span::styled("expected ", label_style()),
+            Span::raw(selected.target.clone()),
+        ]),
+        Line::from(vec![
             Span::styled("cmd ", label_style()),
             Span::raw(
                 selected
@@ -1473,6 +1532,10 @@ fn draw_context_rail(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         ]),
         Line::from(""),
     ];
+    lines.extend(context_project_lines(selected));
+    if selected.repo.is_some() {
+        lines.push(Line::from(""));
+    }
     lines.extend(output_lines);
     lines.push(Line::from(""));
     lines.push(action_line);
@@ -1543,6 +1606,10 @@ fn input_prompt_line(prompt: &InputPrompt) -> Line<'static> {
         InputPromptKind::NewPane => (
             "new pane ".to_string(),
             "enter <host>/<session> (Esc to cancel)",
+        ),
+        InputPromptKind::SendKeys { target } => (
+            format!("send {target} "),
+            "literal text; Enter sends text plus Enter (Esc to cancel)",
         ),
     };
     Line::from(vec![
@@ -1705,6 +1772,13 @@ fn detail_preview_lines(
 
 fn detail_status_lines(row: &SessionSnapshot) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
+
+    if let Some(summary) = row_issue_summary(row) {
+        lines.push(Line::from(vec![
+            Span::styled("Issue: ", Style::default().fg(Color::Red)),
+            Span::raw(summary),
+        ]));
+    }
 
     if let Some(repo) = &row.repo {
         if !repo.changed_files.is_empty() {
@@ -1918,6 +1992,91 @@ fn capture_hint(row: &SessionSnapshot) -> String {
         MatchStatus::Unreachable => "unavailable, host unreachable".to_string(),
         MatchStatus::Unknown => "unavailable".to_string(),
     }
+}
+
+fn context_project_lines(row: &SessionSnapshot) -> Vec<Line<'static>> {
+    let Some(repo) = &row.repo else {
+        return vec![Line::from(Span::styled(
+            "no project metadata",
+            muted_style(),
+        ))];
+    };
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("project ", label_style()),
+            Span::raw(short_path(&repo.path)),
+        ]),
+        Line::from(vec![
+            Span::styled("branch ", label_style()),
+            Span::raw(repo.branch.as_deref().unwrap_or("-").to_string()),
+            Span::raw("  "),
+            Span::styled("dirty ", label_style()),
+            Span::styled(
+                repo.dirty_count
+                    .map(|count| count.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                dirty_style(
+                    &repo
+                        .dirty_count
+                        .map(|count| count.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                ),
+            ),
+        ]),
+    ];
+
+    if !repo.changed_files.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "changed",
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        for file in repo.changed_files.iter().take(4) {
+            lines.push(Line::from(short_message(file)));
+        }
+        if repo.changed_files.len() > 4 {
+            lines.push(Line::from(Span::styled("...", muted_style())));
+        }
+    }
+    if let Some(error) = &repo.error {
+        lines.push(Line::from(vec![
+            Span::styled("repo error ", Style::default().fg(Color::Red)),
+            Span::raw(short_message(error)),
+        ]));
+    }
+    lines
+}
+
+fn row_issue_summary(row: &SessionSnapshot) -> Option<String> {
+    match row.match_status {
+        MatchStatus::Missing => Some(format!("missing configured target {}", row.target)),
+        MatchStatus::Ambiguous => Some(format!(
+            "ambiguous watch: {} candidates",
+            row.candidate_targets.len()
+        )),
+        MatchStatus::Shadowed => Some(format!(
+            "shadowed by {}",
+            row.shadowed_by.as_deref().unwrap_or("another watch")
+        )),
+        MatchStatus::Unreachable => row
+            .errors
+            .first()
+            .map(|error| short_message(&error.message))
+            .or_else(|| Some("host unreachable".to_string())),
+        MatchStatus::Unknown => row
+            .errors
+            .first()
+            .map(|error| short_message(&error.message))
+            .or_else(|| Some("unknown state".to_string())),
+        MatchStatus::Matched | MatchStatus::Orphan => None,
+    }
+}
+
+fn short_path(path: &str) -> String {
+    path.strip_prefix("/home/nixos/")
+        .or_else(|| path.strip_prefix("/home/cam/"))
+        .unwrap_or(path)
+        .to_string()
 }
 
 fn filter_label(app: &App) -> String {

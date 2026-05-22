@@ -118,6 +118,11 @@ fn run() -> Result<()> {
             verbose,
         ),
         Command::Kill { target, yes } => lifecycle::kill(&config, &target, yes, verbose),
+        Command::SendKeys {
+            target,
+            keys,
+            no_enter,
+        } => lifecycle::send_keys(&config, &target, &keys, !no_enter, verbose),
     }
 }
 

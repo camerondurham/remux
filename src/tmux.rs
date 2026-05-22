@@ -416,6 +416,18 @@ pub fn split_window_command(session: &str, socket: Option<&str>) -> String {
     )
 }
 
+pub fn send_keys_command(target: &str, keys: &str, enter: bool, socket: Option<&str>) -> String {
+    let base = tmux_command(socket);
+    let target = shell_quote(target);
+    let mut command = format!("{base} send-keys -t {target} -l {}", shell_quote(keys));
+    if enter {
+        command.push_str(&format!(
+            " && sleep 0.05 && {base} send-keys -t {target} Enter"
+        ));
+    }
+    command
+}
+
 pub fn inventory_command(socket: Option<&str>) -> String {
     format!(
         "{} list-panes -a -F {INVENTORY_FORMAT}",
@@ -570,6 +582,14 @@ mod tests {
         assert_eq!(
             split_window_command("work", None),
             "tmux split-window -d -t 'work'"
+        );
+        assert_eq!(
+            send_keys_command("work:0.1", "cargo test", true, None),
+            "tmux send-keys -t 'work:0.1' -l 'cargo test' && sleep 0.05 && tmux send-keys -t 'work:0.1' Enter"
+        );
+        assert_eq!(
+            send_keys_command("work", "q", false, Some("/tmp/tmux.sock")),
+            "tmux -S '/tmp/tmux.sock' send-keys -t 'work' -l 'q'"
         );
     }
 
