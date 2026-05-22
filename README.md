@@ -153,6 +153,7 @@ remux inspect 'pi/work:0.1'
 remux capture 'pi/work:0.1'
 remux attach --readonly 'pi/work:0.1'
 remux attach 'pi/work:0.1'
+remux send-keys 'pi/work:0.1' 'cargo test'
 ```
 
 ## Core capabilities
@@ -177,6 +178,7 @@ remux inspect <watch-id-or-pane-target> [--json] [--color]
 remux capture <watch-id-or-pane-target> [--lines N] [--color]
 remux attach --readonly <watch-id-or-pane-target>
 remux attach <watch-id-or-pane-target>
+remux send-keys <watch-id-or-pane-target> <keys> [--no-enter]
 remux pick [--host HOST] [--filter TEXT] [--sessions] [--color] [--no-fzf]
 remux tui [--host HOST] [--filter TEXT]
 remux new <host> <session-name> [--cwd PATH] [--window-name NAME]

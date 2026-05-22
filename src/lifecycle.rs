@@ -11,6 +11,11 @@ enum KillTarget {
     Pane(PaneTarget),
 }
 
+enum SendTarget {
+    Session { host: String, session: String },
+    Pane(PaneTarget),
+}
+
 pub fn new_session(
     config: &Config,
     host_id: &str,
@@ -47,6 +52,18 @@ pub fn kill(config: &Config, target: &str, yes: bool, verbose: bool) -> Result<(
     let target = resolve_kill_target(config, target)?;
     confirm_kill(&target, yes)?;
     let (host_id, command) = target.command(config)?;
+    run_lifecycle_command(config, host_id, &command, verbose)
+}
+
+pub fn send_keys(
+    config: &Config,
+    target: &str,
+    keys: &str,
+    enter: bool,
+    verbose: bool,
+) -> Result<()> {
+    let target = resolve_send_target(config, target)?;
+    let (host_id, command) = target.command(config, keys, enter)?;
     run_lifecycle_command(config, host_id, &command, verbose)
 }
 
@@ -128,6 +145,35 @@ fn resolve_kill_target(config: &Config, target: &str) -> Result<KillTarget> {
     if let Some((host, session)) = parse_session_target(target) {
         let session = resolve_live_session(config, host, session)?;
         return Ok(session);
+    }
+
+    Err(ExitFailure::new(
+        3,
+        format!("target `{target}` was not found or is ambiguous"),
+    )
+    .into())
+}
+
+fn resolve_send_target(config: &Config, target: &str) -> Result<SendTarget> {
+    if config.find_watch(target).is_some() {
+        return snapshot::target_for_action(config, target, "send keys")
+            .map(SendTarget::Pane)
+            .map_err(|err| {
+                ExitFailure::new(3, format!("cannot send keys to watch `{target}`: {err:#}")).into()
+            });
+    }
+
+    if let Ok(pane) = PaneTarget::parse(target) {
+        let resolved = resolve_live_pane(config, pane)?;
+        return Ok(SendTarget::Pane(resolved));
+    }
+
+    if let Some((host, session)) = parse_session_target(target) {
+        resolve_live_session(config, host, session)?;
+        return Ok(SendTarget::Session {
+            host: host.to_string(),
+            session: session.to_string(),
+        });
     }
 
     Err(ExitFailure::new(
@@ -251,6 +297,32 @@ impl KillTarget {
         match self {
             KillTarget::Session { host, session } => format!("{host}/{session}"),
             KillTarget::Pane(target) => target.to_string(),
+        }
+    }
+}
+
+impl SendTarget {
+    fn command(&self, config: &Config, keys: &str, enter: bool) -> Result<(&str, String)> {
+        match self {
+            SendTarget::Session { host, session } => {
+                let host_config = config.host(host)?;
+                Ok((
+                    host,
+                    tmux::send_keys_command(session, keys, enter, host_config.tmux_socket()),
+                ))
+            }
+            SendTarget::Pane(target) => {
+                let host_config = config.host(&target.host)?;
+                Ok((
+                    &target.host,
+                    tmux::send_keys_command(
+                        &target.tmux_target(),
+                        keys,
+                        enter,
+                        host_config.tmux_socket(),
+                    ),
+                ))
+            }
         }
     }
 }

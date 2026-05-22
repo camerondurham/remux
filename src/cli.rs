@@ -149,6 +149,16 @@ pub enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Send literal keys to a tmux session or pane.
+    SendKeys {
+        /// Watch id, <host>/<session>, or <host>/<session>:<window>.<pane>.
+        target: String,
+        /// Literal text to send.
+        keys: String,
+        /// Do not press Enter after the literal text.
+        #[arg(long)]
+        no_enter: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
