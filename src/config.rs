@@ -10,6 +10,8 @@ pub struct Config {
     #[serde(default)]
     pub poll: PollConfig,
     #[serde(default)]
+    pub session_templates: SessionTemplatesConfig,
+    #[serde(default)]
     pub hosts: Vec<HostConfig>,
     #[serde(default)]
     pub watches: Vec<WatchConfig>,
@@ -56,6 +58,19 @@ pub struct PollConfig {
         deserialize_with = "deserialize_duration"
     )]
     pub auto_refresh_interval: Duration,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SessionTemplatesConfig {
+    #[serde(default)]
+    pub presets: Vec<SessionTemplatePresetConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionTemplatePresetConfig {
+    pub id: String,
+    pub label: String,
+    pub prefix: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -235,6 +250,7 @@ impl Config {
         {
             bail!("poll.auto_refresh_interval must be 0s (disabled) or at least 1s");
         }
+        validate_session_templates(&self.session_templates)?;
 
         let mut host_ids = HashSet::new();
         for host in &self.hosts {
@@ -446,6 +462,35 @@ fn default_auto_refresh_interval() -> Duration {
     Duration::from_secs(15)
 }
 
+pub const BUILTIN_SESSION_TEMPLATE_IDS: &[&str] = &["date", "work", "fix", "spike"];
+
+fn validate_session_templates(config: &SessionTemplatesConfig) -> Result<()> {
+    let mut ids = HashSet::new();
+    for preset in &config.presets {
+        let id = preset.id.trim();
+        if id.is_empty() {
+            bail!("session template preset id must not be empty");
+        }
+        if BUILTIN_SESSION_TEMPLATE_IDS.contains(&id) {
+            bail!("session template preset `{id}` conflicts with a built-in preset");
+        }
+        if !ids.insert(id) {
+            bail!("duplicate session template preset id `{id}`");
+        }
+        if preset.label.trim().is_empty() {
+            bail!("session template preset `{id}` label must not be empty");
+        }
+        let prefix = preset.prefix.trim();
+        if prefix.is_empty() {
+            bail!("session template preset `{id}` prefix must not be empty");
+        }
+        if prefix.contains('/') || prefix.contains(':') {
+            bail!("session template preset `{id}` prefix must not contain `/` or `:`");
+        }
+    }
+    Ok(())
+}
+
 fn validate_watch<'a>(
     seen_ids: &mut HashSet<&'a str>,
     host_ids: &HashSet<&str>,
@@ -554,6 +599,11 @@ hosts:
     tmux_socket: ~/.work-os/tmux.sock
     ssh:
       target: cam@192.168.0.197
+session_templates:
+  presets:
+    - id: client
+      label: Client Work
+      prefix: client
 sessions:
   - id: agent
     host: pi
@@ -586,11 +636,104 @@ watches:
             config.host("pi").unwrap().ssh().unwrap().target().unwrap(),
             "cam@192.168.0.197"
         );
+        assert_eq!(config.session_templates.presets.len(), 1);
+        assert_eq!(config.session_templates.presets[0].prefix, "client");
         assert_eq!(
             config.watch("agent").unwrap().watch.agent_hint.as_deref(),
             Some("codex")
         );
         assert_eq!(config.watches_for_host("pi").len(), 2);
+    }
+
+    #[test]
+    fn rejects_duplicate_session_template_presets() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+session_templates:
+  presets:
+    - id: client
+      label: Client
+      prefix: client
+    - id: client
+      label: Other Client
+      prefix: other
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate session template preset id `client`")
+        );
+    }
+
+    #[test]
+    fn rejects_session_template_presets_conflicting_with_builtins() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+session_templates:
+  presets:
+    - id: date
+      label: Date
+      prefix: custom-date
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("conflicts with a built-in preset")
+        );
+    }
+
+    #[test]
+    fn rejects_empty_session_template_preset_fields() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+session_templates:
+  presets:
+    - id: client
+      label: " "
+      prefix: client
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("label must not be empty")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_session_template_prefix_chars() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+session_templates:
+  presets:
+    - id: client
+      label: Client
+      prefix: client/work
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("prefix must not contain `/` or `:`")
+        );
     }
 
     #[test]

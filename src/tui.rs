@@ -119,6 +119,7 @@ struct App {
     inspected_detail: Option<PaneDetail>,
     kill_prompt: Option<KillPrompt>,
     input_prompt: Option<InputPrompt>,
+    template_prompt: Option<TemplatePrompt>,
     sort_mode: SortMode,
     show_context: bool,
     inspect_mode: bool,
@@ -140,6 +141,39 @@ struct KillPrompt {
 struct InputPrompt {
     kind: InputPromptKind,
     value: String,
+}
+
+struct TemplatePrompt {
+    step: TemplatePromptStep,
+}
+
+enum TemplatePromptStep {
+    Host {
+        value: String,
+    },
+    Preset {
+        host: String,
+        presets: Vec<SessionTemplatePreset>,
+        selected: usize,
+    },
+    Name {
+        host: String,
+        preset: SessionTemplatePreset,
+        value: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionTemplatePreset {
+    id: String,
+    label: String,
+    prefix: SessionTemplatePrefix,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SessionTemplatePrefix {
+    Date,
+    Literal(String),
 }
 
 #[derive(Clone)]
@@ -187,6 +221,7 @@ impl App {
             inspected_detail: None,
             kill_prompt: None,
             input_prompt: None,
+            template_prompt: None,
             sort_mode: SortMode::Attention,
             show_context: true,
             inspect_mode: false,
@@ -635,6 +670,11 @@ fn handle_key(
         return Ok(false);
     }
 
+    if app.template_prompt.is_some() {
+        handle_template_prompt_key(key, config, host, tx, app)?;
+        return Ok(false);
+    }
+
     if app.editing_filter {
         match key.code {
             KeyCode::Esc | KeyCode::Enter => app.editing_filter = false,
@@ -722,6 +762,10 @@ fn handle_key(
             Ok(false)
         }
         KeyCode::Char('t') => {
+            begin_template_prompt(host.as_deref(), app);
+            Ok(false)
+        }
+        KeyCode::Char('z') => {
             begin_send_keys_prompt(config, app);
             Ok(false)
         }
@@ -794,6 +838,17 @@ fn begin_rename_prompt(app: &mut App) {
     app.status = "rename session: edit name and press enter".to_string();
 }
 
+fn begin_template_prompt(scoped_host: Option<&str>, app: &mut App) {
+    let host = scoped_host
+        .map(str::to_string)
+        .or_else(|| app.selected_row().map(|row| row.host.clone()))
+        .unwrap_or_default();
+    app.template_prompt = Some(TemplatePrompt {
+        step: TemplatePromptStep::Host { value: host },
+    });
+    app.status = "new templated session: enter host".to_string();
+}
+
 fn begin_send_keys_prompt(config: &Config, app: &mut App) {
     let Some(row) = app.selected_row() else {
         app.status = "no selected row".to_string();
@@ -848,6 +903,195 @@ fn handle_input_prompt_key(
             prompt.value.push(ch);
         }
         _ => {}
+    }
+    Ok(())
+}
+
+fn handle_template_prompt_key(
+    key: KeyEvent,
+    config: &Config,
+    scoped_host: Option<String>,
+    tx: mpsc::Sender<RefreshMessage>,
+    app: &mut App,
+) -> Result<()> {
+    let Some(prompt) = app.template_prompt.take() else {
+        return Ok(());
+    };
+
+    match prompt.step {
+        TemplatePromptStep::Host { mut value } => match key.code {
+            KeyCode::Esc => {
+                app.status = "action cancelled".to_string();
+            }
+            KeyCode::Backspace => {
+                value.pop();
+                app.template_prompt = Some(TemplatePrompt {
+                    step: TemplatePromptStep::Host { value },
+                });
+            }
+            KeyCode::Enter => {
+                let host_id = value.trim().to_string();
+                if host_id.is_empty() {
+                    app.status = "template session expects a host".to_string();
+                    app.template_prompt = Some(TemplatePrompt {
+                        step: TemplatePromptStep::Host { value },
+                    });
+                    return Ok(());
+                }
+                if let Some(scope) = scoped_host.as_deref()
+                    && scope != host_id
+                {
+                    app.status = format!(
+                        "new session blocked in scoped view: expected host `{scope}`, got `{host_id}`"
+                    );
+                    app.template_prompt = Some(TemplatePrompt {
+                        step: TemplatePromptStep::Host { value },
+                    });
+                    return Ok(());
+                }
+                if let Err(err) = config.host(&host_id) {
+                    app.status = format!("{err:#}");
+                    app.template_prompt = Some(TemplatePrompt {
+                        step: TemplatePromptStep::Host { value },
+                    });
+                    return Ok(());
+                }
+                app.template_prompt = Some(TemplatePrompt {
+                    step: TemplatePromptStep::Preset {
+                        host: host_id.clone(),
+                        presets: session_template_presets(config),
+                        selected: 0,
+                    },
+                });
+                app.status = format!("new templated session on {host_id}: choose prefix");
+            }
+            KeyCode::Char(ch) => {
+                value.push(ch);
+                app.template_prompt = Some(TemplatePrompt {
+                    step: TemplatePromptStep::Host { value },
+                });
+            }
+            _ => {
+                app.template_prompt = Some(TemplatePrompt {
+                    step: TemplatePromptStep::Host { value },
+                });
+            }
+        },
+        TemplatePromptStep::Preset {
+            host,
+            presets,
+            mut selected,
+        } => match key.code {
+            KeyCode::Esc => {
+                app.status = "action cancelled".to_string();
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                selected = selected.saturating_sub(1);
+                app.template_prompt = Some(TemplatePrompt {
+                    step: TemplatePromptStep::Preset {
+                        host,
+                        presets,
+                        selected,
+                    },
+                });
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if selected + 1 < presets.len() {
+                    selected += 1;
+                }
+                app.template_prompt = Some(TemplatePrompt {
+                    step: TemplatePromptStep::Preset {
+                        host,
+                        presets,
+                        selected,
+                    },
+                });
+            }
+            KeyCode::Enter => {
+                let Some(preset) = presets.get(selected).cloned() else {
+                    app.status = "no session templates configured".to_string();
+                    return Ok(());
+                };
+                app.template_prompt = Some(TemplatePrompt {
+                    step: TemplatePromptStep::Name {
+                        host: host.clone(),
+                        preset: preset.clone(),
+                        value: String::new(),
+                    },
+                });
+                app.status = format!("new templated session on {host}: enter name");
+            }
+            _ => {
+                app.template_prompt = Some(TemplatePrompt {
+                    step: TemplatePromptStep::Preset {
+                        host,
+                        presets,
+                        selected,
+                    },
+                });
+            }
+        },
+        TemplatePromptStep::Name {
+            host,
+            preset,
+            mut value,
+        } => match key.code {
+            KeyCode::Esc => {
+                app.status = "action cancelled".to_string();
+            }
+            KeyCode::Backspace => {
+                value.pop();
+                app.template_prompt = Some(TemplatePrompt {
+                    step: TemplatePromptStep::Name {
+                        host,
+                        preset,
+                        value,
+                    },
+                });
+            }
+            KeyCode::Enter => {
+                let session_name = match templated_session_name(&preset, value.trim()) {
+                    Ok(session_name) => session_name,
+                    Err(err) => {
+                        app.status = format!("{err:#}");
+                        app.template_prompt = Some(TemplatePrompt {
+                            step: TemplatePromptStep::Name {
+                                host,
+                                preset,
+                                value,
+                            },
+                        });
+                        return Ok(());
+                    }
+                };
+                match lifecycle::new_session(config, &host, &session_name, None, None, false) {
+                    Ok(()) => {
+                        app.status = format!("created session {host}/{session_name}");
+                        spawn_refresh(config, Some(host), tx, app)?;
+                    }
+                    Err(err) => app.status = format!("{err:#}"),
+                }
+            }
+            KeyCode::Char(ch) => {
+                value.push(ch);
+                app.template_prompt = Some(TemplatePrompt {
+                    step: TemplatePromptStep::Name {
+                        host,
+                        preset,
+                        value,
+                    },
+                });
+            }
+            _ => {
+                app.template_prompt = Some(TemplatePrompt {
+                    step: TemplatePromptStep::Name {
+                        host,
+                        preset,
+                        value,
+                    },
+                });
+            }
+        },
     }
     Ok(())
 }
@@ -950,6 +1194,62 @@ fn parse_host_session(input: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((host, session))
+}
+
+fn session_template_presets(config: &Config) -> Vec<SessionTemplatePreset> {
+    let mut presets = vec![
+        SessionTemplatePreset {
+            id: "date".to_string(),
+            label: "Date".to_string(),
+            prefix: SessionTemplatePrefix::Date,
+        },
+        SessionTemplatePreset {
+            id: "work".to_string(),
+            label: "Work".to_string(),
+            prefix: SessionTemplatePrefix::Literal("work".to_string()),
+        },
+        SessionTemplatePreset {
+            id: "fix".to_string(),
+            label: "Fix".to_string(),
+            prefix: SessionTemplatePrefix::Literal("fix".to_string()),
+        },
+        SessionTemplatePreset {
+            id: "spike".to_string(),
+            label: "Spike".to_string(),
+            prefix: SessionTemplatePrefix::Literal("spike".to_string()),
+        },
+    ];
+    presets.extend(
+        config
+            .session_templates
+            .presets
+            .iter()
+            .map(|preset| SessionTemplatePreset {
+                id: preset.id.trim().to_string(),
+                label: preset.label.trim().to_string(),
+                prefix: SessionTemplatePrefix::Literal(preset.prefix.trim().to_string()),
+            }),
+    );
+    presets
+}
+
+fn templated_session_name(preset: &SessionTemplatePreset, suffix: &str) -> Result<String> {
+    let suffix = suffix.trim();
+    if suffix.is_empty() {
+        bail!("template session expects a name");
+    }
+    if suffix.contains('/') || suffix.contains(':') {
+        bail!("template session name must not contain `/` or `:`");
+    }
+    let prefix = match &preset.prefix {
+        SessionTemplatePrefix::Date => Utc::now().format("%Y-%m-%d").to_string(),
+        SessionTemplatePrefix::Literal(prefix) => prefix.clone(),
+    };
+    let session_name = format!("{prefix}-{suffix}");
+    if session_name.contains('/') || session_name.contains(':') {
+        bail!("template session name must not contain `/` or `:`");
+    }
+    Ok(session_name)
 }
 
 fn attach_selected(
@@ -1327,8 +1627,9 @@ fn draw_inspector(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             Line::from("[x] kill selected pane"),
             Line::from("[e] rename selected session"),
             Line::from("[n] create session (<host>/<session>)"),
+            Line::from("[t] create session from template"),
             Line::from("[p] spawn pane (<host>/<session>)"),
-            Line::from("[t] send keys to selected pane"),
+            Line::from("[z] send keys to selected pane"),
             Line::from("[d] toggle detail pane"),
             Line::from("[?] toggle this help"),
             Line::from("[q] quit"),
@@ -1404,6 +1705,10 @@ fn draw_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         frame.render_widget(Paragraph::new(input_prompt_line(prompt)), area);
         return;
     }
+    if let Some(prompt) = &app.template_prompt {
+        frame.render_widget(Paragraph::new(template_prompt_line(prompt)), area);
+        return;
+    }
 
     let mode = if app.editing_filter {
         "filter"
@@ -1414,7 +1719,7 @@ fn draw_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     };
     let mut spans = vec![
         Span::raw(
-            "[↑↓] move  [Enter] attach ro  [a] jump rw  [t] send keys  [i] refresh  [/] filter  [d] details  [?] help  [x] kill  [q] quit   ",
+            "[↑↓] move  [Enter] attach ro  [a] jump rw  [t] template  [z] send keys  [i] refresh  [/] filter  [d] details  [?] help  [x] kill  [q] quit   ",
         ),
         Span::styled(mode, Style::default().fg(Color::Cyan)),
         Span::raw("  "),
@@ -1446,7 +1751,7 @@ fn draw_context_rail(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         ))
     } else {
         Line::from(Span::styled(
-            "[i] refresh · [Enter] attach ro · [a] jump rw · [t] send keys · [c] capture",
+            "[i] refresh · [Enter] attach ro · [a] jump rw · [t] template · [z] send keys · [c] capture",
             muted_style(),
         ))
     };
@@ -1619,6 +1924,65 @@ fn input_prompt_line(prompt: &InputPrompt) -> Line<'static> {
         Span::raw(" | "),
         Span::styled(hint, muted_style()),
     ])
+}
+
+fn template_prompt_line(prompt: &TemplatePrompt) -> Line<'static> {
+    match &prompt.step {
+        TemplatePromptStep::Host { value } => Line::from(vec![
+            Span::styled("template host ", Style::default().fg(Color::Yellow)),
+            Span::raw(value.clone()),
+            Span::styled(" _", Style::default().fg(Color::LightCyan)),
+            Span::raw(" | "),
+            Span::styled("Enter chooses host (Esc to cancel)", muted_style()),
+        ]),
+        TemplatePromptStep::Preset {
+            host,
+            presets,
+            selected,
+        } => {
+            let selected_preset = presets
+                .get(*selected)
+                .map(template_preset_label)
+                .unwrap_or_else(|| "-".to_string());
+            Line::from(vec![
+                Span::styled(
+                    format!("template {host} "),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::raw(selected_preset),
+                Span::raw(" | "),
+                Span::styled(
+                    "[j/k] choose prefix, Enter selects (Esc to cancel)",
+                    muted_style(),
+                ),
+            ])
+        }
+        TemplatePromptStep::Name {
+            host,
+            preset,
+            value,
+        } => Line::from(vec![
+            Span::styled(
+                format!("template {host}/{}-", template_prefix_preview(preset)),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::raw(value.clone()),
+            Span::styled(" _", Style::default().fg(Color::LightCyan)),
+            Span::raw(" | "),
+            Span::styled("Enter creates session (Esc to cancel)", muted_style()),
+        ]),
+    }
+}
+
+fn template_preset_label(preset: &SessionTemplatePreset) -> String {
+    format!("{} ({})", preset.label, template_prefix_preview(preset))
+}
+
+fn template_prefix_preview(preset: &SessionTemplatePreset) -> String {
+    match &preset.prefix {
+        SessionTemplatePrefix::Date => Utc::now().format("%Y-%m-%d").to_string(),
+        SessionTemplatePrefix::Literal(prefix) => prefix.clone(),
+    }
 }
 
 fn detail_meta_lines(row: &SessionSnapshot) -> Vec<Line<'static>> {
@@ -2438,5 +2802,89 @@ mod tests {
     fn friendly_label_drops_window_name_matching_window_index() {
         let row = row_with_meta("zsh", Some("2"), Some("2"), None, Some("dev-dsk-cam"));
         assert_eq!(friendly_label_suffix(&row), None);
+    }
+
+    #[test]
+    fn built_in_session_template_presets_are_first() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+session_templates:
+  presets:
+    - id: client
+      label: Client
+      prefix: client
+"#,
+        )
+        .unwrap();
+        let presets = session_template_presets(&config);
+        let ids: Vec<&str> = presets.iter().map(|preset| preset.id.as_str()).collect();
+        assert_eq!(ids, vec!["date", "work", "fix", "spike", "client"]);
+    }
+
+    #[test]
+    fn templated_session_name_uses_literal_prefix() {
+        let preset = SessionTemplatePreset {
+            id: "client".to_string(),
+            label: "Client".to_string(),
+            prefix: SessionTemplatePrefix::Literal("client".to_string()),
+        };
+
+        assert_eq!(
+            templated_session_name(&preset, "api").unwrap(),
+            "client-api"
+        );
+    }
+
+    #[test]
+    fn templated_session_name_uses_utc_date_prefix() {
+        let preset = SessionTemplatePreset {
+            id: "date".to_string(),
+            label: "Date".to_string(),
+            prefix: SessionTemplatePrefix::Date,
+        };
+        let expected = Utc::now().format("%Y-%m-%d").to_string();
+
+        assert_eq!(
+            templated_session_name(&preset, "investigate").unwrap(),
+            format!("{expected}-investigate")
+        );
+    }
+
+    #[test]
+    fn templated_session_name_rejects_empty_suffix() {
+        let preset = SessionTemplatePreset {
+            id: "fix".to_string(),
+            label: "Fix".to_string(),
+            prefix: SessionTemplatePrefix::Literal("fix".to_string()),
+        };
+
+        assert!(
+            templated_session_name(&preset, " ")
+                .unwrap_err()
+                .to_string()
+                .contains("expects a name")
+        );
+    }
+
+    #[test]
+    fn templated_session_name_rejects_target_separators() {
+        let preset = SessionTemplatePreset {
+            id: "fix".to_string(),
+            label: "Fix".to_string(),
+            prefix: SessionTemplatePrefix::Literal("fix".to_string()),
+        };
+
+        assert!(
+            templated_session_name(&preset, "api/work")
+                .unwrap_err()
+                .to_string()
+                .contains("must not contain")
+        );
+        assert!(
+            templated_session_name(&preset, "api:0")
+                .unwrap_err()
+                .to_string()
+                .contains("must not contain")
+        );
     }
 }

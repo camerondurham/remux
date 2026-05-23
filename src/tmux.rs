@@ -12,6 +12,7 @@ use std::fmt;
 // into a tmux variable stays inside its own field instead of corrupting
 // the row layout.
 pub const INVENTORY_FIELD_SEP: char = '\x1f';
+const INVENTORY_FIELD_SEP_ESCAPED: &str = "\\037";
 pub const INVENTORY_FORMAT: &str = "'#S\x1f#I\x1f#P\x1f#{pane_id}\x1f#{pane_pid}\x1f#{pane_current_command}\x1f#{pane_current_path}\x1f#{session_attached}\x1f#W\x1f#{pane_title}\x1f#{host_short}'";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -92,6 +93,8 @@ pub fn parse_inventory(host: &str, output: &str) -> Result<Vec<Pane>> {
         // tests or pre-upgrade fixtures.
         let fields: Vec<&str> = if line.contains(INVENTORY_FIELD_SEP) {
             line.split(INVENTORY_FIELD_SEP).collect()
+        } else if line.contains(INVENTORY_FIELD_SEP_ESCAPED) {
+            line.split(INVENTORY_FIELD_SEP_ESCAPED).collect()
         } else {
             line.split('\t').collect()
         };
@@ -503,14 +506,26 @@ mod tests {
 
     #[test]
     fn parses_unit_separator_inventory_with_window_metadata() {
-        // 11-field row using \x1f as the field delimiter (matches what the
-        // current INVENTORY_FORMAT emits via tmux).
+        // 11-field row using \x1f as the field delimiter, which older fixtures
+        // and direct parser callers may already have materialized.
         let output = "codex\u{1f}0\u{1f}1\u{1f}%3\u{1f}1234\u{1f}zsh\u{1f}/home/cam/work\u{1f}1\u{1f}lrcp\u{1f}✳ Claude Code\u{1f}rpi\n";
         let panes = parse_inventory("pi", output).unwrap();
         assert_eq!(panes.len(), 1);
         assert_eq!(panes[0].target, "pi/codex:0.1");
         assert_eq!(panes[0].window_name.as_deref(), Some("lrcp"));
         assert_eq!(panes[0].pane_title.as_deref(), Some("✳ Claude Code"));
+        assert_eq!(panes[0].host_short.as_deref(), Some("rpi"));
+    }
+
+    #[test]
+    fn parses_tmux_escaped_unit_separator_inventory() {
+        let output = "codex\\0370\\0371\\037%3\\0371234\\037zsh\\037/home/cam/work\\0371\\037lrcp\\037pane title\\037rpi\n";
+        let panes = parse_inventory("pi", output).unwrap();
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].target, "pi/codex:0.1");
+        assert_eq!(panes[0].pid, Some(1234));
+        assert_eq!(panes[0].window_name.as_deref(), Some("lrcp"));
+        assert_eq!(panes[0].pane_title.as_deref(), Some("pane title"));
         assert_eq!(panes[0].host_short.as_deref(), Some("rpi"));
     }
 
