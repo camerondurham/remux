@@ -208,15 +208,29 @@ remux a [--readonly] <watch-id-or-pane-target>
 - `remux onboard` reuses your SSH aliases by default, so `ssh pi` can become `target: pi`
 - watches give important panes stable IDs
 - match fields are exact and combined with AND semantics
+- `session_templates.presets` adds custom TUI prefixes for templated session creation
 - default config path is `~/.config/remux/config.yaml`
 - legacy `sessions` entries are still accepted as exact tmux-coordinate watches
+
+Example session template presets:
+
+```yaml
+session_templates:
+  presets:
+    - id: client
+      label: Client Work
+      prefix: client
+    - id: ops
+      label: Operations
+      prefix: ops
+```
 
 ## TUI keys
 
 Main keys:
 
 ```text
-[↑↓] move  [Enter] attach ro  [a] jump rw  [i] refresh  [/] filter  [d] details  [?] help  [x] kill  [q] quit
+[↑↓] move  [Enter] attach ro  [a] jump rw  [t] template  [z] send keys  [i] refresh  [/] filter  [d] details  [?] help  [x] kill  [q] quit
 ```
 
 More keys available in the help overlay (`?`):
@@ -229,7 +243,9 @@ More keys available in the help overlay (`?`):
 | `c` | Capture selected pane output into the detail view |
 | `e` | Rename the selected session |
 | `n` | Create a new tmux session on a host (`<host>/<session>`) |
+| `t` | Create a new tmux session from a host and prefix template |
 | `p` | Spawn a new pane in an existing session |
+| `z` | Send keys to the selected pane |
 | `d` | Toggle the detail pane |
 | `Esc` | Close the current overlay |
 

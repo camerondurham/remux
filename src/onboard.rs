@@ -259,7 +259,7 @@ fn render_config(hosts: &[String]) -> String {
     }
 
     out.push_str(
-        "\n# Optional: give important panes stable IDs you can inspect/attach quickly.\n# watches:\n#   - id: prod-api\n#     host: prod\n#     match:\n#       command: node\n#       cwd_prefix: /srv/api\n#     repo: /srv/api\n#     agent_hint: codex\n",
+        "\n# Optional: add custom prefixes for TUI templated session creation.\n# session_templates:\n#   presets:\n#     - id: client\n#       label: Client Work\n#       prefix: client\n\n# Optional: give important panes stable IDs you can inspect/attach quickly.\n# watches:\n#   - id: prod-api\n#     host: prod\n#     match:\n#       command: node\n#       cwd_prefix: /srv/api\n#     repo: /srv/api\n#     agent_hint: codex\n",
     );
 
     out

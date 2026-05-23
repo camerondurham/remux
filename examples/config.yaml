@@ -24,6 +24,15 @@ hosts:
         BatchMode: "yes"
         ConnectTimeout: "5"
 
+session_templates:
+  presets:
+    - id: client
+      label: Client Work
+      prefix: client
+    - id: ops
+      label: Operations
+      prefix: ops
+
 watches:
   - id: local-shell
     host: local
