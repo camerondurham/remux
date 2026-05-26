@@ -49,7 +49,7 @@ fn directory_scan_command(roots: &[String]) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     format!(
-        "for _remux_root in {roots}; do [ -d \"$_remux_root\" ] || continue; find \"$_remux_root\" \\( {prune_expr} \\) -prune -o -type d -print; done 2>/dev/null"
+        "for _remux_root in {roots}; do [ -d \"$_remux_root\" ] || continue; printf '%s\\n' \"$_remux_root\"; find \"$_remux_root\" -mindepth 1 \\( {prune_expr} \\) -prune -o -type d -print; done 2>/dev/null"
     )
 }
 
@@ -114,10 +114,10 @@ mod tests {
     #[test]
     fn directory_rows_scans_configured_roots_and_prunes_noise() {
         let root = unique_temp_dir();
-        let project = root.join("project");
-        fs::create_dir_all(project.join("src")).unwrap();
-        fs::create_dir_all(project.join(".git").join("objects")).unwrap();
-        fs::create_dir_all(project.join("target").join("debug")).unwrap();
+        let target_root = root.join("target");
+        fs::create_dir_all(target_root.join("src")).unwrap();
+        fs::create_dir_all(target_root.join(".git").join("objects")).unwrap();
+        fs::create_dir_all(target_root.join("node_modules").join("pkg")).unwrap();
 
         let config = Config {
             poll: PollConfig::default(),
@@ -126,7 +126,7 @@ mod tests {
                 id: "local".to_string(),
                 kind: HostKind::Local,
                 tmux_socket: None,
-                session_roots: vec![root.to_string_lossy().to_string()],
+                session_roots: vec![target_root.to_string_lossy().to_string()],
                 ssh: None,
             }],
             watches: Vec::new(),
@@ -134,12 +134,12 @@ mod tests {
         };
 
         let rows = directory_rows(&config, config.host("local").unwrap()).unwrap();
-        let project_path = project.to_string_lossy().to_string();
+        let target_root_path = target_root.to_string_lossy().to_string();
 
-        assert!(rows.contains(&project_path));
-        assert!(rows.iter().any(|row| row.ends_with("/project/src")));
+        assert!(rows.contains(&target_root_path));
+        assert!(rows.iter().any(|row| row.ends_with("/target/src")));
         assert!(!rows.iter().any(|row| row.contains("/.git/")));
-        assert!(!rows.iter().any(|row| row.contains("/target/")));
+        assert!(!rows.iter().any(|row| row.contains("/node_modules/")));
 
         fs::remove_dir_all(root).unwrap();
     }
