@@ -1,5 +1,6 @@
 use crate::attach;
 use crate::config::Config;
+use crate::dir_picker;
 use crate::lifecycle;
 use crate::snapshot::{
     self, HostSnapshot, MatchStatus, PaneDetail, SessionSnapshot, SessionState, SnapshotError,
@@ -180,6 +181,7 @@ enum SessionTemplatePrefix {
 enum InputPromptKind {
     RenameSession { host: String, current: String },
     NewSession,
+    NewSessionCwd { host: String, session: String },
     NewPane,
     SendKeys { target: String },
 }
@@ -666,12 +668,12 @@ fn handle_key(
     }
 
     if app.input_prompt.is_some() {
-        handle_input_prompt_key(key, config, host, tx, app)?;
+        handle_input_prompt_key(key, config, host, tx, app, terminal)?;
         return Ok(false);
     }
 
     if app.template_prompt.is_some() {
-        handle_template_prompt_key(key, config, host, tx, app)?;
+        handle_template_prompt_key(key, config, host, tx, app, terminal)?;
         return Ok(false);
     }
 
@@ -883,6 +885,7 @@ fn handle_input_prompt_key(
     host: Option<String>,
     tx: mpsc::Sender<RefreshMessage>,
     app: &mut App,
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) -> Result<()> {
     let Some(prompt) = app.input_prompt.as_mut() else {
         return Ok(());
@@ -897,7 +900,7 @@ fn handle_input_prompt_key(
             prompt.value.pop();
         }
         KeyCode::Enter => {
-            execute_input_prompt(config, host, tx, app)?;
+            execute_input_prompt(config, host, tx, app, terminal)?;
         }
         KeyCode::Char(ch) => {
             prompt.value.push(ch);
@@ -913,6 +916,7 @@ fn handle_template_prompt_key(
     scoped_host: Option<String>,
     tx: mpsc::Sender<RefreshMessage>,
     app: &mut App,
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) -> Result<()> {
     let Some(prompt) = app.template_prompt.take() else {
         return Ok(());
@@ -1064,13 +1068,14 @@ fn handle_template_prompt_key(
                         return Ok(());
                     }
                 };
-                match lifecycle::new_session(config, &host, &session_name, None, None, false) {
-                    Ok(()) => {
-                        app.status = format!("created session {host}/{session_name}");
-                        spawn_refresh(config, Some(host), tx, app)?;
-                    }
-                    Err(err) => app.status = format!("{err:#}"),
-                }
+                create_session_after_directory_selection(
+                    config,
+                    &host,
+                    &session_name,
+                    tx,
+                    app,
+                    terminal,
+                )?;
             }
             KeyCode::Char(ch) => {
                 value.push(ch);
@@ -1101,6 +1106,7 @@ fn execute_input_prompt(
     scoped_host: Option<String>,
     tx: mpsc::Sender<RefreshMessage>,
     app: &mut App,
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) -> Result<()> {
     let Some(prompt) = app.input_prompt.take() else {
         return Ok(());
@@ -1141,13 +1147,19 @@ fn execute_input_prompt(
                 );
                 return Ok(());
             }
-            match lifecycle::new_session(config, host_id, session_name, None, None, false) {
-                Ok(()) => {
-                    app.status = format!("created session {host_id}/{session_name}");
-                    spawn_refresh(config, Some(host_id.to_string()), tx, app)?;
-                }
-                Err(err) => app.status = format!("{err:#}"),
-            }
+            create_session_after_directory_selection(
+                config,
+                host_id,
+                session_name,
+                tx,
+                app,
+                terminal,
+            )?;
+        }
+        InputPromptKind::NewSessionCwd { host, session } => {
+            let cwd = prompt.value.trim();
+            let cwd = if cwd.is_empty() { None } else { Some(cwd) };
+            create_session(config, &host, &session, cwd, tx, app)?;
         }
         InputPromptKind::NewPane => {
             let Some((host_id, session_name)) = parse_host_session(prompt.value.trim()) else {
@@ -1184,6 +1196,63 @@ fn execute_input_prompt(
                 Err(err) => app.status = format!("{err:#}"),
             }
         }
+    }
+    Ok(())
+}
+
+fn create_session_after_directory_selection(
+    config: &Config,
+    host_id: &str,
+    session_name: &str,
+    tx: mpsc::Sender<RefreshMessage>,
+    app: &mut App,
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+) -> Result<()> {
+    let selection = suspend_terminal(terminal, || dir_picker::pick_directory(config, host_id));
+    match selection {
+        Ok(Some(cwd)) => create_session(config, host_id, session_name, Some(cwd.as_str()), tx, app),
+        Ok(None) => {
+            begin_cwd_prompt(app, host_id, session_name, "directory picker cancelled");
+            Ok(())
+        }
+        Err(err) => {
+            begin_cwd_prompt(
+                app,
+                host_id,
+                session_name,
+                &format!("directory picker unavailable: {err:#}"),
+            );
+            Ok(())
+        }
+    }
+}
+
+fn begin_cwd_prompt(app: &mut App, host_id: &str, session_name: &str, reason: &str) {
+    app.input_prompt = Some(InputPrompt {
+        kind: InputPromptKind::NewSessionCwd {
+            host: host_id.to_string(),
+            session: session_name.to_string(),
+        },
+        value: String::new(),
+    });
+    app.status = format!("{reason}; type cwd or press Enter for default");
+}
+
+fn create_session(
+    config: &Config,
+    host_id: &str,
+    session_name: &str,
+    cwd: Option<&str>,
+    tx: mpsc::Sender<RefreshMessage>,
+    app: &mut App,
+) -> Result<()> {
+    match lifecycle::new_session(config, host_id, session_name, cwd, None, false) {
+        Ok(()) => {
+            let cwd_label = cwd.map(|cwd| format!(" in {cwd}")).unwrap_or_default();
+            app.status = format!("created session {host_id}/{session_name}{cwd_label}");
+            spawn_refresh(config, Some(host_id.to_string()), tx, app)?;
+        }
+        Err(err) => app.status = format!("{err:#}"),
     }
     Ok(())
 }
@@ -1907,6 +1976,10 @@ fn input_prompt_line(prompt: &InputPrompt) -> Line<'static> {
         InputPromptKind::NewSession => (
             "new session ".to_string(),
             "enter <host>/<session> (Esc to cancel)",
+        ),
+        InputPromptKind::NewSessionCwd { host, session } => (
+            format!("cwd for {host}/{session} "),
+            "optional path; empty uses tmux default (Esc to cancel)",
         ),
         InputPromptKind::NewPane => (
             "new pane ".to_string(),
@@ -2886,5 +2959,23 @@ session_templates:
                 .to_string()
                 .contains("must not contain")
         );
+    }
+
+    #[test]
+    fn cwd_prompt_keeps_pending_session_context() {
+        let mut app = App::new(String::new());
+
+        begin_cwd_prompt(&mut app, "local", "work-api", "fzf unavailable");
+
+        let prompt = app.input_prompt.as_ref().unwrap();
+        match &prompt.kind {
+            InputPromptKind::NewSessionCwd { host, session } => {
+                assert_eq!(host, "local");
+                assert_eq!(session, "work-api");
+            }
+            _ => panic!("expected cwd prompt"),
+        }
+        assert!(prompt.value.is_empty());
+        assert!(app.status.contains("type cwd or press Enter for default"));
     }
 }

@@ -108,9 +108,14 @@ poll:
 hosts:
   - id: local
     type: local
+    session_roots:
+      - ~/code
+      - ~/work
 
   - id: pi
     type: ssh
+    session_roots:
+      - /home/cam
     ssh:
       target: cam@192.168.0.197
 
@@ -198,7 +203,7 @@ remux a [--readonly] <watch-id-or-pane-target>
 
 - tmux on each monitored host
 - ssh for remote hosts
-- fzf only for `remux pick`
+- fzf for `remux pick` and TUI directory picking; manual cwd entry works without it
 - git only if repo metadata is configured
 - Rust only when building from source
 
@@ -206,6 +211,7 @@ remux a [--readonly] <watch-id-or-pane-target>
 
 - hosts can be local or SSH
 - `remux onboard` reuses your SSH aliases by default, so `ssh pi` can become `target: pi`
+- `session_roots` gives the TUI a bounded fzf directory list for new sessions
 - watches give important panes stable IDs
 - match fields are exact and combined with AND semantics
 - `session_templates.presets` adds custom TUI prefixes for templated session creation
@@ -242,8 +248,8 @@ More keys available in the help overlay (`?`):
 | `s` | Cycle the table sort mode |
 | `c` | Capture selected pane output into the detail view |
 | `e` | Rename the selected session |
-| `n` | Create a new tmux session on a host (`<host>/<session>`) |
-| `t` | Create a new tmux session from a host and prefix template |
+| `n` | Create a new tmux session on a host (`<host>/<session>`, then optional cwd) |
+| `t` | Create a new tmux session from a host and prefix template, then optional cwd |
 | `p` | Spawn a new pane in an existing session |
 | `z` | Send keys to the selected pane |
 | `d` | Toggle the detail pane |
