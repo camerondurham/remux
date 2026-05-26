@@ -247,12 +247,12 @@ fn write_config(path: &Path, rendered: &str, force: bool) -> Result<()> {
 
 fn render_config(hosts: &[String]) -> String {
     let mut out = String::from(
-        "poll:\n  active_after: 5m\n  idle_after: 60m\n  capture_lines: 120\n  ssh_timeout: 5s\n  command_timeout: 15s\n\nhosts:\n  - id: local\n    type: local\n",
+        "poll:\n  active_after: 5m\n  idle_after: 60m\n  capture_lines: 120\n  ssh_timeout: 5s\n  command_timeout: 15s\n\nhosts:\n  - id: local\n    type: local\n    # Optional: roots used by the TUI new-session directory picker.\n    # session_roots:\n    #   - ~/code\n",
     );
 
     for host in hosts {
         out.push_str(&format!(
-            "\n  - id: {}\n    type: ssh\n    ssh:\n      target: {}\n",
+            "\n  - id: {}\n    type: ssh\n    # Optional: roots are evaluated on the remote host.\n    # session_roots:\n    #   - ~/code\n    ssh:\n      target: {}\n",
             sanitize_id(host),
             host
         ));

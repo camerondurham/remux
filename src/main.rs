@@ -2,6 +2,7 @@ mod attach;
 mod cache;
 mod cli;
 mod config;
+mod dir_picker;
 mod doctor;
 mod exec;
 mod exit;

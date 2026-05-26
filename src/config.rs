@@ -80,6 +80,8 @@ pub struct HostConfig {
     pub kind: HostKind,
     #[serde(default)]
     pub tmux_socket: Option<String>,
+    #[serde(default)]
+    pub session_roots: Vec<String>,
     pub ssh: Option<SshConfig>,
 }
 
@@ -266,6 +268,9 @@ impl Config {
                 .is_some_and(|socket| socket.trim().is_empty())
             {
                 bail!("host `{}` tmux_socket must not be empty", host.id);
+            }
+            if host.session_roots.iter().any(|root| root.trim().is_empty()) {
+                bail!("host `{}` session_roots entries must not be empty", host.id);
             }
 
             match host.kind {
@@ -597,6 +602,9 @@ hosts:
   - id: pi
     type: ssh
     tmux_socket: ~/.work-os/tmux.sock
+    session_roots:
+      - /home/cam/work
+      - ~/code
     ssh:
       target: cam@192.168.0.197
 session_templates:
@@ -633,6 +641,10 @@ watches:
             Some("~/.work-os/tmux.sock")
         );
         assert_eq!(
+            config.host("pi").unwrap().session_roots,
+            vec!["/home/cam/work", "~/code"]
+        );
+        assert_eq!(
             config.host("pi").unwrap().ssh().unwrap().target().unwrap(),
             "cam@192.168.0.197"
         );
@@ -643,6 +655,28 @@ watches:
             Some("codex")
         );
         assert_eq!(config.watches_for_host("pi").len(), 2);
+    }
+
+    #[test]
+    fn rejects_empty_session_roots() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+hosts:
+  - id: local
+    type: local
+    session_roots:
+      - " "
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("session_roots entries must not be empty")
+        );
     }
 
     #[test]

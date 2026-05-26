@@ -142,6 +142,7 @@ mod tests {
             id: "pi".to_string(),
             kind: HostKind::Ssh,
             tmux_socket: None,
+            session_roots: Vec::new(),
             ssh: Some(SshConfig {
                 target: Some("cam@192.168.0.197".to_string()),
                 host: None,

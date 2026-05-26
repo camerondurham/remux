@@ -8,11 +8,18 @@ poll:
 hosts:
   - id: local
     type: local
+    # Optional roots used by the TUI session directory picker.
+    session_roots:
+      - ~/code
+      - ~/work
     # Optional: inspect a non-default tmux server socket for this host.
     # tmux_socket: ~/.work-os/tmux.sock
 
   - id: pi
     type: ssh
+    # Optional roots are evaluated on the remote host.
+    session_roots:
+      - /home/cam
     # Optional for SSH hosts too; the path is evaluated on the remote host.
     # tmux_socket: ~/.work-os/tmux.sock
     ssh:
