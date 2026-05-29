@@ -1,4 +1,5 @@
 use crate::config::{Config, HostConfig};
+use crate::fzf;
 use crate::{host, tmux};
 use anyhow::{Context, Result, anyhow, bail};
 use std::io::Write;
@@ -8,7 +9,7 @@ const PRUNE_DIRS: &[&str] = &[".git", "node_modules", "target", ".cache"];
 
 pub fn pick_directory(config: &Config, host_id: &str) -> Result<Option<String>> {
     let host_config = config.host(host_id)?;
-    if fzf_missing()? {
+    if fzf::is_missing()? {
         bail!("fzf is not available");
     }
     if host_config.session_roots.is_empty() {
@@ -51,14 +52,6 @@ fn directory_scan_command(roots: &[String]) -> String {
     format!(
         "for _remux_root in {roots}; do [ -d \"$_remux_root\" ] || continue; printf '%s\\n' \"$_remux_root\"; find \"$_remux_root\" -mindepth 1 \\( {prune_expr} \\) -prune -o -type d -print; done 2>/dev/null"
     )
-}
-
-fn fzf_missing() -> Result<bool> {
-    match Command::new("fzf").arg("--version").output() {
-        Ok(output) => Ok(!output.status.success()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(true),
-        Err(err) => Err(err).context("failed to check fzf availability"),
-    }
 }
 
 fn run_fzf(rows: &[String]) -> Result<Option<String>> {

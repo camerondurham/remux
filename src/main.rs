@@ -6,6 +6,7 @@ mod dir_picker;
 mod doctor;
 mod exec;
 mod exit;
+mod fzf;
 mod git;
 mod host;
 mod lifecycle;

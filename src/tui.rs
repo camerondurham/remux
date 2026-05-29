@@ -27,6 +27,15 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod line_editor;
+mod session_template;
+
+use line_editor::LineEditor;
+use session_template::{
+    SessionTemplatePreset, session_template_presets, template_prefix_preview,
+    template_preset_label, templated_session_name,
+};
+
 pub fn run(config: &Config, host: Option<String>, filter: Option<String>) -> Result<()> {
     if let Some(host_id) = &host {
         config.host(host_id)?;
@@ -162,136 +171,6 @@ enum TemplatePromptStep {
         preset: SessionTemplatePreset,
         value: LineEditor,
     },
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct LineEditor {
-    value: String,
-    cursor: usize,
-}
-
-impl LineEditor {
-    fn new(value: impl Into<String>) -> Self {
-        let value = value.into();
-        Self {
-            cursor: value.len(),
-            value,
-        }
-    }
-
-    fn as_str(&self) -> &str {
-        &self.value
-    }
-
-    fn into_string(self) -> String {
-        self.value
-    }
-
-    fn insert(&mut self, ch: char) {
-        self.value.insert(self.cursor, ch);
-        self.cursor += ch.len_utf8();
-    }
-
-    fn move_start(&mut self) {
-        self.cursor = 0;
-    }
-
-    fn move_end(&mut self) {
-        self.cursor = self.value.len();
-    }
-
-    fn move_left(&mut self) {
-        if let Some((idx, _)) = self.value[..self.cursor].char_indices().next_back() {
-            self.cursor = idx;
-        }
-    }
-
-    fn move_right(&mut self) {
-        if let Some(ch) = self.value[self.cursor..].chars().next() {
-            self.cursor += ch.len_utf8();
-        }
-    }
-
-    fn backspace(&mut self) {
-        if let Some((start, _)) = self.value[..self.cursor].char_indices().next_back() {
-            self.value.drain(start..self.cursor);
-            self.cursor = start;
-        }
-    }
-
-    fn delete(&mut self) {
-        if let Some(ch) = self.value[self.cursor..].chars().next() {
-            self.value.drain(self.cursor..self.cursor + ch.len_utf8());
-        }
-    }
-
-    fn clear_before_cursor(&mut self) {
-        self.value.drain(..self.cursor);
-        self.cursor = 0;
-    }
-
-    fn clear_after_cursor(&mut self) {
-        self.value.truncate(self.cursor);
-    }
-
-    fn delete_previous_word(&mut self) {
-        let before = &self.value[..self.cursor];
-        let trimmed = before.trim_end_matches(char::is_whitespace);
-        let word_start = trimmed
-            .char_indices()
-            .rev()
-            .find(|(_, ch)| ch.is_whitespace())
-            .map(|(idx, ch)| idx + ch.len_utf8())
-            .unwrap_or(0);
-        self.value.drain(word_start..self.cursor);
-        self.cursor = word_start;
-    }
-
-    fn apply_key(&mut self, key: KeyEvent) -> bool {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        match key.code {
-            KeyCode::Left => self.move_left(),
-            KeyCode::Right => self.move_right(),
-            KeyCode::Home => self.move_start(),
-            KeyCode::End => self.move_end(),
-            KeyCode::Backspace => self.backspace(),
-            KeyCode::Delete => self.delete(),
-            KeyCode::Char('a') if ctrl => self.move_start(),
-            KeyCode::Char('b') if ctrl => self.move_left(),
-            KeyCode::Char('d') if ctrl => self.delete(),
-            KeyCode::Char('e') if ctrl => self.move_end(),
-            KeyCode::Char('f') if ctrl => self.move_right(),
-            KeyCode::Char('h') if ctrl => self.backspace(),
-            KeyCode::Char('k') if ctrl => self.clear_after_cursor(),
-            KeyCode::Char('u') if ctrl => self.clear_before_cursor(),
-            KeyCode::Char('w') if ctrl => self.delete_previous_word(),
-            KeyCode::Char(ch) if !ctrl => self.insert(ch),
-            _ => return false,
-        }
-        true
-    }
-
-    fn cursor_spans(&self) -> Vec<Span<'static>> {
-        let (before, after) = self.value.split_at(self.cursor);
-        vec![
-            Span::raw(before.to_string()),
-            Span::styled("_", Style::default().fg(Color::LightCyan)),
-            Span::raw(after.to_string()),
-        ]
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct SessionTemplatePreset {
-    id: String,
-    label: String,
-    prefix: SessionTemplatePrefix,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum SessionTemplatePrefix {
-    Date,
-    Literal(String),
 }
 
 #[derive(Clone)]
@@ -1347,62 +1226,6 @@ fn parse_host_session(input: &str) -> Option<(&str, &str)> {
     Some((host, session))
 }
 
-fn session_template_presets(config: &Config) -> Vec<SessionTemplatePreset> {
-    let mut presets = vec![
-        SessionTemplatePreset {
-            id: "date".to_string(),
-            label: "Date".to_string(),
-            prefix: SessionTemplatePrefix::Date,
-        },
-        SessionTemplatePreset {
-            id: "work".to_string(),
-            label: "Work".to_string(),
-            prefix: SessionTemplatePrefix::Literal("work".to_string()),
-        },
-        SessionTemplatePreset {
-            id: "fix".to_string(),
-            label: "Fix".to_string(),
-            prefix: SessionTemplatePrefix::Literal("fix".to_string()),
-        },
-        SessionTemplatePreset {
-            id: "spike".to_string(),
-            label: "Spike".to_string(),
-            prefix: SessionTemplatePrefix::Literal("spike".to_string()),
-        },
-    ];
-    presets.extend(
-        config
-            .session_templates
-            .presets
-            .iter()
-            .map(|preset| SessionTemplatePreset {
-                id: preset.id.trim().to_string(),
-                label: preset.label.trim().to_string(),
-                prefix: SessionTemplatePrefix::Literal(preset.prefix.trim().to_string()),
-            }),
-    );
-    presets
-}
-
-fn templated_session_name(preset: &SessionTemplatePreset, suffix: &str) -> Result<String> {
-    let suffix = suffix.trim();
-    if suffix.is_empty() {
-        bail!("template session expects a name");
-    }
-    if suffix.contains('/') || suffix.contains(':') {
-        bail!("template session name must not contain `/` or `:`");
-    }
-    let prefix = match &preset.prefix {
-        SessionTemplatePrefix::Date => Utc::now().format("%Y-%m-%d").to_string(),
-        SessionTemplatePrefix::Literal(prefix) => prefix.clone(),
-    };
-    let session_name = format!("{prefix}-{suffix}");
-    if session_name.contains('/') || session_name.contains(':') {
-        bail!("template session name must not contain `/` or `:`");
-    }
-    Ok(session_name)
-}
-
 fn attach_selected(
     config: &Config,
     app: &mut App,
@@ -2128,17 +1951,6 @@ fn editable_prompt_line(
     Line::from(spans)
 }
 
-fn template_preset_label(preset: &SessionTemplatePreset) -> String {
-    format!("{} ({})", preset.label, template_prefix_preview(preset))
-}
-
-fn template_prefix_preview(preset: &SessionTemplatePreset) -> String {
-    match &preset.prefix {
-        SessionTemplatePrefix::Date => Utc::now().format("%Y-%m-%d").to_string(),
-        SessionTemplatePrefix::Literal(prefix) => prefix.clone(),
-    }
-}
-
 fn detail_meta_lines(row: &SessionSnapshot) -> Vec<Line<'static>> {
     let pid = row
         .process
@@ -2826,6 +2638,7 @@ fn short_message(message: &str) -> String {
 mod tests {
     use super::*;
     use crate::snapshot::{MatchStatus, SessionSnapshot, SessionState, TmuxSnapshot};
+    use crate::tui::session_template::SessionTemplatePrefix;
 
     fn make_row(match_status: MatchStatus, state: SessionState) -> SessionSnapshot {
         SessionSnapshot {

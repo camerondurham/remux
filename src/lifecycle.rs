@@ -7,13 +7,18 @@ use anyhow::{Context, Result};
 use std::io::{self, IsTerminal, Write};
 
 enum KillTarget {
-    Session { host: String, session: String },
+    Session(SessionTarget),
     Pane(PaneTarget),
 }
 
 enum SendTarget {
-    Session { host: String, session: String },
+    Session(SessionTarget),
     Pane(PaneTarget),
+}
+
+struct SessionTarget {
+    host: String,
+    session: String,
 }
 
 pub fn new_session(
@@ -144,7 +149,7 @@ fn resolve_kill_target(config: &Config, target: &str) -> Result<KillTarget> {
 
     if let Some((host, session)) = parse_session_target(target) {
         let session = resolve_live_session(config, host, session)?;
-        return Ok(session);
+        return Ok(KillTarget::Session(session));
     }
 
     Err(ExitFailure::new(
@@ -169,11 +174,9 @@ fn resolve_send_target(config: &Config, target: &str) -> Result<SendTarget> {
     }
 
     if let Some((host, session)) = parse_session_target(target) {
-        resolve_live_session(config, host, session)?;
-        return Ok(SendTarget::Session {
-            host: host.to_string(),
-            session: session.to_string(),
-        });
+        return Ok(SendTarget::Session(resolve_live_session(
+            config, host, session,
+        )?));
     }
 
     Err(ExitFailure::new(
@@ -209,7 +212,7 @@ fn resolve_live_pane(config: &Config, target: PaneTarget) -> Result<PaneTarget> 
     })
 }
 
-fn resolve_live_session(config: &Config, host: &str, session: &str) -> Result<KillTarget> {
+fn resolve_live_session(config: &Config, host: &str, session: &str) -> Result<SessionTarget> {
     let snapshot = snapshot::snapshot_host(config, host).map_err(|err| {
         ExitFailure::new(
             3,
@@ -221,7 +224,7 @@ fn resolve_live_session(config: &Config, host: &str, session: &str) -> Result<Ki
         .iter()
         .any(|row| row.raw_target.is_some() && row.tmux.session == session);
     if found {
-        Ok(KillTarget::Session {
+        Ok(SessionTarget {
             host: host.to_string(),
             session: session.to_string(),
         })
@@ -276,11 +279,11 @@ fn run_lifecycle_command(
 impl KillTarget {
     fn command(&self, config: &Config) -> Result<(&str, String)> {
         match self {
-            KillTarget::Session { host, session } => {
-                let host_config = config.host(host)?;
+            KillTarget::Session(target) => {
+                let host_config = config.host(&target.host)?;
                 Ok((
-                    host,
-                    tmux::kill_session_command(session, host_config.tmux_socket()),
+                    &target.host,
+                    tmux::kill_session_command(&target.session, host_config.tmux_socket()),
                 ))
             }
             KillTarget::Pane(target) => {
@@ -295,7 +298,7 @@ impl KillTarget {
 
     fn display(&self) -> String {
         match self {
-            KillTarget::Session { host, session } => format!("{host}/{session}"),
+            KillTarget::Session(target) => format!("{}/{}", target.host, target.session),
             KillTarget::Pane(target) => target.to_string(),
         }
     }
@@ -304,11 +307,16 @@ impl KillTarget {
 impl SendTarget {
     fn command(&self, config: &Config, keys: &str, enter: bool) -> Result<(&str, String)> {
         match self {
-            SendTarget::Session { host, session } => {
-                let host_config = config.host(host)?;
+            SendTarget::Session(target) => {
+                let host_config = config.host(&target.host)?;
                 Ok((
-                    host,
-                    tmux::send_keys_command(session, keys, enter, host_config.tmux_socket()),
+                    &target.host,
+                    tmux::send_keys_command(
+                        &target.session,
+                        keys,
+                        enter,
+                        host_config.tmux_socket(),
+                    ),
                 ))
             }
             SendTarget::Pane(target) => {
