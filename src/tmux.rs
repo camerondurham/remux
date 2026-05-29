@@ -15,6 +15,10 @@ pub const INVENTORY_FIELD_SEP: char = '\x1f';
 const INVENTORY_FIELD_SEP_ESCAPED: &str = "\\037";
 pub const INVENTORY_FORMAT: &str = "'#S\x1f#I\x1f#P\x1f#{pane_id}\x1f#{pane_pid}\x1f#{pane_current_command}\x1f#{pane_current_path}\x1f#{session_attached}\x1f#W\x1f#{pane_title}\x1f#{host_short}'";
 
+pub type PaneCaptures = HashMap<String, Option<String>>;
+pub type PaneGitSnapshots = HashMap<String, Option<crate::git::RepoSnapshot>>;
+pub type InventoryWithCaptures = (Vec<Pane>, PaneCaptures, PaneGitSnapshots);
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PaneTarget {
     pub host: String,
@@ -200,15 +204,7 @@ echo \"===REMUX-END-$NONCE===\"",
     )
 }
 
-#[allow(clippy::type_complexity)]
-pub fn parse_inventory_with_captures(
-    host_id: &str,
-    raw: &str,
-) -> Result<(
-    Vec<Pane>,
-    HashMap<String, Option<String>>,
-    HashMap<String, Option<crate::git::RepoSnapshot>>,
-)> {
+pub fn parse_inventory_with_captures(host_id: &str, raw: &str) -> Result<InventoryWithCaptures> {
     let mut lines = raw.lines();
 
     // First line must be the inventory-begin delimiter; extract nonce from it.

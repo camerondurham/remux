@@ -1,4 +1,5 @@
 use crate::config::{Config, HostKind};
+use crate::fzf;
 use crate::{local, ssh};
 use anyhow::Result;
 
@@ -148,16 +149,21 @@ fn check_local_binary(name: &str, command: &str, success: &str, failure: &str) -
 }
 
 fn check_fzf() -> CheckResult {
-    match std::process::Command::new("fzf").arg("--version").output() {
-        Ok(output) if output.status.success() => CheckResult {
+    match fzf::is_missing() {
+        Ok(false) => CheckResult {
             name: "local fzf".to_string(),
             ok: true,
             detail: "fzf found".to_string(),
         },
-        Ok(_) | Err(_) => CheckResult {
+        Ok(true) => CheckResult {
             name: "local fzf".to_string(),
             ok: false,
             detail: "fzf not found in PATH (only required for remux pick)".to_string(),
+        },
+        Err(err) => CheckResult {
+            name: "local fzf".to_string(),
+            ok: false,
+            detail: format!("failed to check fzf: {err:#}"),
         },
     }
 }

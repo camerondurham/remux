@@ -1,6 +1,7 @@
 use crate::attach;
 use crate::config::Config;
 use crate::exit::ExitFailure;
+use crate::fzf;
 use crate::sessions;
 use crate::snapshot::{self, SessionSnapshot};
 use crate::tmux::{self, PaneTarget};
@@ -21,7 +22,7 @@ pub struct PickOptions {
 pub fn run(config: &Config, config_path: Option<&Path>, options: PickOptions) -> Result<()> {
     let rows = picker_rows(config, options.host.as_deref(), options.sessions)?;
 
-    if options.no_fzf || fzf_missing()? {
+    if options.no_fzf || fzf::is_missing()? {
         print_fzf_remediation();
         print_rows(&rows)?;
         return Err(ExitFailure::quiet(2).into());
@@ -101,18 +102,8 @@ fn compact_field(cwd: &str, preview: &str) -> String {
     }
 }
 
-fn fzf_missing() -> Result<bool> {
-    match Command::new("fzf").arg("--version").output() {
-        Ok(output) => Ok(!output.status.success()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(true),
-        Err(err) => Err(err).context("failed to check fzf availability"),
-    }
-}
-
 fn print_fzf_remediation() {
-    eprintln!(
-        "fzf is not available; install it with one of:\n  macOS:  brew install fzf\n  Debian: sudo apt-get install fzf\n  Arch:   sudo pacman -S fzf"
-    );
+    eprintln!("{}", fzf::INSTALL_HINT);
 }
 
 fn print_rows(rows: &[String]) -> Result<()> {

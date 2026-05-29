@@ -447,8 +447,11 @@ pub fn strip_ansi(s: &str) -> String {
             }
             i += 1; // skip final byte
         } else {
-            out.push(s[i..].chars().next().unwrap());
-            i += s[i..].chars().next().map_or(1, |c| c.len_utf8());
+            let Some(ch) = s[i..].chars().next() else {
+                break;
+            };
+            out.push(ch);
+            i += ch.len_utf8();
         }
     }
     out
