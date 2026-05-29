@@ -106,7 +106,7 @@ struct App {
     snapshots: Vec<HostSnapshot>,
     selected: usize,
     selected_identity: Option<String>,
-    filter: String,
+    filter: LineEditor,
     editing_filter: bool,
     help: bool,
     status: String,
@@ -141,7 +141,7 @@ struct KillPrompt {
 
 struct InputPrompt {
     kind: InputPromptKind,
-    value: String,
+    value: LineEditor,
 }
 
 struct TemplatePrompt {
@@ -150,7 +150,7 @@ struct TemplatePrompt {
 
 enum TemplatePromptStep {
     Host {
-        value: String,
+        value: LineEditor,
     },
     Preset {
         host: String,
@@ -160,8 +160,125 @@ enum TemplatePromptStep {
     Name {
         host: String,
         preset: SessionTemplatePreset,
-        value: String,
+        value: LineEditor,
     },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct LineEditor {
+    value: String,
+    cursor: usize,
+}
+
+impl LineEditor {
+    fn new(value: impl Into<String>) -> Self {
+        let value = value.into();
+        Self {
+            cursor: value.len(),
+            value,
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        &self.value
+    }
+
+    fn into_string(self) -> String {
+        self.value
+    }
+
+    fn insert(&mut self, ch: char) {
+        self.value.insert(self.cursor, ch);
+        self.cursor += ch.len_utf8();
+    }
+
+    fn move_start(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn move_end(&mut self) {
+        self.cursor = self.value.len();
+    }
+
+    fn move_left(&mut self) {
+        if let Some((idx, _)) = self.value[..self.cursor].char_indices().next_back() {
+            self.cursor = idx;
+        }
+    }
+
+    fn move_right(&mut self) {
+        if let Some(ch) = self.value[self.cursor..].chars().next() {
+            self.cursor += ch.len_utf8();
+        }
+    }
+
+    fn backspace(&mut self) {
+        if let Some((start, _)) = self.value[..self.cursor].char_indices().next_back() {
+            self.value.drain(start..self.cursor);
+            self.cursor = start;
+        }
+    }
+
+    fn delete(&mut self) {
+        if let Some(ch) = self.value[self.cursor..].chars().next() {
+            self.value.drain(self.cursor..self.cursor + ch.len_utf8());
+        }
+    }
+
+    fn clear_before_cursor(&mut self) {
+        self.value.drain(..self.cursor);
+        self.cursor = 0;
+    }
+
+    fn clear_after_cursor(&mut self) {
+        self.value.truncate(self.cursor);
+    }
+
+    fn delete_previous_word(&mut self) {
+        let before = &self.value[..self.cursor];
+        let trimmed = before.trim_end_matches(char::is_whitespace);
+        let word_start = trimmed
+            .char_indices()
+            .rev()
+            .find(|(_, ch)| ch.is_whitespace())
+            .map(|(idx, ch)| idx + ch.len_utf8())
+            .unwrap_or(0);
+        self.value.drain(word_start..self.cursor);
+        self.cursor = word_start;
+    }
+
+    fn apply_key(&mut self, key: KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Left => self.move_left(),
+            KeyCode::Right => self.move_right(),
+            KeyCode::Home => self.move_start(),
+            KeyCode::End => self.move_end(),
+            KeyCode::Backspace => self.backspace(),
+            KeyCode::Delete => self.delete(),
+            KeyCode::Char('a') if ctrl => self.move_start(),
+            KeyCode::Char('b') if ctrl => self.move_left(),
+            KeyCode::Char('d') if ctrl => self.delete(),
+            KeyCode::Char('e') if ctrl => self.move_end(),
+            KeyCode::Char('f') if ctrl => self.move_right(),
+            KeyCode::Char('h') if ctrl => self.backspace(),
+            KeyCode::Char('k') if ctrl => self.clear_after_cursor(),
+            KeyCode::Char('u') if ctrl => self.clear_before_cursor(),
+            KeyCode::Char('w') if ctrl => self.delete_previous_word(),
+            KeyCode::Char(ch) if !ctrl => self.insert(ch),
+            _ => return false,
+        }
+        true
+    }
+
+    fn cursor_spans(&self) -> Vec<Span<'static>> {
+        let (before, after) = self.value.split_at(self.cursor);
+        vec![
+            Span::raw(before.to_string()),
+            Span::styled("_", Style::default().fg(Color::LightCyan)),
+            Span::raw(after.to_string()),
+        ]
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -209,7 +326,7 @@ impl App {
             snapshots: Vec::new(),
             selected: 0,
             selected_identity: None,
-            filter,
+            filter: LineEditor::new(filter),
             editing_filter: false,
             help: false,
             status: "polling".to_string(),
@@ -232,7 +349,7 @@ impl App {
     }
 
     fn rows(&self) -> Vec<&SessionSnapshot> {
-        let filter = self.filter.trim().to_lowercase();
+        let filter = self.filter.as_str().trim().to_lowercase();
         let mut rows: Vec<&SessionSnapshot> = self
             .snapshots
             .iter()
@@ -680,17 +797,12 @@ fn handle_key(
     if app.editing_filter {
         match key.code {
             KeyCode::Esc | KeyCode::Enter => app.editing_filter = false,
-            KeyCode::Backspace => {
+            _ => {
                 let selected_identity = app.selected_row_identity();
-                app.filter.pop();
-                app.restore_selection(selected_identity);
+                if app.filter.apply_key(key) {
+                    app.restore_selection(selected_identity);
+                }
             }
-            KeyCode::Char(ch) => {
-                let selected_identity = app.selected_row_identity();
-                app.filter.push(ch);
-                app.restore_selection(selected_identity);
-            }
-            _ => {}
         }
         return Ok(false);
     }
@@ -750,7 +862,7 @@ fn handle_key(
         KeyCode::Char('n') => {
             app.input_prompt = Some(InputPrompt {
                 kind: InputPromptKind::NewSession,
-                value: String::new(),
+                value: LineEditor::default(),
             });
             app.status = "new session: enter <host>/<session>".to_string();
             Ok(false)
@@ -758,7 +870,7 @@ fn handle_key(
         KeyCode::Char('p') => {
             app.input_prompt = Some(InputPrompt {
                 kind: InputPromptKind::NewPane,
-                value: String::new(),
+                value: LineEditor::default(),
             });
             app.status = "new pane: enter <host>/<session>".to_string();
             Ok(false)
@@ -835,7 +947,7 @@ fn begin_rename_prompt(app: &mut App) {
             host: row.host.clone(),
             current: row.tmux.session.clone(),
         },
-        value: row.tmux.session.clone(),
+        value: LineEditor::new(row.tmux.session.clone()),
     });
     app.status = "rename session: edit name and press enter".to_string();
 }
@@ -846,7 +958,9 @@ fn begin_template_prompt(scoped_host: Option<&str>, app: &mut App) {
         .or_else(|| app.selected_row().map(|row| row.host.clone()))
         .unwrap_or_default();
     app.template_prompt = Some(TemplatePrompt {
-        step: TemplatePromptStep::Host { value: host },
+        step: TemplatePromptStep::Host {
+            value: LineEditor::new(host),
+        },
     });
     app.status = "new templated session: enter host".to_string();
 }
@@ -874,7 +988,7 @@ fn begin_send_keys_prompt(config: &Config, app: &mut App) {
         kind: InputPromptKind::SendKeys {
             target: target.clone(),
         },
-        value: String::new(),
+        value: LineEditor::default(),
     });
     app.status = format!("send keys to {target}: type command and press enter");
 }
@@ -896,16 +1010,12 @@ fn handle_input_prompt_key(
             app.input_prompt = None;
             app.status = "action cancelled".to_string();
         }
-        KeyCode::Backspace => {
-            prompt.value.pop();
-        }
         KeyCode::Enter => {
             execute_input_prompt(config, host, tx, app, terminal)?;
         }
-        KeyCode::Char(ch) => {
-            prompt.value.push(ch);
+        _ => {
+            prompt.value.apply_key(key);
         }
-        _ => {}
     }
     Ok(())
 }
@@ -927,14 +1037,8 @@ fn handle_template_prompt_key(
             KeyCode::Esc => {
                 app.status = "action cancelled".to_string();
             }
-            KeyCode::Backspace => {
-                value.pop();
-                app.template_prompt = Some(TemplatePrompt {
-                    step: TemplatePromptStep::Host { value },
-                });
-            }
             KeyCode::Enter => {
-                let host_id = value.trim().to_string();
+                let host_id = value.as_str().trim().to_string();
                 if host_id.is_empty() {
                     app.status = "template session expects a host".to_string();
                     app.template_prompt = Some(TemplatePrompt {
@@ -969,13 +1073,8 @@ fn handle_template_prompt_key(
                 });
                 app.status = format!("new templated session on {host_id}: choose prefix");
             }
-            KeyCode::Char(ch) => {
-                value.push(ch);
-                app.template_prompt = Some(TemplatePrompt {
-                    step: TemplatePromptStep::Host { value },
-                });
-            }
             _ => {
+                value.apply_key(key);
                 app.template_prompt = Some(TemplatePrompt {
                     step: TemplatePromptStep::Host { value },
                 });
@@ -1020,7 +1119,7 @@ fn handle_template_prompt_key(
                     step: TemplatePromptStep::Name {
                         host: host.clone(),
                         preset: preset.clone(),
-                        value: String::new(),
+                        value: LineEditor::default(),
                     },
                 });
                 app.status = format!("new templated session on {host}: enter name");
@@ -1043,18 +1142,8 @@ fn handle_template_prompt_key(
             KeyCode::Esc => {
                 app.status = "action cancelled".to_string();
             }
-            KeyCode::Backspace => {
-                value.pop();
-                app.template_prompt = Some(TemplatePrompt {
-                    step: TemplatePromptStep::Name {
-                        host,
-                        preset,
-                        value,
-                    },
-                });
-            }
             KeyCode::Enter => {
-                let session_name = match templated_session_name(&preset, value.trim()) {
+                let session_name = match templated_session_name(&preset, value.as_str().trim()) {
                     Ok(session_name) => session_name,
                     Err(err) => {
                         app.status = format!("{err:#}");
@@ -1077,17 +1166,8 @@ fn handle_template_prompt_key(
                     terminal,
                 )?;
             }
-            KeyCode::Char(ch) => {
-                value.push(ch);
-                app.template_prompt = Some(TemplatePrompt {
-                    step: TemplatePromptStep::Name {
-                        host,
-                        preset,
-                        value,
-                    },
-                });
-            }
             _ => {
+                value.apply_key(key);
                 app.template_prompt = Some(TemplatePrompt {
                     step: TemplatePromptStep::Name {
                         host,
@@ -1117,7 +1197,7 @@ fn execute_input_prompt(
             host: host_id,
             current,
         } => {
-            let new_name = prompt.value.trim();
+            let new_name = prompt.value.as_str().trim();
             if new_name.is_empty() {
                 app.status = "rename cancelled: empty name".to_string();
                 return Ok(());
@@ -1135,7 +1215,8 @@ fn execute_input_prompt(
             }
         }
         InputPromptKind::NewSession => {
-            let Some((host_id, session_name)) = parse_host_session(prompt.value.trim()) else {
+            let Some((host_id, session_name)) = parse_host_session(prompt.value.as_str().trim())
+            else {
                 app.status = "new session expects <host>/<session>".to_string();
                 return Ok(());
             };
@@ -1157,12 +1238,13 @@ fn execute_input_prompt(
             )?;
         }
         InputPromptKind::NewSessionCwd { host, session } => {
-            let cwd = prompt.value.trim();
+            let cwd = prompt.value.as_str().trim();
             let cwd = if cwd.is_empty() { None } else { Some(cwd) };
             create_session(config, &host, &session, cwd, tx, app)?;
         }
         InputPromptKind::NewPane => {
-            let Some((host_id, session_name)) = parse_host_session(prompt.value.trim()) else {
+            let Some((host_id, session_name)) = parse_host_session(prompt.value.as_str().trim())
+            else {
                 app.status = "new pane expects <host>/<session>".to_string();
                 return Ok(());
             };
@@ -1183,7 +1265,7 @@ fn execute_input_prompt(
             }
         }
         InputPromptKind::SendKeys { target } => {
-            let keys = prompt.value;
+            let keys = prompt.value.into_string();
             if keys.is_empty() {
                 app.status = "send keys cancelled: empty input".to_string();
                 return Ok(());
@@ -1233,7 +1315,7 @@ fn begin_cwd_prompt(app: &mut App, host_id: &str, session_name: &str, reason: &s
             host: host_id.to_string(),
             session: session_name.to_string(),
         },
-        value: String::new(),
+        value: LineEditor::default(),
     });
     app.status = format!("{reason}; type cwd or press Enter for default");
 }
@@ -1472,7 +1554,14 @@ fn draw_summary(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let mut spans = vec![
         Span::styled("remux", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" | "),
-        Span::raw(format!("/ {}", filter_label(app))),
+        Span::raw("/ "),
+    ];
+    if app.editing_filter {
+        spans.extend(app.filter.cursor_spans());
+    } else {
+        spans.push(Span::raw(filter_label(app)));
+    }
+    spans.extend([
         Span::raw(" | "),
         Span::raw(format!("{total} panes  ")),
         Span::styled(format!("•{free} free"), Style::default().fg(Color::White)),
@@ -1481,7 +1570,7 @@ fn draw_summary(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             format!("◆{watched} watched"),
             Style::default().fg(Color::Cyan),
         ),
-    ];
+    ]);
     if problems > 0 {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
@@ -1780,7 +1869,7 @@ fn draw_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     } else {
         "ready"
     };
-    let mut spans = vec![
+    let spans = vec![
         Span::raw(
             "[↑↓] move  [Enter] attach ro  [a] jump rw  [t] template  [z] send keys  [i] refresh  [/] filter  [d] details  [?] help  [x] kill  [q] quit   ",
         ),
@@ -1788,9 +1877,6 @@ fn draw_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         Span::raw("  "),
         Span::styled(short_message(&app.status), muted_style()),
     ];
-    if app.editing_filter {
-        spans.push(Span::styled(" _", Style::default().fg(Color::LightCyan)));
-    }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -1984,24 +2070,16 @@ fn input_prompt_line(prompt: &InputPrompt) -> Line<'static> {
             "literal text; Enter sends text plus Enter (Esc to cancel)",
         ),
     };
-    Line::from(vec![
-        Span::styled(label, Style::default().fg(Color::Yellow)),
-        Span::raw(prompt.value.clone()),
-        Span::styled(" _", Style::default().fg(Color::LightCyan)),
-        Span::raw(" | "),
-        Span::styled(hint, muted_style()),
-    ])
+    editable_prompt_line(label, &prompt.value, hint)
 }
 
 fn template_prompt_line(prompt: &TemplatePrompt) -> Line<'static> {
     match &prompt.step {
-        TemplatePromptStep::Host { value } => Line::from(vec![
-            Span::styled("template host ", Style::default().fg(Color::Yellow)),
-            Span::raw(value.clone()),
-            Span::styled(" _", Style::default().fg(Color::LightCyan)),
-            Span::raw(" | "),
-            Span::styled("Enter chooses host (Esc to cancel)", muted_style()),
-        ]),
+        TemplatePromptStep::Host { value } => editable_prompt_line(
+            "template host ",
+            value,
+            "Enter chooses host (Esc to cancel)",
+        ),
         TemplatePromptStep::Preset {
             host,
             presets,
@@ -2028,17 +2106,26 @@ fn template_prompt_line(prompt: &TemplatePrompt) -> Line<'static> {
             host,
             preset,
             value,
-        } => Line::from(vec![
-            Span::styled(
-                format!("template {host}/{}-", template_prefix_preview(preset)),
-                Style::default().fg(Color::Yellow),
-            ),
-            Span::raw(value.clone()),
-            Span::styled(" _", Style::default().fg(Color::LightCyan)),
-            Span::raw(" | "),
-            Span::styled("Enter creates session (Esc to cancel)", muted_style()),
-        ]),
+        } => editable_prompt_line(
+            format!("template {host}/{}-", template_prefix_preview(preset)),
+            value,
+            "Enter creates session (Esc to cancel)",
+        ),
     }
+}
+
+fn editable_prompt_line(
+    label: impl Into<String>,
+    value: &LineEditor,
+    hint: &'static str,
+) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        label.into(),
+        Style::default().fg(Color::Yellow),
+    )];
+    spans.extend(value.cursor_spans());
+    spans.extend([Span::raw(" | "), Span::styled(hint, muted_style())]);
+    Line::from(spans)
 }
 
 fn template_preset_label(preset: &SessionTemplatePreset) -> String {
@@ -2312,9 +2399,12 @@ fn empty_state_lines(app: &App) -> Vec<Line<'static>> {
         ];
     }
 
-    if !app.filter.trim().is_empty() {
+    if !app.filter.as_str().trim().is_empty() {
         return vec![
-            Line::from(format!("No rows match filter `{}`", app.filter.trim())),
+            Line::from(format!(
+                "No rows match filter `{}`",
+                app.filter.as_str().trim()
+            )),
             Line::from(host_problem_summary(app)),
         ];
     }
@@ -2511,7 +2601,7 @@ fn short_path(path: &str) -> String {
 }
 
 fn filter_label(app: &App) -> String {
-    let trimmed = app.filter.trim();
+    let trimmed = app.filter.as_str().trim();
     if trimmed.is_empty() {
         "-".to_string()
     } else {
@@ -2794,6 +2884,99 @@ mod tests {
         }
     }
 
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(ch: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL)
+    }
+
+    fn line_text(line: Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn line_editor_inserts_at_cursor_and_moves_by_character() {
+        let mut editor = LineEditor::new("ac");
+
+        assert!(editor.apply_key(key(KeyCode::Left)));
+        assert!(editor.apply_key(key(KeyCode::Char('b'))));
+
+        assert_eq!(editor.as_str(), "abc");
+        assert_eq!(line_text(Line::from(editor.cursor_spans())), "ab_c");
+    }
+
+    #[test]
+    fn line_editor_deletes_before_and_at_cursor() {
+        let mut editor = LineEditor::new("abcd");
+
+        editor.apply_key(key(KeyCode::Left));
+        editor.apply_key(key(KeyCode::Left));
+        editor.apply_key(key(KeyCode::Backspace));
+        assert_eq!(editor.as_str(), "acd");
+        assert_eq!(line_text(Line::from(editor.cursor_spans())), "a_cd");
+
+        editor.apply_key(key(KeyCode::Delete));
+        assert_eq!(editor.as_str(), "ad");
+        assert_eq!(line_text(Line::from(editor.cursor_spans())), "a_d");
+    }
+
+    #[test]
+    fn line_editor_supports_home_end_and_ctrl_movement() {
+        let mut editor = LineEditor::new("abcd");
+
+        editor.apply_key(key(KeyCode::Home));
+        assert_eq!(line_text(Line::from(editor.cursor_spans())), "_abcd");
+        editor.apply_key(ctrl('f'));
+        assert_eq!(line_text(Line::from(editor.cursor_spans())), "a_bcd");
+        editor.apply_key(ctrl('e'));
+        assert_eq!(line_text(Line::from(editor.cursor_spans())), "abcd_");
+        editor.apply_key(ctrl('b'));
+        assert_eq!(line_text(Line::from(editor.cursor_spans())), "abc_d");
+        editor.apply_key(ctrl('a'));
+        assert_eq!(line_text(Line::from(editor.cursor_spans())), "_abcd");
+    }
+
+    #[test]
+    fn line_editor_supports_readline_kill_keys() {
+        let mut editor = LineEditor::new("alpha beta  ");
+
+        editor.apply_key(ctrl('w'));
+        assert_eq!(editor.as_str(), "alpha ");
+        assert_eq!(line_text(Line::from(editor.cursor_spans())), "alpha _");
+
+        editor.apply_key(ctrl('u'));
+        assert_eq!(editor.as_str(), "");
+        assert_eq!(line_text(Line::from(editor.cursor_spans())), "_");
+
+        for ch in "gamma".chars() {
+            editor.apply_key(key(KeyCode::Char(ch)));
+        }
+        editor.apply_key(key(KeyCode::End));
+        editor.apply_key(key(KeyCode::Left));
+        editor.apply_key(ctrl('k'));
+        assert_eq!(editor.as_str(), "gamm");
+        assert_eq!(line_text(Line::from(editor.cursor_spans())), "gamm_");
+    }
+
+    #[test]
+    fn prompt_rendering_places_cursor_at_editor_cursor() {
+        let mut value = LineEditor::new("local/work");
+        for _ in 0..4 {
+            value.apply_key(key(KeyCode::Left));
+        }
+        let prompt = InputPrompt {
+            kind: InputPromptKind::NewSession,
+            value,
+        };
+
+        assert!(line_text(input_prompt_line(&prompt)).contains("local/_work"));
+    }
+
     use crate::snapshot::ProcessSnapshot;
 
     fn row_with_meta(
@@ -3002,7 +3185,7 @@ session_templates:
             }
             _ => panic!("expected cwd prompt"),
         }
-        assert!(prompt.value.is_empty());
+        assert!(prompt.value.as_str().is_empty());
         assert!(app.status.contains("type cwd or press Enter for default"));
     }
 }
