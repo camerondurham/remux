@@ -111,11 +111,7 @@ pub fn list(snapshots: &[HostSnapshot], json: bool) -> Result<()> {
                 .zip(session.tmux.pane.as_ref())
                 .map(|(window, pane)| format!("{window}.{pane}"))
                 .unwrap_or_else(|| "-".to_string());
-            let command = session
-                .process
-                .as_ref()
-                .map(|process| process.command.clone())
-                .unwrap_or_else(|| "-".to_string());
+            let command = session.display_command().unwrap_or_else(|| "-".to_string());
             let repo = session
                 .repo
                 .as_ref()
@@ -361,11 +357,7 @@ fn print_session_table(sessions: &[SessionSnapshot]) {
     let rows: Vec<Vec<String>> = sessions
         .iter()
         .map(|session| {
-            let command = session
-                .process
-                .as_ref()
-                .map(|process| process.command.clone())
-                .unwrap_or_else(|| "-".to_string());
+            let command = session.display_command().unwrap_or_else(|| "-".to_string());
             let cwd = session
                 .process
                 .as_ref()

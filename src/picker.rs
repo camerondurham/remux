@@ -70,11 +70,7 @@ fn picker_rows(config: &Config, host: Option<&str>, sessions_mode: bool) -> Resu
 }
 
 fn pane_row(row: &SessionSnapshot, target: &str) -> String {
-    let command = row
-        .process
-        .as_ref()
-        .map(|process| process.command.as_str())
-        .unwrap_or("-");
+    let command = row.display_command().unwrap_or_else(|| "-".to_string());
     let cwd = row
         .process
         .as_ref()

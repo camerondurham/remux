@@ -66,7 +66,7 @@ impl RollupBuilder {
 
         if self.target.is_none() || is_more_active(row.state, self.state.unwrap_or(row.state)) {
             self.target = row.raw_target.clone();
-            self.active_cmd = row.process.as_ref().map(|process| process.command.clone());
+            self.active_cmd = row.display_command();
         }
         if let Some(window) = &row.tmux.window {
             self.windows.insert(window.clone());

@@ -1619,13 +1619,7 @@ fn draw_live_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 
             let age_cell = Cell::from(last_output_age(session));
 
-            let cmd_cell = Cell::from(
-                session
-                    .process
-                    .as_ref()
-                    .map(|p| p.command.clone())
-                    .unwrap_or_else(|| "-".to_string()),
-            );
+            let cmd_cell = Cell::from(session.display_command().unwrap_or_else(|| "-".to_string()));
 
             let preview_text = session
                 .output
@@ -2556,8 +2550,10 @@ fn row_search_text(row: &SessionSnapshot) -> String {
         .as_ref()
         .map(|output| format!("{} {}", output.preview, output.recent))
         .unwrap_or_default();
+    let display_command = row.display_command().unwrap_or_default();
+    let agent_hint = row.agent_hint.as_deref().unwrap_or("");
     format!(
-        "{} {} {} {} {} {} {} {} {}",
+        "{} {} {} {} {} {} {} {} {} {} {}",
         row.host,
         row.tmux_socket.as_deref().unwrap_or(""),
         row.display_id,
@@ -2567,6 +2563,8 @@ fn row_search_text(row: &SessionSnapshot) -> String {
             .as_ref()
             .map(|process| process.command.as_str())
             .unwrap_or(""),
+        display_command,
+        agent_hint,
         row.process
             .as_ref()
             .map(|process| process.cwd.as_str())
@@ -2875,6 +2873,35 @@ mod tests {
     fn friendly_label_drops_window_name_matching_window_index() {
         let row = row_with_meta("zsh", Some("2"), Some("2"), None, Some("dev-dsk-cam"));
         assert_eq!(friendly_label_suffix(&row), None);
+    }
+
+    #[test]
+    fn search_and_command_display_include_detected_pi_agent() {
+        let mut row = row_with_meta(
+            "node",
+            Some("2"),
+            None,
+            Some("\u{03c0} - work - Read the TaskPacket"),
+            Some("local"),
+        );
+        row.agent_hint = Some("pi".to_string());
+
+        assert_eq!(row.display_command().as_deref(), Some("pi"));
+        assert!(row_search_text(&row).contains("pi"));
+    }
+
+    #[test]
+    fn command_display_keeps_specific_agent_commands() {
+        let row = row_with_meta(
+            "kiro-cli",
+            Some("0"),
+            None,
+            Some("pi - stale title"),
+            Some("local"),
+        );
+
+        assert_eq!(row.display_command().as_deref(), Some("kiro-cli"));
+        assert!(!row_search_text(&row).contains("pi"));
     }
 
     #[test]

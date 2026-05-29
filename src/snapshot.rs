@@ -111,6 +111,23 @@ pub struct SessionSnapshot {
     pub errors: Vec<SnapshotError>,
 }
 
+impl SessionSnapshot {
+    pub fn display_command(&self) -> Option<String> {
+        let process = self.process.as_ref()?;
+        if agent_from_command(&process.command).is_some() {
+            return Some(process.command.clone());
+        }
+
+        if let Some(agent) = agent_from_labels(
+            self.tmux.window_name.as_deref(),
+            self.tmux.pane_title.as_deref(),
+        ) {
+            return Some(agent.to_string());
+        }
+        Some(process.command.clone())
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TmuxSnapshot {
     pub session: String,
@@ -675,6 +692,12 @@ fn snapshot_for_pane(
         })
     };
 
+    let detected_agent = infer_coding_agent(
+        &pane.command,
+        pane.window_name.as_deref(),
+        pane.pane_title.as_deref(),
+    );
+
     SessionSnapshot {
         session_id: display_id.clone(),
         target: pane.target.clone(),
@@ -688,7 +711,10 @@ fn snapshot_for_pane(
         candidate_targets: row.candidate_targets,
         shadowed_by: row.shadowed_by,
         state,
-        agent_hint: row.watch.and_then(|watch| watch.watch.agent_hint.clone()),
+        agent_hint: row
+            .watch
+            .and_then(|watch| watch.watch.agent_hint.clone())
+            .or_else(|| detected_agent.map(str::to_string)),
         tmux: TmuxSnapshot {
             session: pane.session.clone(),
             window: Some(pane.window.clone()),
@@ -708,6 +734,66 @@ fn snapshot_for_pane(
         output,
         errors,
     }
+}
+
+fn infer_coding_agent(
+    command: &str,
+    window_name: Option<&str>,
+    pane_title: Option<&str>,
+) -> Option<&'static str> {
+    if let Some(agent) = agent_from_command(command) {
+        return Some(agent);
+    }
+
+    agent_from_labels(window_name, pane_title)
+}
+
+fn agent_from_labels(window_name: Option<&str>, pane_title: Option<&str>) -> Option<&'static str> {
+    for label in [window_name, pane_title].into_iter().flatten() {
+        if is_pi_agent_label(label) {
+            return Some("pi");
+        }
+        if label.to_ascii_lowercase().contains("claude code") {
+            return Some("claude");
+        }
+    }
+
+    None
+}
+
+fn agent_from_command(command: &str) -> Option<&'static str> {
+    let command = command
+        .rsplit('/')
+        .next()
+        .unwrap_or(command)
+        .trim()
+        .to_ascii_lowercase();
+    match command.as_str() {
+        "pi" | "pi-cli" => Some("pi"),
+        "claude" | "claude-code" => Some("claude"),
+        "codex" | "codex-cli" => Some("codex"),
+        "kiro" | "kiro-cli" => Some("kiro"),
+        _ => None,
+    }
+}
+
+fn is_pi_agent_label(label: &str) -> bool {
+    let label = label.trim_start();
+    if let Some(first) = label.chars().next()
+        && matches!(first, '\u{03c0}' | '\u{03a0}')
+    {
+        return true;
+    }
+
+    let label = label.to_ascii_lowercase();
+    matches!(
+        label.strip_prefix("pi"),
+        Some(rest)
+            if rest.starts_with(" - ")
+                || rest.starts_with(" | ")
+                || rest.starts_with(": ")
+                || rest == " coding agent"
+    )
 }
 
 fn watch_without_pane_snapshot(
@@ -1051,6 +1137,26 @@ mod tests {
         assert_eq!(resolutions[1].status, MatchStatus::Shadowed);
         assert_eq!(resolutions[1].shadowed_by.as_deref(), Some("first"));
         assert!(claimed.contains("local/scratch:1.0"));
+    }
+
+    #[test]
+    fn infers_pi_agent_from_tmux_title_when_command_is_node() {
+        let mut pane = pane("local/myservice:2.0", "myservice", "2", "0", "node", "/tmp");
+        pane.pane_title = Some("\u{03c0} - work - Read the TaskPacket".to_string());
+
+        assert_eq!(
+            infer_coding_agent(
+                &pane.command,
+                pane.window_name.as_deref(),
+                pane.pane_title.as_deref()
+            ),
+            Some("pi")
+        );
+    }
+
+    #[test]
+    fn does_not_treat_plain_pi_host_title_as_agent() {
+        assert_eq!(infer_coding_agent("node", None, Some("pi")), None);
     }
 
     fn watch(id: &str, matcher: WatchMatchConfig) -> IndexedWatch {
