@@ -105,6 +105,11 @@ poll:
   command_timeout: 15s
   max_concurrency: 4
 
+tui:
+  sort:
+    field: attention      # attention | last-output | state | id
+    direction: desc       # asc | desc
+
 hosts:
   - id: local
     type: local
@@ -164,11 +169,12 @@ remux send-keys 'pi/work:0.1' 'cargo test'
 ## Core capabilities
 
 - index tmux panes across local and SSH hosts
+- browse live panes grouped by host, session, and window in the TUI
 - show command, cwd, repo, activity, and match state
 - inspect output, capture panes, and jump in read-only or read-write
 - assign friendly watch IDs to panes you revisit often
 
-![remux TUI: single-line summary, live pane table (NAME/AGE/CMD/PREVIEW) with colored state glyphs, and a right-hand context rail showing the selected pane](docs/assets/remux-tui.png)
+![remux TUI: single-line summary, live pane tree (NAME/AGE/CMD/PREVIEW) with colored state glyphs, and a right-hand context rail showing the selected pane](docs/assets/remux-tui.png)
 
 ## Core commands
 
@@ -236,7 +242,7 @@ session_templates:
 Main keys:
 
 ```text
-[↑↓] move  [Enter] attach ro  [a] jump rw  [t] template  [z] send keys  [i] refresh  [/] filter  [d] details  [?] help  [x] kill  [q] quit
+[↑↓] move  [Enter] attach ro  [a] jump rw  [s/S] sort  [t] template  [z] send keys  [i] refresh  [/] filter  [d] details  [?] help  [x] kill  [q] quit
 ```
 
 More keys available in the help overlay (`?`):
@@ -245,7 +251,8 @@ More keys available in the help overlay (`?`):
 | --- | --- |
 | `j` / `k` | Select next / previous row |
 | `r` | Re-poll every configured host |
-| `s` | Cycle the table sort mode |
+| `s` | Cycle the table sort field |
+| `S` | Toggle the table sort direction |
 | `c` | Capture selected pane output into the detail view |
 | `e` | Rename the selected session |
 | `n` | Create a new tmux session on a host (`<host>/<session>`, then optional cwd) |
