@@ -5,6 +5,13 @@ poll:
   ssh_timeout: 5s
   command_timeout: 15s
 
+tui:
+  sort:
+    # attention | last-output | state | id
+    field: attention
+    # asc | desc
+    direction: desc
+
 hosts:
   - id: local
     type: local
