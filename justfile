@@ -6,6 +6,9 @@ default:
 fmt:
     cargo fmt --all
 
+fetch:
+    cargo fetch --locked
+
 fmt-check:
     cargo fmt --all -- --check
 
@@ -28,10 +31,10 @@ run-list config="fixtures/config/pi.yaml":
     cargo run --locked -- --config {{config}} list
 
 validate-fixtures:
-    cargo run --locked -- --config fixtures/config/valid.yaml hosts
+    cargo run --locked -- --config fixtures/config/pi.yaml hosts
     ! cargo run --locked -- --config fixtures/config/duplicate-host.yaml hosts
     ! cargo run --locked -- --config fixtures/config/duplicate-session.yaml hosts
     ! cargo run --locked -- --config fixtures/config/missing-host-ref.yaml hosts
     ! cargo run --locked -- --config fixtures/config/invalid-duration.yaml hosts
 
-ci: fmt-check lint test release help validate-fixtures
+ci: fetch fmt-check lint test release help validate-fixtures
