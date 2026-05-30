@@ -1,5 +1,5 @@
 use crate::attach;
-use crate::config::Config;
+use crate::config::{Config, TuiSortDirection, TuiSortField};
 use crate::dir_picker;
 use crate::lifecycle;
 use crate::snapshot::{
@@ -59,7 +59,7 @@ fn run_app(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
 ) -> Result<()> {
     let (tx, rx) = mpsc::channel();
-    let mut app = App::new(filter);
+    let mut app = App::new(filter, config.tui.sort.field, config.tui.sort.direction);
     spawn_refresh(&config, host.clone(), tx.clone(), &mut app)?;
 
     loop {
@@ -130,18 +130,29 @@ struct App {
     kill_prompt: Option<KillPrompt>,
     input_prompt: Option<InputPrompt>,
     template_prompt: Option<TemplatePrompt>,
-    sort_mode: SortMode,
+    sort_field: TuiSortField,
+    sort_direction: TuiSortDirection,
     show_context: bool,
     inspect_mode: bool,
     inspect_pending: Option<String>,
+    pending_selection: Option<SelectionPreference>,
 }
 
-#[derive(Clone, Copy)]
-enum SortMode {
-    Attention,
-    LastOutput,
-    State,
-    Id,
+#[derive(Clone)]
+struct SelectionPreference {
+    identity: String,
+    host: String,
+    session: String,
+}
+
+impl SelectionPreference {
+    fn new_session(host: &str, session: &str) -> Self {
+        Self {
+            identity: format!("target:{host}/{session}:0.0"),
+            host: host.to_string(),
+            session: session.to_string(),
+        }
+    }
 }
 
 struct KillPrompt {
@@ -200,7 +211,7 @@ enum HostProgressState {
 }
 
 impl App {
-    fn new(filter: String) -> Self {
+    fn new(filter: String, sort_field: TuiSortField, sort_direction: TuiSortDirection) -> Self {
         Self {
             snapshots: Vec::new(),
             selected: 0,
@@ -220,10 +231,12 @@ impl App {
             kill_prompt: None,
             input_prompt: None,
             template_prompt: None,
-            sort_mode: SortMode::Attention,
+            sort_field,
+            sort_direction,
             show_context: true,
             inspect_mode: false,
             inspect_pending: None,
+            pending_selection: None,
         }
     }
 
@@ -240,7 +253,7 @@ impl App {
                         .contains(filter.as_str())
             })
             .collect();
-        rows.sort_by(|left, right| compare_rows(left, right, self.sort_mode));
+        rows.sort_by(|left, right| self.compare_tree_rows(left, right));
         rows
     }
 
@@ -253,14 +266,14 @@ impl App {
         self.selected_row().map(row_identity)
     }
 
-    fn restore_selection(&mut self, preferred_identity: Option<String>) {
+    fn restore_selection(&mut self, preferred_identity: Option<String>) -> bool {
         let preferred_identity = preferred_identity.or_else(|| self.selected_identity.clone());
         let (selected, selected_identity) = {
             let rows = self.rows();
             if rows.is_empty() {
                 self.selected = 0;
                 self.selected_identity = None;
-                return;
+                return false;
             }
             let selected = if let Some(identity) = preferred_identity {
                 rows.iter()
@@ -274,10 +287,64 @@ impl App {
         if selected_identity.is_none() {
             self.selected = 0;
             self.selected_identity = None;
-            return;
+            return false;
         }
         self.selected = selected;
         self.selected_identity = selected_identity;
+        true
+    }
+
+    fn restore_selection_after_refresh(&mut self, fallback_identity: Option<String>) {
+        if self.restore_pending_selection() {
+            return;
+        }
+        self.restore_selection(fallback_identity);
+    }
+
+    fn restore_pending_selection(&mut self) -> bool {
+        let Some(preference) = self.pending_selection.clone() else {
+            return false;
+        };
+        let selected = {
+            let rows = self.rows();
+            let exact = rows
+                .iter()
+                .position(|row| row_identity(row) == preference.identity);
+            let fallback = exact.or_else(|| {
+                rows.iter().position(|row| {
+                    row.raw_target.is_some()
+                        && row.host == preference.host
+                        && row.tmux.session == preference.session
+                })
+            });
+            fallback.map(|index| (index, row_identity(rows[index])))
+        };
+        let Some((selected, selected_identity)) = selected else {
+            return false;
+        };
+        self.selected = selected;
+        self.selected_identity = Some(selected_identity);
+        self.pending_selection = None;
+        true
+    }
+
+    fn compare_tree_rows(&self, left: &SessionSnapshot, right: &SessionSnapshot) -> Ordering {
+        self.host_rank(&left.host)
+            .cmp(&self.host_rank(&right.host))
+            .then_with(|| left.tmux_socket.cmp(&right.tmux_socket))
+            .then_with(|| left.tmux.session.cmp(&right.tmux.session))
+            .then_with(|| {
+                compare_tmux_index(left.tmux.window.as_deref(), right.tmux.window.as_deref())
+            })
+            .then_with(|| compare_sort_field(left, right, self.sort_field, self.sort_direction))
+            .then_with(|| stable_row_cmp(left, right))
+    }
+
+    fn host_rank(&self, host: &str) -> usize {
+        self.snapshots
+            .iter()
+            .position(|snapshot| snapshot.host == host)
+            .unwrap_or(usize::MAX)
     }
 
     fn begin_refresh(&mut self, host_ids: Vec<String>) {
@@ -310,7 +377,7 @@ impl App {
                 let selected_identity = self.selected_row_identity();
                 self.update_host_finished(&snapshot);
                 self.upsert_snapshot(snapshot);
-                self.restore_selection(selected_identity);
+                self.restore_selection_after_refresh(selected_identity);
                 self.status = self.progress_summary();
             }
             RefreshMessage::Complete => {
@@ -328,6 +395,9 @@ impl App {
                 }
                 self.last_refresh_duration = self.refresh_started_at.map(|t| t.elapsed());
                 self.refresh_completed_at = Some(Instant::now());
+                if self.pending_selection.is_some() && !self.restore_pending_selection() {
+                    self.pending_selection = None;
+                }
                 self.status = format!("scan complete: {}", self.progress_summary());
             }
             RefreshMessage::InspectResult { display_id, result } => {
@@ -454,13 +524,22 @@ impl App {
         }
     }
 
-    fn cycle_sort_mode(&mut self) {
+    fn cycle_sort_field(&mut self) {
         let selected_identity = self.selected_row_identity();
-        self.sort_mode = match self.sort_mode {
-            SortMode::Attention => SortMode::LastOutput,
-            SortMode::LastOutput => SortMode::State,
-            SortMode::State => SortMode::Id,
-            SortMode::Id => SortMode::Attention,
+        self.sort_field = match self.sort_field {
+            TuiSortField::Attention => TuiSortField::LastOutput,
+            TuiSortField::LastOutput => TuiSortField::State,
+            TuiSortField::State => TuiSortField::Id,
+            TuiSortField::Id => TuiSortField::Attention,
+        };
+        self.restore_selection(selected_identity);
+    }
+
+    fn toggle_sort_direction(&mut self) {
+        let selected_identity = self.selected_row_identity();
+        self.sort_direction = match self.sort_direction {
+            TuiSortDirection::Asc => TuiSortDirection::Desc,
+            TuiSortDirection::Desc => TuiSortDirection::Asc,
         };
         self.restore_selection(selected_identity);
     }
@@ -469,17 +548,6 @@ impl App {
 impl HostProgressState {
     fn is_finished(self) -> bool {
         matches!(self, HostProgressState::Ok | HostProgressState::Unreachable)
-    }
-}
-
-impl SortMode {
-    fn label(self) -> &'static str {
-        match self {
-            SortMode::Attention => "attention",
-            SortMode::LastOutput => "last-output",
-            SortMode::State => "state",
-            SortMode::Id => "id",
-        }
     }
 }
 
@@ -709,8 +777,13 @@ fn handle_key(
             Ok(false)
         }
         KeyCode::Char('s') => {
-            app.cycle_sort_mode();
-            app.status = format!("sort: {}", app.sort_mode.label());
+            app.cycle_sort_field();
+            app.status = format!("sort: {}", sort_label(app.sort_field, app.sort_direction));
+            Ok(false)
+        }
+        KeyCode::Char('S') => {
+            app.toggle_sort_direction();
+            app.status = format!("sort: {}", sort_label(app.sort_field, app.sort_direction));
             Ok(false)
         }
         KeyCode::Char('r') => {
@@ -1211,6 +1284,7 @@ fn create_session(
         Ok(()) => {
             let cwd_label = cwd.map(|cwd| format!(" in {cwd}")).unwrap_or_default();
             app.status = format!("created session {host_id}/{session_name}{cwd_label}");
+            app.pending_selection = Some(SelectionPreference::new_session(host_id, session_name));
             spawn_refresh(config, Some(host_id.to_string()), tx, app)?;
         }
         Err(err) => app.status = format!("{err:#}"),
@@ -1406,6 +1480,11 @@ fn draw_summary(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     )));
     spans.push(Span::raw(" | "));
     spans.push(Span::styled(mode, Style::default().fg(Color::Cyan)));
+    spans.push(Span::raw(" | sort "));
+    spans.push(Span::styled(
+        sort_label(app.sort_field, app.sort_direction),
+        muted_style(),
+    ));
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -1486,11 +1565,90 @@ fn is_default_host_title(title: &str, host_short: Option<&str>) -> bool {
     false
 }
 
+enum LiveTableRow<'a> {
+    Group {
+        label: String,
+        depth: u8,
+    },
+    Pane {
+        row: &'a SessionSnapshot,
+        pane_index: usize,
+    },
+}
+
+fn live_table_rows<'a>(rows: &[&'a SessionSnapshot]) -> Vec<LiveTableRow<'a>> {
+    let mut table_rows = Vec::new();
+    let mut current_host: Option<(String, Option<String>)> = None;
+    let mut current_session: Option<String> = None;
+    let mut current_window: Option<String> = None;
+
+    for (pane_index, row) in rows.iter().enumerate() {
+        let host_key = (row.host.clone(), row.tmux_socket.clone());
+        if current_host.as_ref() != Some(&host_key) {
+            table_rows.push(LiveTableRow::Group {
+                label: host_group_label(row),
+                depth: 0,
+            });
+            current_host = Some(host_key);
+            current_session = None;
+            current_window = None;
+        }
+
+        if current_session.as_deref() != Some(row.tmux.session.as_str()) {
+            table_rows.push(LiveTableRow::Group {
+                label: format!("session {}", row.tmux.session),
+                depth: 1,
+            });
+            current_session = Some(row.tmux.session.clone());
+            current_window = None;
+        }
+
+        if let Some(window) = &row.tmux.window
+            && current_window.as_deref() != Some(window.as_str())
+        {
+            table_rows.push(LiveTableRow::Group {
+                label: window_group_label(row),
+                depth: 2,
+            });
+            current_window = Some(window.clone());
+        }
+
+        table_rows.push(LiveTableRow::Pane {
+            row: *row,
+            pane_index,
+        });
+    }
+
+    table_rows
+}
+
+fn host_group_label(row: &SessionSnapshot) -> String {
+    match row.tmux_socket.as_deref() {
+        Some(socket) => format!("host {}  [{}]", row.host, socket),
+        None => format!("host {}", row.host),
+    }
+}
+
+fn window_group_label(row: &SessionSnapshot) -> String {
+    let window = row.tmux.window.as_deref().unwrap_or("-");
+    let window_name = row
+        .tmux
+        .window_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .filter(|name| *name != window);
+    match window_name {
+        Some(name) => format!("window {window}  [{name}]"),
+        None => format!("window {window}"),
+    }
+}
+
 fn draw_live_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let rows = app.rows();
     if rows.is_empty() {
         let paragraph = Paragraph::new(Text::from(empty_state_lines(app)))
-            .block(Block::default().borders(Borders::ALL).title("live table"))
+            .block(Block::default().borders(Borders::ALL).title("live tree"))
             .wrap(Wrap { trim: false });
         frame.render_widget(paragraph, area);
         return;
@@ -1502,55 +1660,18 @@ fn draw_live_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let preview_min: u16 = 30;
 
     let selected_idx = app.selected.min(rows.len() - 1);
-    let table_rows: Vec<Row> = rows
+    let display_rows = live_table_rows(&rows);
+    let selected_display_idx = display_rows
         .iter()
-        .enumerate()
-        .map(|(i, session)| {
-            let selector = if i == selected_idx { "› " } else { "  " };
-            let glyph = row_glyph(session);
-            let prefix = format!("{selector}{glyph}");
-
-            let mut name_spans = vec![Span::styled(prefix, canonical_state_style(session))];
-            if session.tmux_socket.is_some() {
-                name_spans.push(Span::styled(
-                    "i ",
-                    Style::default()
-                        .fg(Color::LightBlue)
-                        .add_modifier(Modifier::BOLD),
-                ));
+        .position(|row| matches!(row, LiveTableRow::Pane { pane_index, .. } if *pane_index == selected_idx))
+        .unwrap_or(0);
+    let table_rows: Vec<Row> = display_rows
+        .iter()
+        .map(|display_row| match display_row {
+            LiveTableRow::Group { label, depth } => group_table_row(label, *depth),
+            LiveTableRow::Pane { row, pane_index } => {
+                pane_table_row(row, *pane_index == selected_idx)
             }
-            name_spans.push(Span::styled(
-                session.display_id.clone(),
-                canonical_state_style(session),
-            ));
-            if let Some(label) = friendly_label_suffix(session) {
-                name_spans.push(Span::raw(" "));
-                name_spans.push(Span::styled(label, muted_style()));
-            }
-            let name_cell = Cell::from(Line::from(name_spans));
-
-            let age_cell = Cell::from(last_output_age(session));
-
-            let cmd_cell = Cell::from(session.display_command().unwrap_or_else(|| "-".to_string()));
-
-            let preview_text = session
-                .output
-                .as_ref()
-                .and_then(|o| {
-                    let src = if o.recent.is_empty() {
-                        &o.preview
-                    } else {
-                        &o.recent
-                    };
-                    src.lines()
-                        .rfind(|l| !l.trim().is_empty())
-                        .map(|l| l.to_string())
-                })
-                .or_else(|| row_issue_summary(session))
-                .unwrap_or_else(|| "(no capture)".to_string());
-            let preview_cell = Cell::from(preview_text).style(muted_style());
-
-            Row::new(vec![name_cell, age_cell, cmd_cell, preview_cell])
         })
         .collect();
 
@@ -1576,8 +1697,77 @@ fn draw_live_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     );
 
     let mut state = TableState::default();
-    state.select(Some(selected_idx));
+    state.select(Some(selected_display_idx));
     frame.render_stateful_widget(table, area, &mut state);
+}
+
+fn group_table_row(label: &str, depth: u8) -> Row<'static> {
+    let indent = "  ".repeat(depth as usize);
+    let name = Line::from(vec![
+        Span::raw(indent),
+        Span::styled("▾ ", muted_style()),
+        Span::styled(label.to_string(), label_style()),
+    ]);
+    Row::new(vec![
+        Cell::from(name),
+        Cell::from(""),
+        Cell::from(""),
+        Cell::from(""),
+    ])
+    .style(muted_style())
+}
+
+fn pane_table_row(session: &SessionSnapshot, selected: bool) -> Row<'static> {
+    let selector = if selected { "› " } else { "  " };
+    let glyph = row_glyph(session);
+    let indent = if session.tmux.window.is_some() {
+        "      "
+    } else {
+        "    "
+    };
+    let prefix = format!("{indent}{selector}{glyph}");
+
+    let mut name_spans = vec![Span::styled(prefix, canonical_state_style(session))];
+    if session.tmux_socket.is_some() {
+        name_spans.push(Span::styled(
+            "i ",
+            Style::default()
+                .fg(Color::LightBlue)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    name_spans.push(Span::styled(
+        session.display_id.clone(),
+        canonical_state_style(session),
+    ));
+    if let Some(label) = friendly_label_suffix(session) {
+        name_spans.push(Span::raw(" "));
+        name_spans.push(Span::styled(label, muted_style()));
+    }
+    let name_cell = Cell::from(Line::from(name_spans));
+
+    let age_cell = Cell::from(last_output_age(session));
+
+    let cmd_cell = Cell::from(session.display_command().unwrap_or_else(|| "-".to_string()));
+
+    let preview_text = session
+        .output
+        .as_ref()
+        .and_then(|o| {
+            let src = if o.recent.is_empty() {
+                &o.preview
+            } else {
+                &o.recent
+            };
+            src.lines()
+                .rfind(|l| !l.trim().is_empty())
+                .map(|l| l.to_string())
+        })
+        .or_else(|| row_issue_summary(session))
+        .unwrap_or_else(|| "(no capture)".to_string());
+    let preview_cell = Cell::from(preview_text).style(muted_style());
+
+    Row::new(vec![name_cell, age_cell, cmd_cell, preview_cell])
 }
 
 fn draw_inspector(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
@@ -1593,7 +1783,8 @@ fn draw_inspector(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             Line::from("[j/↓] select next"),
             Line::from("[k/↑] select previous"),
             Line::from("[r] refresh now"),
-            Line::from("[s] cycle table sort"),
+            Line::from("[s] cycle table sort field"),
+            Line::from("[S] toggle table sort direction"),
             Line::from("[/] filter"),
             Line::from("[Enter] readonly attach"),
             Line::from("[a] read-write jump"),
@@ -1694,7 +1885,7 @@ fn draw_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     };
     let spans = vec![
         Span::raw(
-            "[↑↓] move  [Enter] attach ro  [a] jump rw  [t] template  [z] send keys  [i] refresh  [/] filter  [d] details  [?] help  [x] kill  [q] quit   ",
+            "[↑↓] move  [Enter] attach ro  [a] jump rw  [s/S] sort  [t] template  [z] send keys  [i] refresh  [/] filter  [d] details  [?] help  [x] kill  [q] quit   ",
         ),
         Span::styled(mode, Style::default().fg(Color::Cyan)),
         Span::raw("  "),
@@ -2501,20 +2692,67 @@ fn row_identity(row: &SessionSnapshot) -> String {
         .unwrap_or_else(|| format!("display:{}|{}", row.display_id, row.target))
 }
 
-fn compare_rows(left: &SessionSnapshot, right: &SessionSnapshot, mode: SortMode) -> Ordering {
-    match mode {
-        SortMode::Attention => attention_score(right)
-            .cmp(&attention_score(left))
-            .then_with(|| state_rank(right.state).cmp(&state_rank(left.state)))
-            .then_with(|| left.display_id.cmp(&right.display_id)),
-        SortMode::LastOutput => last_output_timestamp(right)
-            .cmp(&last_output_timestamp(left))
-            .then_with(|| left.display_id.cmp(&right.display_id)),
-        SortMode::State => state_rank(right.state)
-            .cmp(&state_rank(left.state))
-            .then_with(|| left.display_id.cmp(&right.display_id)),
-        SortMode::Id => left.display_id.cmp(&right.display_id),
+fn compare_sort_field(
+    left: &SessionSnapshot,
+    right: &SessionSnapshot,
+    field: TuiSortField,
+    direction: TuiSortDirection,
+) -> Ordering {
+    let ordering = match field {
+        TuiSortField::Attention => attention_score(left)
+            .cmp(&attention_score(right))
+            .then_with(|| state_rank(left.state).cmp(&state_rank(right.state))),
+        TuiSortField::LastOutput => last_output_timestamp(left).cmp(&last_output_timestamp(right)),
+        TuiSortField::State => state_rank(left.state).cmp(&state_rank(right.state)),
+        TuiSortField::Id => left.display_id.cmp(&right.display_id),
+    };
+    match direction {
+        TuiSortDirection::Asc => ordering,
+        TuiSortDirection::Desc => ordering.reverse(),
     }
+}
+
+fn stable_row_cmp(left: &SessionSnapshot, right: &SessionSnapshot) -> Ordering {
+    left.host
+        .cmp(&right.host)
+        .then_with(|| left.tmux_socket.cmp(&right.tmux_socket))
+        .then_with(|| left.tmux.session.cmp(&right.tmux.session))
+        .then_with(|| compare_tmux_index(left.tmux.window.as_deref(), right.tmux.window.as_deref()))
+        .then_with(|| left.tmux.window.cmp(&right.tmux.window))
+        .then_with(|| compare_tmux_index(left.tmux.pane.as_deref(), right.tmux.pane.as_deref()))
+        .then_with(|| left.tmux.pane.cmp(&right.tmux.pane))
+        .then_with(|| left.tmux.pane_id.cmp(&right.tmux.pane_id))
+        .then_with(|| left.raw_target.cmp(&right.raw_target))
+        .then_with(|| left.target.cmp(&right.target))
+        .then_with(|| left.watch_index.cmp(&right.watch_index))
+        .then_with(|| left.display_id.cmp(&right.display_id))
+        .then_with(|| row_identity(left).cmp(&row_identity(right)))
+}
+
+fn compare_tmux_index(left: Option<&str>, right: Option<&str>) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => match (left.parse::<u32>(), right.parse::<u32>()) {
+            (Ok(left), Ok(right)) => left.cmp(&right),
+            _ => left.cmp(right),
+        },
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn sort_label(field: TuiSortField, direction: TuiSortDirection) -> String {
+    let field = match field {
+        TuiSortField::Attention => "attention",
+        TuiSortField::LastOutput => "last-output",
+        TuiSortField::State => "state",
+        TuiSortField::Id => "id",
+    };
+    let direction = match direction {
+        TuiSortDirection::Asc => "asc",
+        TuiSortDirection::Desc => "desc",
+    };
+    format!("{field} {direction}")
 }
 
 fn attention_score(row: &SessionSnapshot) -> usize {
@@ -2637,7 +2875,9 @@ fn short_message(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snapshot::{MatchStatus, SessionSnapshot, SessionState, TmuxSnapshot};
+    use crate::snapshot::{
+        HostSnapshot, MatchStatus, SessionSnapshot, SessionState, SnapshotStatus, TmuxSnapshot,
+    };
     use crate::tui::session_template::SessionTemplatePrefix;
 
     fn make_row(match_status: MatchStatus, state: SessionState) -> SessionSnapshot {
@@ -2672,6 +2912,38 @@ mod tests {
         }
     }
 
+    fn row_at(
+        host: &str,
+        session: &str,
+        window: &str,
+        pane: &str,
+        display_id: &str,
+    ) -> SessionSnapshot {
+        let mut row = make_row(MatchStatus::Orphan, SessionState::Active);
+        let target = format!("{host}/{session}:{window}.{pane}");
+        row.session_id = display_id.to_string();
+        row.target = target.clone();
+        row.display_id = display_id.to_string();
+        row.raw_target = Some(target);
+        row.host = host.to_string();
+        row.tmux.session = session.to_string();
+        row.tmux.window = Some(window.to_string());
+        row.tmux.pane = Some(pane.to_string());
+        row.tmux.pane_id = Some(format!("%{window}{pane}"));
+        row
+    }
+
+    fn host_snapshot(host: &str, sessions: Vec<SessionSnapshot>) -> HostSnapshot {
+        HostSnapshot {
+            host: host.to_string(),
+            tmux_socket: None,
+            status: SnapshotStatus::Ok,
+            collected_at: Utc::now(),
+            sessions,
+            errors: Vec::new(),
+        }
+    }
+
     #[test]
     fn canonical_state_mapping() {
         let cases = [
@@ -2695,6 +2967,94 @@ mod tests {
                 "canonical_state({ms:?}, {ss:?})"
             );
         }
+    }
+
+    #[test]
+    fn stable_row_cmp_breaks_duplicate_display_id_ties() {
+        let pane_two = row_at("local", "work", "0", "2", "same");
+        let pane_one = row_at("local", "work", "0", "1", "same");
+        let mut rows = [pane_two, pane_one];
+
+        rows.sort_by(|left, right| {
+            compare_sort_field(
+                left,
+                right,
+                TuiSortField::LastOutput,
+                TuiSortDirection::Desc,
+            )
+            .then_with(|| stable_row_cmp(left, right))
+        });
+
+        assert_eq!(rows[0].raw_target.as_deref(), Some("local/work:0.1"));
+        assert_eq!(rows[1].raw_target.as_deref(), Some("local/work:0.2"));
+    }
+
+    #[test]
+    fn app_rows_sort_within_tree_groups() {
+        let mut app = App::new(String::new(), TuiSortField::Id, TuiSortDirection::Asc);
+        app.snapshots = vec![host_snapshot(
+            "local",
+            vec![
+                row_at("local", "beta", "0", "0", "a-pane"),
+                row_at("local", "alpha", "0", "0", "z-pane"),
+            ],
+        )];
+
+        let targets: Vec<&str> = app
+            .rows()
+            .iter()
+            .filter_map(|row| row.raw_target.as_deref())
+            .collect();
+
+        assert_eq!(targets, vec!["local/alpha:0.0", "local/beta:0.0"]);
+    }
+
+    #[test]
+    fn live_table_rows_include_host_session_window_groups() {
+        let row = row_at("local", "work", "0", "1", "pane");
+        let rows = vec![&row];
+        let table_rows = live_table_rows(&rows);
+
+        assert!(matches!(
+            &table_rows[0],
+            LiveTableRow::Group { label, depth: 0 } if label == "host local"
+        ));
+        assert!(matches!(
+            &table_rows[1],
+            LiveTableRow::Group { label, depth: 1 } if label == "session work"
+        ));
+        assert!(matches!(
+            &table_rows[2],
+            LiveTableRow::Group { label, depth: 2 } if label == "window 0"
+        ));
+        assert!(matches!(
+            &table_rows[3],
+            LiveTableRow::Pane { pane_index: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn pending_new_session_selection_falls_back_to_first_live_pane() {
+        let mut app = App::new(
+            String::new(),
+            TuiSortField::Attention,
+            TuiSortDirection::Desc,
+        );
+        app.pending_selection = Some(SelectionPreference::new_session("local", "new-work"));
+        app.snapshots = vec![host_snapshot(
+            "local",
+            vec![
+                row_at("local", "old-work", "0", "0", "old"),
+                row_at("local", "new-work", "2", "1", "new"),
+            ],
+        )];
+
+        assert!(app.restore_pending_selection());
+        assert_eq!(
+            app.selected_row().and_then(|row| row.raw_target.as_deref()),
+            Some("local/new-work:2.1")
+        );
+        assert!(app.pending_selection.is_none());
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -2986,7 +3346,11 @@ session_templates:
 
     #[test]
     fn cwd_prompt_keeps_pending_session_context() {
-        let mut app = App::new(String::new());
+        let mut app = App::new(
+            String::new(),
+            TuiSortField::Attention,
+            TuiSortDirection::Desc,
+        );
 
         begin_cwd_prompt(&mut app, "local", "work-api", "fzf unavailable");
 

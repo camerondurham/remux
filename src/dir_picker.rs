@@ -114,6 +114,7 @@ mod tests {
 
         let config = Config {
             poll: PollConfig::default(),
+            tui: Default::default(),
             session_templates: SessionTemplatesConfig::default(),
             hosts: vec![HostConfig {
                 id: "local".to_string(),

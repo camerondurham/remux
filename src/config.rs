@@ -10,6 +10,8 @@ pub struct Config {
     #[serde(default)]
     pub poll: PollConfig,
     #[serde(default)]
+    pub tui: TuiConfig,
+    #[serde(default)]
     pub session_templates: SessionTemplatesConfig,
     #[serde(default)]
     pub hosts: Vec<HostConfig>,
@@ -17,6 +19,36 @@ pub struct Config {
     pub watches: Vec<WatchConfig>,
     #[serde(default)]
     pub sessions: Vec<SessionConfig>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TuiConfig {
+    #[serde(default)]
+    pub sort: TuiSortConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TuiSortConfig {
+    #[serde(default)]
+    pub field: TuiSortField,
+    #[serde(default)]
+    pub direction: TuiSortDirection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TuiSortField {
+    Attention,
+    LastOutput,
+    State,
+    Id,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TuiSortDirection {
+    Asc,
+    Desc,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -171,6 +203,27 @@ impl Default for PollConfig {
             git_cache_ttl: default_git_cache_ttl(),
             auto_refresh_interval: default_auto_refresh_interval(),
         }
+    }
+}
+
+impl Default for TuiSortConfig {
+    fn default() -> Self {
+        Self {
+            field: TuiSortField::Attention,
+            direction: TuiSortDirection::Desc,
+        }
+    }
+}
+
+impl Default for TuiSortField {
+    fn default() -> Self {
+        Self::Attention
+    }
+}
+
+impl Default for TuiSortDirection {
+    fn default() -> Self {
+        Self::Desc
     }
 }
 
@@ -596,6 +649,10 @@ poll:
   ssh_timeout: 7s
   command_timeout: 11s
   max_concurrency: 3
+tui:
+  sort:
+    field: last-output
+    direction: asc
 hosts:
   - id: local
     type: local
@@ -636,6 +693,8 @@ watches:
         assert_eq!(config.poll.capture_lines, 80);
         assert_eq!(config.poll.command_timeout, Duration::from_secs(11));
         assert_eq!(config.poll.max_concurrency, 3);
+        assert_eq!(config.tui.sort.field, TuiSortField::LastOutput);
+        assert_eq!(config.tui.sort.direction, TuiSortDirection::Asc);
         assert_eq!(
             config.host("pi").unwrap().tmux_socket(),
             Some("~/.work-os/tmux.sock")
@@ -655,6 +714,37 @@ watches:
             Some("codex")
         );
         assert_eq!(config.watches_for_host("pi").len(), 2);
+    }
+
+    #[test]
+    fn tui_sort_defaults_to_attention_desc() {
+        let config: Config = serde_yaml::from_str(
+            r#"
+hosts:
+  - id: local
+    type: local
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.tui.sort.field, TuiSortField::Attention);
+        assert_eq!(config.tui.sort.direction, TuiSortDirection::Desc);
+    }
+
+    #[test]
+    fn rejects_invalid_tui_sort_values() {
+        let err = serde_yaml::from_str::<Config>(
+            r#"
+tui:
+  sort:
+    field: newest
+    direction: sideways
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("newest"));
     }
 
     #[test]
