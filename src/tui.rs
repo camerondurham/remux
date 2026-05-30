@@ -1613,10 +1613,7 @@ fn live_table_rows<'a>(rows: &[&'a SessionSnapshot]) -> Vec<LiveTableRow<'a>> {
             current_window = Some(window.clone());
         }
 
-        table_rows.push(LiveTableRow::Pane {
-            row: *row,
-            pane_index,
-        });
+        table_rows.push(LiveTableRow::Pane { row, pane_index });
     }
 
     table_rows

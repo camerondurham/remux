@@ -35,19 +35,21 @@ pub struct TuiSortConfig {
     pub direction: TuiSortDirection,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TuiSortField {
+    #[default]
     Attention,
     LastOutput,
     State,
     Id,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TuiSortDirection {
     Asc,
+    #[default]
     Desc,
 }
 
@@ -212,18 +214,6 @@ impl Default for TuiSortConfig {
             field: TuiSortField::Attention,
             direction: TuiSortDirection::Desc,
         }
-    }
-}
-
-impl Default for TuiSortField {
-    fn default() -> Self {
-        Self::Attention
-    }
-}
-
-impl Default for TuiSortDirection {
-    fn default() -> Self {
-        Self::Desc
     }
 }
 
