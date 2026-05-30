@@ -395,9 +395,7 @@ impl App {
                 }
                 self.last_refresh_duration = self.refresh_started_at.map(|t| t.elapsed());
                 self.refresh_completed_at = Some(Instant::now());
-                if self.pending_selection.is_some() && !self.restore_pending_selection() {
-                    self.pending_selection = None;
-                }
+                self.restore_pending_selection();
                 self.status = format!("scan complete: {}", self.progress_summary());
             }
             RefreshMessage::InspectResult { display_id, result } => {
@@ -3050,6 +3048,40 @@ mod tests {
         assert_eq!(
             app.selected_row().and_then(|row| row.raw_target.as_deref()),
             Some("local/new-work:2.1")
+        );
+        assert!(app.pending_selection.is_none());
+    }
+
+    #[test]
+    fn pending_new_session_selection_survives_stale_refresh_completion() {
+        let mut app = App::new(
+            String::new(),
+            TuiSortField::Attention,
+            TuiSortDirection::Desc,
+        );
+        app.pending_selection = Some(SelectionPreference::new_session("local", "new-work"));
+        app.snapshots = vec![host_snapshot(
+            "local",
+            vec![row_at("local", "old-work", "0", "0", "old")],
+        )];
+
+        app.apply_refresh(RefreshMessage::Complete);
+
+        assert!(app.pending_selection.is_some());
+
+        app.apply_refresh(RefreshMessage::HostFinished {
+            snapshot: host_snapshot(
+                "local",
+                vec![
+                    row_at("local", "old-work", "0", "0", "old"),
+                    row_at("local", "new-work", "0", "0", "new"),
+                ],
+            ),
+        });
+
+        assert_eq!(
+            app.selected_row().and_then(|row| row.raw_target.as_deref()),
+            Some("local/new-work:0.0")
         );
         assert!(app.pending_selection.is_none());
     }
