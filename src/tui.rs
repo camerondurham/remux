@@ -456,7 +456,11 @@ impl App {
             let target_display_index = current_display_index
                 .saturating_add_signed(delta)
                 .min(last_display_index);
-            nearest_pane_index_for_display_row(&display_rows, target_display_index)
+            nearest_pane_index_for_directional_display_row(
+                &display_rows,
+                target_display_index,
+                delta,
+            )
         };
         if let Some(selected) = selected {
             self.select_pane_index(selected);
@@ -1838,6 +1842,33 @@ fn nearest_pane_index_for_display_row(
     display_rows: &[LiveTableRow<'_>],
     target: usize,
 ) -> Option<usize> {
+    nearest_pane_index_for_display_row_with_tie(display_rows, target, PaneTieBreak::After)
+}
+
+fn nearest_pane_index_for_directional_display_row(
+    display_rows: &[LiveTableRow<'_>],
+    target: usize,
+    delta: isize,
+) -> Option<usize> {
+    let tie_break = if delta < 0 {
+        PaneTieBreak::Before
+    } else {
+        PaneTieBreak::After
+    };
+    nearest_pane_index_for_display_row_with_tie(display_rows, target, tie_break)
+}
+
+#[derive(Clone, Copy)]
+enum PaneTieBreak {
+    Before,
+    After,
+}
+
+fn nearest_pane_index_for_display_row_with_tie(
+    display_rows: &[LiveTableRow<'_>],
+    target: usize,
+    tie_break: PaneTieBreak,
+) -> Option<usize> {
     display_rows
         .iter()
         .enumerate()
@@ -1846,10 +1877,11 @@ fn nearest_pane_index_for_display_row(
             LiveTableRow::Group { .. } => None,
         })
         .min_by_key(|(display_index, _)| {
-            (
-                display_index.abs_diff(target),
-                usize::from(*display_index < target),
-            )
+            let tie_rank = match tie_break {
+                PaneTieBreak::Before => usize::from(*display_index > target),
+                PaneTieBreak::After => usize::from(*display_index < target),
+            };
+            (display_index.abs_diff(target), tie_rank)
         })
         .map(|(_, pane_index)| pane_index)
 }
@@ -3196,6 +3228,17 @@ mod tests {
         row
     }
 
+    fn row_without_window(
+        host: &str,
+        session: &str,
+        pane: &str,
+        display_id: &str,
+    ) -> SessionSnapshot {
+        let mut row = row_at(host, session, "0", pane, display_id);
+        row.tmux.window = None;
+        row
+    }
+
     fn host_snapshot(host: &str, sessions: Vec<SessionSnapshot>) -> HostSnapshot {
         HostSnapshot {
             host: host.to_string(),
@@ -3392,6 +3435,21 @@ mod tests {
         assert_eq!(
             app.selected_row().and_then(|row| row.raw_target.as_deref()),
             Some("local/work:0.0")
+        );
+    }
+
+    #[test]
+    fn upward_page_tie_on_group_row_selects_previous_pane() {
+        let mut app = app_with_rows(vec![
+            row_without_window("local", "alpha", "0", "pane-0"),
+            row_without_window("local", "beta", "0", "pane-1"),
+        ]);
+        app.select_last_pane();
+
+        assert!(handle_navigation_key(&mut app, key(KeyCode::PageUp), 1));
+        assert_eq!(
+            app.selected_row().and_then(|row| row.raw_target.as_deref()),
+            Some("local/alpha:0.0")
         );
     }
 
