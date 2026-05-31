@@ -242,7 +242,7 @@ session_templates:
 Main keys:
 
 ```text
-[↑↓] move  [Enter] attach ro  [a] jump rw  [s/S] sort  [t] template  [z] send keys  [i] refresh  [/] filter  [d] details  [?] help  [x] kill  [q] quit
+[↑↓ PgUp/PgDn] move  [gg/G] ends  [Enter] attach ro  [a] jump rw  [s/S] sort  [t] template  [z] send keys  [i] refresh  [/] filter  [d] details  [?] help  [x] kill  [q] quit
 ```
 
 More keys available in the help overlay (`?`):
@@ -250,6 +250,11 @@ More keys available in the help overlay (`?`):
 | Key | Action |
 | --- | --- |
 | `j` / `k` | Select next / previous row |
+| `Home` / `End` | Select the first / last pane row |
+| `g g` / `G` | Select the first / last pane row |
+| `PageUp` / `PageDown` | Move by one visible page |
+| `Ctrl-u` / `Ctrl-d` | Move by half a visible page |
+| `H` / `M` / `L` | Select the top / middle / bottom pane on screen |
 | `r` | Re-poll every configured host |
 | `s` | Cycle the table sort field |
 | `S` | Toggle the table sort direction |

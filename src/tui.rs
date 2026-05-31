@@ -115,6 +115,7 @@ struct App {
     snapshots: Vec<HostSnapshot>,
     selected: usize,
     selected_identity: Option<String>,
+    table_offset: usize,
     filter: LineEditor,
     editing_filter: bool,
     help: bool,
@@ -136,6 +137,7 @@ struct App {
     inspect_mode: bool,
     inspect_pending: Option<String>,
     pending_selection: Option<SelectionPreference>,
+    pending_key: Option<PendingKey>,
 }
 
 #[derive(Clone)]
@@ -210,12 +212,25 @@ enum HostProgressState {
     Unreachable,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingKey {
+    G,
+}
+
+#[derive(Clone, Copy)]
+enum VisiblePosition {
+    Top,
+    Middle,
+    Bottom,
+}
+
 impl App {
     fn new(filter: String, sort_field: TuiSortField, sort_direction: TuiSortDirection) -> Self {
         Self {
             snapshots: Vec::new(),
             selected: 0,
             selected_identity: None,
+            table_offset: 0,
             filter: LineEditor::new(filter),
             editing_filter: false,
             help: false,
@@ -237,6 +252,7 @@ impl App {
             inspect_mode: false,
             inspect_pending: None,
             pending_selection: None,
+            pending_key: None,
         }
     }
 
@@ -273,6 +289,7 @@ impl App {
             if rows.is_empty() {
                 self.selected = 0;
                 self.selected_identity = None;
+                self.table_offset = 0;
                 return false;
             }
             let selected = if let Some(identity) = preferred_identity {
@@ -287,6 +304,7 @@ impl App {
         if selected_identity.is_none() {
             self.selected = 0;
             self.selected_identity = None;
+            self.table_offset = 0;
             return false;
         }
         self.selected = selected;
@@ -326,6 +344,123 @@ impl App {
         self.selected_identity = Some(selected_identity);
         self.pending_selection = None;
         true
+    }
+
+    fn select_pane_index(&mut self, index: usize) {
+        let selected = {
+            let rows = self.rows();
+            if rows.is_empty() {
+                self.selected = 0;
+                self.selected_identity = None;
+                self.table_offset = 0;
+                return;
+            }
+            let selected = index.min(rows.len() - 1);
+            let selected_identity = row_identity(rows[selected]);
+            (selected, selected_identity)
+        };
+        self.selected = selected.0;
+        self.selected_identity = Some(selected.1);
+    }
+
+    fn select_first_pane(&mut self) {
+        self.select_pane_index(0);
+    }
+
+    fn select_last_pane(&mut self) {
+        let Some(last_index) = self.rows().len().checked_sub(1) else {
+            self.select_pane_index(0);
+            return;
+        };
+        self.select_pane_index(last_index);
+    }
+
+    fn move_selection_by(&mut self, delta: isize) {
+        let rows_len = self.rows().len();
+        if rows_len == 0 {
+            self.select_pane_index(0);
+            return;
+        }
+        let max_index = rows_len - 1;
+        let selected = self.selected.saturating_add_signed(delta).min(max_index);
+        self.select_pane_index(selected);
+    }
+
+    fn move_page(&mut self, delta_pages: isize, visible_rows: usize) {
+        self.move_display_rows_by(delta_pages.saturating_mul(visible_rows.max(1) as isize));
+        self.ensure_selection_visible(visible_rows);
+    }
+
+    fn move_half_page(&mut self, delta: isize, visible_rows: usize) {
+        let half_page = (visible_rows.max(1) / 2).max(1);
+        self.move_display_rows_by(delta.saturating_mul(half_page as isize));
+        self.ensure_selection_visible(visible_rows);
+    }
+
+    fn select_visible_position(&mut self, position: VisiblePosition, visible_rows: usize) {
+        let selected = {
+            let rows = self.rows();
+            let display_rows = live_table_rows(&rows);
+            if let Some(last_display_index) = display_rows.len().checked_sub(1) {
+                let start = self.table_offset.min(last_display_index);
+                let end = start
+                    .saturating_add(visible_rows.max(1).saturating_sub(1))
+                    .min(last_display_index);
+                let target = match position {
+                    VisiblePosition::Top => start,
+                    VisiblePosition::Middle => start + (end - start) / 2,
+                    VisiblePosition::Bottom => end,
+                };
+                pane_index_for_visible_position(&display_rows, start, end, target, position)
+                    .or_else(|| nearest_pane_index_for_display_row(&display_rows, target))
+            } else {
+                None
+            }
+        };
+        if let Some(selected) = selected {
+            self.select_pane_index(selected);
+        }
+        self.ensure_selection_visible(visible_rows);
+    }
+
+    fn ensure_selection_visible(&mut self, visible_rows: usize) {
+        let rows = self.rows();
+        let display_rows = live_table_rows(&rows);
+        let Some(selected_display_index) = display_index_for_pane(&display_rows, self.selected)
+        else {
+            self.table_offset = 0;
+            return;
+        };
+        let visible_rows = visible_rows.max(1);
+        let max_offset = display_rows.len().saturating_sub(visible_rows);
+        self.table_offset = self.table_offset.min(max_offset);
+        if selected_display_index < self.table_offset {
+            self.table_offset = selected_display_index;
+        } else if selected_display_index >= self.table_offset + visible_rows {
+            self.table_offset = selected_display_index + 1 - visible_rows;
+        }
+        self.table_offset = self.table_offset.min(max_offset);
+    }
+
+    fn move_display_rows_by(&mut self, delta: isize) {
+        let selected = {
+            let rows = self.rows();
+            let display_rows = live_table_rows(&rows);
+            let Some(current_display_index) = display_index_for_pane(&display_rows, self.selected)
+            else {
+                return;
+            };
+            let Some(last_display_index) = display_rows.len().checked_sub(1) else {
+                return;
+            };
+            let target_display_index = current_display_index
+                .saturating_add_signed(delta)
+                .min(last_display_index);
+            nearest_pane_index_for_display_row(&display_rows, target_display_index)
+        };
+        if let Some(selected) = selected {
+            self.select_pane_index(selected);
+        }
     }
 
     fn compare_tree_rows(&self, left: &SessionSnapshot, right: &SessionSnapshot) -> Ordering {
@@ -746,9 +881,15 @@ fn handle_key(
                 let selected_identity = app.selected_row_identity();
                 if app.filter.apply_key(key) {
                     app.restore_selection(selected_identity);
+                    app.ensure_selection_visible(visible_table_rows(terminal)?);
                 }
             }
         }
+        return Ok(false);
+    }
+
+    let visible_rows = visible_table_rows(terminal)?;
+    if handle_navigation_key(app, key, visible_rows) {
         return Ok(false);
     }
 
@@ -776,29 +917,18 @@ fn handle_key(
         }
         KeyCode::Char('s') => {
             app.cycle_sort_field();
+            app.ensure_selection_visible(visible_rows);
             app.status = format!("sort: {}", sort_label(app.sort_field, app.sort_direction));
             Ok(false)
         }
         KeyCode::Char('S') => {
             app.toggle_sort_direction();
+            app.ensure_selection_visible(visible_rows);
             app.status = format!("sort: {}", sort_label(app.sort_field, app.sort_direction));
             Ok(false)
         }
         KeyCode::Char('r') => {
             spawn_refresh(config, host, tx, app)?;
-            Ok(false)
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            let len = app.rows().len();
-            if app.selected + 1 < len {
-                app.selected += 1;
-            }
-            app.selected_identity = app.selected_row_identity();
-            Ok(false)
-        }
-        KeyCode::Up | KeyCode::Char('k') => {
-            app.selected = app.selected.saturating_sub(1);
-            app.selected_identity = app.selected_row_identity();
             Ok(false)
         }
         KeyCode::Char('x') => {
@@ -855,6 +985,87 @@ fn handle_key(
             Ok(false)
         }
         _ => Ok(false),
+    }
+}
+
+fn visible_table_rows(terminal: &Terminal<CrosstermBackend<Stdout>>) -> Result<usize> {
+    Ok(visible_table_rows_from_height(terminal.size()?.height))
+}
+
+fn visible_table_rows_from_height(terminal_height: u16) -> usize {
+    terminal_height.saturating_sub(3).max(1) as usize
+}
+
+fn handle_navigation_key(app: &mut App, key: KeyEvent, visible_rows: usize) -> bool {
+    let pending_key = app.pending_key.take();
+    if pending_key == Some(PendingKey::G)
+        && key.code == KeyCode::Char('g')
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        app.select_first_pane();
+        app.ensure_selection_visible(visible_rows);
+        return true;
+    }
+
+    match key.code {
+        KeyCode::Char('g') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.pending_key = Some(PendingKey::G);
+            true
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.move_selection_by(1);
+            app.ensure_selection_visible(visible_rows);
+            true
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.move_selection_by(-1);
+            app.ensure_selection_visible(visible_rows);
+            true
+        }
+        KeyCode::Home => {
+            app.select_first_pane();
+            app.ensure_selection_visible(visible_rows);
+            true
+        }
+        KeyCode::End => {
+            app.select_last_pane();
+            app.ensure_selection_visible(visible_rows);
+            true
+        }
+        KeyCode::Char('G') => {
+            app.select_last_pane();
+            app.ensure_selection_visible(visible_rows);
+            true
+        }
+        KeyCode::PageUp => {
+            app.move_page(-1, visible_rows);
+            true
+        }
+        KeyCode::PageDown => {
+            app.move_page(1, visible_rows);
+            true
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.move_half_page(-1, visible_rows);
+            true
+        }
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.move_half_page(1, visible_rows);
+            true
+        }
+        KeyCode::Char('H') => {
+            app.select_visible_position(VisiblePosition::Top, visible_rows);
+            true
+        }
+        KeyCode::Char('M') => {
+            app.select_visible_position(VisiblePosition::Middle, visible_rows);
+            true
+        }
+        KeyCode::Char('L') => {
+            app.select_visible_position(VisiblePosition::Bottom, visible_rows);
+            true
+        }
+        _ => false,
     }
 }
 
@@ -1617,6 +1828,58 @@ fn live_table_rows<'a>(rows: &[&'a SessionSnapshot]) -> Vec<LiveTableRow<'a>> {
     table_rows
 }
 
+fn display_index_for_pane(display_rows: &[LiveTableRow<'_>], selected: usize) -> Option<usize> {
+    display_rows.iter().position(
+        |row| matches!(row, LiveTableRow::Pane { pane_index, .. } if *pane_index == selected),
+    )
+}
+
+fn nearest_pane_index_for_display_row(
+    display_rows: &[LiveTableRow<'_>],
+    target: usize,
+) -> Option<usize> {
+    display_rows
+        .iter()
+        .enumerate()
+        .filter_map(|(display_index, row)| match row {
+            LiveTableRow::Pane { pane_index, .. } => Some((display_index, *pane_index)),
+            LiveTableRow::Group { .. } => None,
+        })
+        .min_by_key(|(display_index, _)| {
+            (
+                display_index.abs_diff(target),
+                usize::from(*display_index < target),
+            )
+        })
+        .map(|(_, pane_index)| pane_index)
+}
+
+fn pane_index_for_visible_position(
+    display_rows: &[LiveTableRow<'_>],
+    start: usize,
+    end: usize,
+    target: usize,
+    position: VisiblePosition,
+) -> Option<usize> {
+    let mut visible_panes = display_rows
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(end.saturating_sub(start) + 1)
+        .filter_map(|(display_index, row)| match row {
+            LiveTableRow::Pane { pane_index, .. } => Some((display_index, *pane_index)),
+            LiveTableRow::Group { .. } => None,
+        });
+
+    match position {
+        VisiblePosition::Top => visible_panes.next().map(|(_, pane_index)| pane_index),
+        VisiblePosition::Middle => visible_panes
+            .min_by_key(|(display_index, _)| display_index.abs_diff(target))
+            .map(|(_, pane_index)| pane_index),
+        VisiblePosition::Bottom => visible_panes.next_back().map(|(_, pane_index)| pane_index),
+    }
+}
+
 fn host_group_label(row: &SessionSnapshot) -> String {
     match row.tmux_socket.as_deref() {
         Some(socket) => format!("host {}  [{}]", row.host, socket),
@@ -1691,7 +1954,7 @@ fn draw_live_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             .add_modifier(Modifier::BOLD),
     );
 
-    let mut state = TableState::default();
+    let mut state = TableState::default().with_offset(app.table_offset);
     state.select(Some(selected_display_idx));
     frame.render_stateful_widget(table, area, &mut state);
 }
@@ -1777,6 +2040,11 @@ fn draw_inspector(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         let text = Text::from(vec![
             Line::from("[j/↓] select next"),
             Line::from("[k/↑] select previous"),
+            Line::from("[Home/End] first/last pane"),
+            Line::from("[gg/G] first/last pane"),
+            Line::from("[PgUp/PgDn] page"),
+            Line::from("[Ctrl-u/Ctrl-d] half page"),
+            Line::from("[H/M/L] screen top/middle/bottom"),
             Line::from("[r] refresh now"),
             Line::from("[s] cycle table sort field"),
             Line::from("[S] toggle table sort direction"),
@@ -1880,7 +2148,7 @@ fn draw_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     };
     let spans = vec![
         Span::raw(
-            "[↑↓] move  [Enter] attach ro  [a] jump rw  [s/S] sort  [t] template  [z] send keys  [i] refresh  [/] filter  [d] details  [?] help  [x] kill  [q] quit   ",
+            "[↑↓ PgUp/PgDn] move  [gg/G] ends  [Enter] attach ro  [a] jump rw  [s/S] sort  [t] template  [z] send keys  [i] refresh  [/] filter  [d] details  [?] help  [x] kill  [q] quit   ",
         ),
         Span::styled(mode, Style::default().fg(Color::Cyan)),
         Span::raw("  "),
@@ -2939,6 +3207,13 @@ mod tests {
         }
     }
 
+    fn app_with_rows(rows: Vec<SessionSnapshot>) -> App {
+        let mut app = App::new(String::new(), TuiSortField::Id, TuiSortDirection::Asc);
+        app.snapshots = vec![host_snapshot("local", rows)];
+        app.restore_selection(None);
+        app
+    }
+
     #[test]
     fn canonical_state_mapping() {
         let cases = [
@@ -3026,6 +3301,164 @@ mod tests {
             &table_rows[3],
             LiveTableRow::Pane { pane_index: 0, .. }
         ));
+    }
+
+    #[test]
+    fn home_and_gg_select_first_pane() {
+        let mut app = app_with_rows(vec![
+            row_at("local", "work", "0", "0", "pane-0"),
+            row_at("local", "work", "0", "1", "pane-1"),
+            row_at("local", "work", "0", "2", "pane-2"),
+        ]);
+        app.select_last_pane();
+
+        assert!(handle_navigation_key(&mut app, key(KeyCode::Home), 5));
+        assert_eq!(
+            app.selected_row().and_then(|row| row.raw_target.as_deref()),
+            Some("local/work:0.0")
+        );
+
+        app.select_last_pane();
+        assert!(handle_navigation_key(&mut app, key(KeyCode::Char('g')), 5));
+        assert_eq!(app.pending_key, Some(PendingKey::G));
+        assert!(handle_navigation_key(&mut app, key(KeyCode::Char('g')), 5));
+        assert_eq!(
+            app.selected_row().and_then(|row| row.raw_target.as_deref()),
+            Some("local/work:0.0")
+        );
+        assert_eq!(app.pending_key, None);
+    }
+
+    #[test]
+    fn end_and_uppercase_g_select_last_pane() {
+        let mut app = app_with_rows(vec![
+            row_at("local", "work", "0", "0", "pane-0"),
+            row_at("local", "work", "0", "1", "pane-1"),
+            row_at("local", "work", "0", "2", "pane-2"),
+        ]);
+
+        assert!(handle_navigation_key(&mut app, key(KeyCode::End), 5));
+        assert_eq!(
+            app.selected_row().and_then(|row| row.raw_target.as_deref()),
+            Some("local/work:0.2")
+        );
+
+        app.select_first_pane();
+        assert!(handle_navigation_key(&mut app, key(KeyCode::Char('G')), 5));
+        assert_eq!(
+            app.selected_row().and_then(|row| row.raw_target.as_deref()),
+            Some("local/work:0.2")
+        );
+    }
+
+    #[test]
+    fn page_movement_clamps_at_list_boundaries() {
+        let mut app = app_with_rows(vec![
+            row_at("local", "work", "0", "0", "pane-0"),
+            row_at("local", "work", "0", "1", "pane-1"),
+            row_at("local", "work", "0", "2", "pane-2"),
+            row_at("local", "work", "0", "3", "pane-3"),
+        ]);
+
+        assert!(handle_navigation_key(&mut app, key(KeyCode::PageUp), 5));
+        assert_eq!(
+            app.selected_row().and_then(|row| row.raw_target.as_deref()),
+            Some("local/work:0.0")
+        );
+
+        app.select_last_pane();
+        app.ensure_selection_visible(5);
+        assert!(handle_navigation_key(&mut app, key(KeyCode::PageDown), 5));
+        assert_eq!(
+            app.selected_row().and_then(|row| row.raw_target.as_deref()),
+            Some("local/work:0.3")
+        );
+    }
+
+    #[test]
+    fn half_page_movement_uses_at_least_one_row() {
+        let mut app = app_with_rows(vec![
+            row_at("local", "work", "0", "0", "pane-0"),
+            row_at("local", "work", "0", "1", "pane-1"),
+            row_at("local", "work", "0", "2", "pane-2"),
+        ]);
+
+        assert!(handle_navigation_key(&mut app, ctrl('d'), 1));
+        assert_eq!(
+            app.selected_row().and_then(|row| row.raw_target.as_deref()),
+            Some("local/work:0.1")
+        );
+        assert!(handle_navigation_key(&mut app, ctrl('u'), 1));
+        assert_eq!(
+            app.selected_row().and_then(|row| row.raw_target.as_deref()),
+            Some("local/work:0.0")
+        );
+    }
+
+    #[test]
+    fn h_m_l_skip_group_rows_and_select_visible_panes() {
+        let mut app = app_with_rows(vec![
+            row_at("local", "work", "0", "0", "pane-0"),
+            row_at("local", "work", "0", "1", "pane-1"),
+            row_at("local", "work", "0", "2", "pane-2"),
+        ]);
+        app.table_offset = 0;
+
+        assert!(handle_navigation_key(&mut app, key(KeyCode::Char('H')), 5));
+        assert_eq!(
+            app.selected_row().and_then(|row| row.raw_target.as_deref()),
+            Some("local/work:0.0")
+        );
+
+        assert!(handle_navigation_key(&mut app, key(KeyCode::Char('M')), 5));
+        assert_eq!(
+            app.selected_row().and_then(|row| row.raw_target.as_deref()),
+            Some("local/work:0.0")
+        );
+
+        assert!(handle_navigation_key(&mut app, key(KeyCode::Char('L')), 5));
+        assert_eq!(
+            app.selected_row().and_then(|row| row.raw_target.as_deref()),
+            Some("local/work:0.1")
+        );
+    }
+
+    #[test]
+    fn pending_g_prefix_clears_after_non_g_key() {
+        let mut app = app_with_rows(vec![
+            row_at("local", "work", "0", "0", "pane-0"),
+            row_at("local", "work", "0", "1", "pane-1"),
+            row_at("local", "work", "0", "2", "pane-2"),
+        ]);
+
+        assert!(handle_navigation_key(&mut app, key(KeyCode::Char('g')), 5));
+        assert_eq!(app.pending_key, Some(PendingKey::G));
+        assert!(handle_navigation_key(&mut app, key(KeyCode::Down), 5));
+        assert_eq!(app.pending_key, None);
+        assert_eq!(
+            app.selected_row().and_then(|row| row.raw_target.as_deref()),
+            Some("local/work:0.1")
+        );
+
+        assert!(handle_navigation_key(&mut app, key(KeyCode::Char('g')), 5));
+        assert!(!handle_navigation_key(&mut app, key(KeyCode::Char('q')), 5));
+        assert_eq!(app.pending_key, None);
+    }
+
+    #[test]
+    fn selected_row_actions_still_resolve_panes_after_tree_navigation() {
+        let mut app = app_with_rows(vec![
+            row_at("local", "work", "0", "0", "pane-0"),
+            row_at("local", "work", "1", "0", "pane-1"),
+        ]);
+        app.table_offset = 4;
+
+        assert!(handle_navigation_key(&mut app, key(KeyCode::Char('L')), 4));
+
+        let selected = app.selected_row().expect("selected pane row");
+        assert_eq!(selected.raw_target.as_deref(), Some("local/work:1.0"));
+        assert!(attach_refusal_reason(selected).is_none());
+        assert!(PaneTarget::parse(selected.raw_target.as_deref().unwrap()).is_ok());
     }
 
     #[test]
