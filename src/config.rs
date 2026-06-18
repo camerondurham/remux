@@ -225,7 +225,7 @@ impl Config {
         };
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("failed to read config {}", path.display()))?;
-        let config: Config = serde_yaml::from_str(&raw)
+        let config: Config = yaml_serde::from_str(&raw)
             .with_context(|| format!("failed to parse config {}", path.display()))?;
         config.validate()?;
         Ok(config)
@@ -630,7 +630,7 @@ mod tests {
 
     #[test]
     fn parses_config_with_hosts_sessions_and_poll() {
-        let config: Config = serde_yaml::from_str(
+        let config: Config = yaml_serde::from_str(
             r#"
 poll:
   active_after: 5m
@@ -708,7 +708,7 @@ watches:
 
     #[test]
     fn tui_sort_defaults_to_attention_desc() {
-        let config: Config = serde_yaml::from_str(
+        let config: Config = yaml_serde::from_str(
             r#"
 hosts:
   - id: local
@@ -723,7 +723,7 @@ hosts:
 
     #[test]
     fn rejects_invalid_tui_sort_values() {
-        let err = serde_yaml::from_str::<Config>(
+        let err = yaml_serde::from_str::<Config>(
             r#"
 tui:
   sort:
@@ -739,7 +739,7 @@ tui:
 
     #[test]
     fn rejects_empty_session_roots() {
-        let config: Config = serde_yaml::from_str(
+        let config: Config = yaml_serde::from_str(
             r#"
 hosts:
   - id: local
@@ -761,7 +761,7 @@ hosts:
 
     #[test]
     fn rejects_duplicate_session_template_presets() {
-        let config: Config = serde_yaml::from_str(
+        let config: Config = yaml_serde::from_str(
             r#"
 session_templates:
   presets:
@@ -786,7 +786,7 @@ session_templates:
 
     #[test]
     fn rejects_session_template_presets_conflicting_with_builtins() {
-        let config: Config = serde_yaml::from_str(
+        let config: Config = yaml_serde::from_str(
             r#"
 session_templates:
   presets:
@@ -808,7 +808,7 @@ session_templates:
 
     #[test]
     fn rejects_empty_session_template_preset_fields() {
-        let config: Config = serde_yaml::from_str(
+        let config: Config = yaml_serde::from_str(
             r#"
 session_templates:
   presets:
@@ -830,7 +830,7 @@ session_templates:
 
     #[test]
     fn rejects_invalid_session_template_prefix_chars() {
-        let config: Config = serde_yaml::from_str(
+        let config: Config = yaml_serde::from_str(
             r#"
 session_templates:
   presets:
@@ -852,7 +852,7 @@ session_templates:
 
     #[test]
     fn rejects_empty_tmux_socket() {
-        let config: Config = serde_yaml::from_str(
+        let config: Config = yaml_serde::from_str(
             r#"
 hosts:
   - id: local
@@ -873,7 +873,7 @@ hosts:
 
     #[test]
     fn rejects_duplicate_hosts() {
-        let config: Config = serde_yaml::from_str(
+        let config: Config = yaml_serde::from_str(
             r#"
 hosts:
   - id: pi
@@ -897,7 +897,7 @@ hosts:
 
     #[test]
     fn rejects_duplicate_sessions() {
-        let config: Config = serde_yaml::from_str(
+        let config: Config = yaml_serde::from_str(
             r#"
 hosts:
   - id: local
@@ -924,7 +924,7 @@ sessions:
 
     #[test]
     fn rejects_missing_host_reference() {
-        let config: Config = serde_yaml::from_str(
+        let config: Config = yaml_serde::from_str(
             r#"
 hosts:
   - id: local
@@ -948,7 +948,7 @@ sessions:
 
     #[test]
     fn rejects_invalid_watch_match() {
-        let config: Config = serde_yaml::from_str(
+        let config: Config = yaml_serde::from_str(
             r#"
 hosts:
   - id: local
@@ -981,20 +981,20 @@ watches:
 
     #[test]
     fn auto_refresh_interval_defaults_to_15s() {
-        let config: Config = serde_yaml::from_str("{}").unwrap();
+        let config: Config = yaml_serde::from_str("{}").unwrap();
         assert_eq!(config.poll.auto_refresh_interval, Duration::from_secs(15));
     }
 
     #[test]
     fn auto_refresh_interval_parses_15s() {
-        let config: Config = serde_yaml::from_str("poll:\n  auto_refresh_interval: 15s").unwrap();
+        let config: Config = yaml_serde::from_str("poll:\n  auto_refresh_interval: 15s").unwrap();
         assert_eq!(config.poll.auto_refresh_interval, Duration::from_secs(15));
         config.validate().unwrap();
     }
 
     #[test]
     fn auto_refresh_interval_parses_0s() {
-        let config: Config = serde_yaml::from_str("poll:\n  auto_refresh_interval: 0s").unwrap();
+        let config: Config = yaml_serde::from_str("poll:\n  auto_refresh_interval: 0s").unwrap();
         assert_eq!(config.poll.auto_refresh_interval, Duration::ZERO);
         config.validate().unwrap();
     }
@@ -1004,7 +1004,7 @@ watches:
         // parse_duration only supports whole-second units, so "500ms" is an
         // invalid unit string and is rejected at parse time.
         let result: Result<Config, _> =
-            serde_yaml::from_str("poll:\n  auto_refresh_interval: 500ms");
+            yaml_serde::from_str("poll:\n  auto_refresh_interval: 500ms");
         assert!(result.is_err());
     }
 }

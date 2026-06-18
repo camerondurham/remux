@@ -544,7 +544,7 @@ Required:
 Rust
 clap
 serde
-serde_yaml
+yaml_serde
 serde_json
 anyhow or thiserror
 chrono or time
@@ -589,7 +589,7 @@ cd remux
 
 Add basic CLI parsing with `clap`.
 
-Commands should exist but may return `todo!()` initially:
+The current implementation provides these commands end to end:
 
 ```bash
 remux hosts
