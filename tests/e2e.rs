@@ -5,7 +5,10 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static TEMP_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 #[test]
 fn doctor_checks_local_tools_and_hosts() {
@@ -944,7 +947,19 @@ fn unique_temp_dir() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!("remux-e2e-{}-{nanos}", std::process::id()))
+    let sequence = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "remux-e2e-{}-{nanos}-{sequence}",
+        std::process::id()
+    ))
+}
+
+#[test]
+fn temp_dirs_are_unique_within_one_test_process() {
+    let first = unique_temp_dir();
+    let second = unique_temp_dir();
+
+    assert_ne!(first, second);
 }
 
 fn fake_ssh_script() -> &'static str {

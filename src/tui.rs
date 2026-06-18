@@ -388,13 +388,11 @@ impl App {
 
     fn move_page(&mut self, delta_pages: isize, visible_rows: usize) {
         self.move_display_rows_by(delta_pages.saturating_mul(visible_rows.max(1) as isize));
-        self.ensure_selection_visible(visible_rows);
     }
 
     fn move_half_page(&mut self, delta: isize, visible_rows: usize) {
         let half_page = (visible_rows.max(1) / 2).max(1);
         self.move_display_rows_by(delta.saturating_mul(half_page as isize));
-        self.ensure_selection_visible(visible_rows);
     }
 
     fn select_visible_position(&mut self, position: VisiblePosition, visible_rows: usize) {
@@ -420,7 +418,6 @@ impl App {
         if let Some(selected) = selected {
             self.select_pane_index(selected);
         }
-        self.ensure_selection_visible(visible_rows);
     }
 
     fn ensure_selection_visible(&mut self, visible_rows: usize) {
@@ -1011,34 +1008,29 @@ fn handle_navigation_key(app: &mut App, key: KeyEvent, visible_rows: usize) -> b
         return true;
     }
 
-    match key.code {
+    let moved = match key.code {
         KeyCode::Char('g') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.pending_key = Some(PendingKey::G);
-            true
+            return true;
         }
         KeyCode::Down | KeyCode::Char('j') => {
             app.move_selection_by(1);
-            app.ensure_selection_visible(visible_rows);
             true
         }
         KeyCode::Up | KeyCode::Char('k') => {
             app.move_selection_by(-1);
-            app.ensure_selection_visible(visible_rows);
             true
         }
         KeyCode::Home => {
             app.select_first_pane();
-            app.ensure_selection_visible(visible_rows);
             true
         }
         KeyCode::End => {
             app.select_last_pane();
-            app.ensure_selection_visible(visible_rows);
             true
         }
         KeyCode::Char('G') => {
             app.select_last_pane();
-            app.ensure_selection_visible(visible_rows);
             true
         }
         KeyCode::PageUp => {
@@ -1070,7 +1062,11 @@ fn handle_navigation_key(app: &mut App, key: KeyEvent, visible_rows: usize) -> b
             true
         }
         _ => false,
+    };
+    if moved {
+        app.ensure_selection_visible(visible_rows);
     }
+    moved
 }
 
 fn begin_kill_prompt(config: &Config, app: &mut App) -> Result<()> {
@@ -3782,7 +3778,7 @@ mod tests {
 
     #[test]
     fn built_in_session_template_presets_are_first() {
-        let config: Config = serde_yaml::from_str(
+        let config: Config = yaml_serde::from_str(
             r#"
 session_templates:
   presets:
