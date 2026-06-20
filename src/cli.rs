@@ -5,7 +5,8 @@ use std::path::PathBuf;
 #[command(
     name = "remux",
     version,
-    about = "Inspect tmux panes across local and SSH hosts"
+    about = "Inspect tmux panes across local and SSH hosts",
+    after_help = "Run without a command to launch the TUI."
 )]
 pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
@@ -16,7 +17,7 @@ pub struct Cli {
     pub verbose: bool,
 
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]

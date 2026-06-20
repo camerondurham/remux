@@ -21,7 +21,7 @@ mod tmux;
 mod tui;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{CommandFactory, Parser, error::ErrorKind};
 use cli::{Cli, Command, ListGroup};
 
 fn main() {
@@ -39,22 +39,28 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    let args_were_provided = std::env::args_os().nth(1).is_some();
     let cli = Cli::parse();
+    run_cli(cli, args_were_provided)
+}
+
+fn run_cli(cli: Cli, args_were_provided: bool) -> Result<()> {
     let config_path = cli.config.clone();
     let verbose = cli.verbose;
+    let command = resolve_command(cli.command, args_were_provided).unwrap_or_else(|err| err.exit());
 
     if let Command::Onboard {
         hosts,
         write,
         force,
-    } = &cli.command
+    } = &command
     {
         return onboard::run(config_path.as_deref(), hosts.as_deref(), *write, *force);
     }
 
     let config = config::Config::load(cli.config.as_deref())?;
 
-    match cli.command {
+    match command {
         Command::Onboard { .. } => unreachable!(),
         Command::Hosts => render::hosts(&config),
         Command::Doctor { json } => doctor::run(&config, json),
@@ -128,6 +134,23 @@ fn run() -> Result<()> {
     }
 }
 
+fn resolve_command(
+    command: Option<Command>,
+    args_were_provided: bool,
+) -> std::result::Result<Command, clap::Error> {
+    match command {
+        Some(command) => Ok(command),
+        None if !args_were_provided => Ok(Command::Tui {
+            host: None,
+            filter: None,
+        }),
+        None => Err(Cli::command().error(
+            ErrorKind::MissingSubcommand,
+            "a subcommand is required when options are provided",
+        )),
+    }
+}
+
 fn render_session_rollups(snapshots: &[snapshot::HostSnapshot], json: bool) -> Result<()> {
     let rollups = sessions::rollups_from_snapshots(snapshots);
     render::sessions(&rollups, json)?;
@@ -135,4 +158,64 @@ fn render_session_rollups(snapshots: &[snapshot::HostSnapshot], json: bool) -> R
         render::warn_snapshot_errors(snapshots);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_cli_defaults_to_tui() {
+        let cli = Cli::try_parse_from(["remux"]).unwrap();
+
+        let command = resolve_command(cli.command, false).unwrap();
+
+        assert!(matches!(
+            command,
+            Command::Tui {
+                host: None,
+                filter: None
+            }
+        ));
+    }
+
+    #[test]
+    fn global_options_without_subcommand_do_not_default_to_tui() {
+        let cli = Cli::try_parse_from(["remux", "--config", "config.yaml"]).unwrap();
+
+        let err = resolve_command(cli.command, true).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::MissingSubcommand);
+    }
+
+    #[test]
+    fn explicit_tui_subcommand_still_accepts_tui_options() {
+        let cli =
+            Cli::try_parse_from(["remux", "tui", "--host", "pi", "--filter", "codex"]).unwrap();
+
+        let command = resolve_command(cli.command, true).unwrap();
+
+        assert!(matches!(
+            command,
+            Command::Tui {
+                host: Some(host),
+                filter: Some(filter)
+            } if host == "pi" && filter == "codex"
+        ));
+    }
+
+    #[test]
+    fn explicit_list_subcommand_stays_non_tui() {
+        let cli = Cli::try_parse_from(["remux", "list", "--json"]).unwrap();
+
+        let command = resolve_command(cli.command, true).unwrap();
+
+        assert!(matches!(
+            command,
+            Command::List {
+                json: true,
+                group: ListGroup::Panes
+            }
+        ));
+    }
 }

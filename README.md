@@ -139,9 +139,14 @@ watches:
 ```bash
 remux onboard
 remux doctor
+remux
 remux list
 remux tui
 ```
+
+Running `remux` with no arguments opens the TUI by default. `remux tui` is the
+explicit form when you want to pass TUI options such as `--host` or `--filter`;
+it is not required for the normal interactive view.
 
 Once you know a pane target or add a watch ID, you can inspect or attach directly:
 
@@ -179,6 +184,7 @@ remux send-keys 'pi/work:0.1' 'cargo test'
 ## Core commands
 
 ```bash
+remux
 remux onboard [--hosts HOST[,HOST...]] [--write] [--force]
 remux hosts
 remux doctor [--json]
@@ -195,6 +201,13 @@ remux tui [--host HOST] [--filter TEXT]
 remux new <host> <session-name> [--cwd PATH] [--window-name NAME]
 remux kill <watch-id-or-pane-target> [--yes]
 ```
+
+Default behavior:
+
+- `remux` opens the interactive TUI.
+- `remux tui [--host HOST] [--filter TEXT]` is the verbose form for the same
+  TUI entrypoint.
+- Any other explicit subcommand or flag stays on the non-TUI CLI path.
 
 Aliases:
 
