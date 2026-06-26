@@ -994,7 +994,7 @@ fn visible_table_rows(terminal: &Terminal<CrosstermBackend<Stdout>>) -> Result<u
 }
 
 fn visible_table_rows_from_height(terminal_height: u16) -> usize {
-    terminal_height.saturating_sub(3).max(1) as usize
+    terminal_height.saturating_sub(5).max(1) as usize
 }
 
 fn handle_navigation_key(app: &mut App, key: KeyEvent, visible_rows: usize) -> bool {
@@ -1602,10 +1602,10 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     draw_summary(frame, chunks[0], app);
     if app.inspect_mode || app.help {
         draw_inspector(frame, chunks[1], app);
-    } else if app.show_context && area.width > 110 {
+    } else if app.show_context && area.width >= 96 {
         let body = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+            .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
             .split(chunks[1]);
         draw_live_table(frame, body[0], app);
         draw_context_rail(frame, body[1], app);
@@ -1657,43 +1657,59 @@ fn draw_summary(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         "browse"
     };
 
-    let mut spans = vec![
-        Span::styled("remux", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(" | "),
-        Span::raw("/ "),
-    ];
+    let compact = area.width < 110;
+    let mut spans = vec![Span::styled(
+        "remux",
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
+    spans.push(Span::raw(if compact { " " } else { " | " }));
+    spans.push(Span::raw("/ "));
     if app.editing_filter {
         spans.extend(app.filter.cursor_spans());
     } else {
         spans.push(Span::raw(filter_label(app)));
     }
-    spans.extend([
-        Span::raw(" | "),
-        Span::raw(format!("{total} panes  ")),
-        Span::styled(format!("•{free} free"), Style::default().fg(Color::White)),
-        Span::raw("  "),
-        Span::styled(
-            format!("◆{watched} watched"),
-            Style::default().fg(Color::Cyan),
-        ),
-    ]);
-    if problems > 0 {
-        spans.push(Span::raw("  "));
+    if compact {
+        spans.push(Span::raw(format!(" | {total} panes")));
+        if problems > 0 {
+            spans.push(Span::styled(
+                format!(" !{problems}"),
+                Style::default().fg(Color::Red),
+            ));
+        }
+        spans.push(Span::raw(format!(
+            " | {host_done}/{host_total} hosts {elapsed_str} | "
+        )));
+        spans.push(Span::styled(mode, Style::default().fg(Color::Cyan)));
+    } else {
+        spans.extend([
+            Span::raw(" | "),
+            Span::raw(format!("{total} panes  ")),
+            Span::styled(format!("•{free} free"), Style::default().fg(Color::White)),
+            Span::raw("  "),
+            Span::styled(
+                format!("◆{watched} watched"),
+                Style::default().fg(Color::Cyan),
+            ),
+        ]);
+        if problems > 0 {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                format!("!{problems} issues"),
+                Style::default().fg(Color::Red),
+            ));
+        }
+        spans.push(Span::raw(format!(
+            " | {host_done}/{host_total} hosts {elapsed_str}"
+        )));
+        spans.push(Span::raw(" | "));
+        spans.push(Span::styled(mode, Style::default().fg(Color::Cyan)));
+        spans.push(Span::raw(" | sort "));
         spans.push(Span::styled(
-            format!("!{problems} issues"),
-            Style::default().fg(Color::Red),
+            sort_label(app.sort_field, app.sort_direction),
+            muted_style(),
         ));
     }
-    spans.push(Span::raw(format!(
-        " | {host_done}/{host_total} hosts {elapsed_str}"
-    )));
-    spans.push(Span::raw(" | "));
-    spans.push(Span::styled(mode, Style::default().fg(Color::Cyan)));
-    spans.push(Span::raw(" | sort "));
-    spans.push(Span::styled(
-        sort_label(app.sort_field, app.sort_direction),
-        muted_style(),
-    ));
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -1940,10 +1956,7 @@ fn draw_live_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         return;
     }
 
-    // PREVIEW column gets whatever width remains after fixed columns.
-    // Fixed: selector(2) + glyph(2) + name(min 20) + age(6) + cmd(12) + gaps ≈ 42
-    // We compute a reasonable preview width; ratatui Min(0) will expand it.
-    let preview_min: u16 = 30;
+    let preview_min: u16 = 20;
 
     let selected_idx = app.selected.min(rows.len() - 1);
     let display_rows = live_table_rows(&rows);
@@ -1974,7 +1987,7 @@ fn draw_live_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         Row::new(["NAME", "AGE", "CMD", "PREVIEW"])
             .style(Style::default().add_modifier(Modifier::BOLD)),
     )
-    .block(Block::default())
+    .block(Block::default().borders(Borders::ALL).title("live tree"))
     .row_highlight_style(
         Style::default()
             .fg(Color::Black)
@@ -2065,32 +2078,7 @@ fn draw_inspector(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(block, area);
 
     if app.help {
-        let text = Text::from(vec![
-            Line::from("[j/↓] select next"),
-            Line::from("[k/↑] select previous"),
-            Line::from("[Home/End] first/last pane"),
-            Line::from("[gg/G] first/last pane"),
-            Line::from("[PgUp/PgDn] page"),
-            Line::from("[Ctrl-u/Ctrl-d] half page"),
-            Line::from("[H/M/L] screen top/middle/bottom"),
-            Line::from("[r] refresh now"),
-            Line::from("[s] cycle table sort field"),
-            Line::from("[S] toggle table sort direction"),
-            Line::from("[/] filter"),
-            Line::from("[Enter] readonly attach"),
-            Line::from("[a] read-write jump"),
-            Line::from("[c] capture into detail"),
-            Line::from("[i] inspect and refresh detail"),
-            Line::from("[x] kill selected pane"),
-            Line::from("[e] rename selected session"),
-            Line::from("[n] create session (<host>/<session>)"),
-            Line::from("[t] create session from template"),
-            Line::from("[p] spawn pane (<host>/<session>)"),
-            Line::from("[z] send keys to selected pane"),
-            Line::from("[d] toggle detail pane"),
-            Line::from("[?] toggle this help"),
-            Line::from("[q] quit"),
-        ]);
+        let text = Text::from(help_lines(inner.width));
         frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
         return;
     }
@@ -2175,14 +2163,62 @@ fn draw_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         "ready"
     };
     let spans = vec![
-        Span::raw(
-            "[↑↓ PgUp/PgDn] move  [gg/G] ends  [Enter] attach ro  [a] jump rw  [s/S] sort  [t] template  [z] send keys  [i] refresh  [/] filter  [d] details  [?] help  [x] kill  [q] quit   ",
-        ),
+        Span::raw(status_hint(area.width)),
         Span::styled(mode, Style::default().fg(Color::Cyan)),
         Span::raw("  "),
         Span::styled(short_message(&app.status), muted_style()),
     ];
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn help_lines(width: u16) -> Vec<Line<'static>> {
+    const HELP: &[&str] = &[
+        "[j/↓] select next",
+        "[k/↑] select previous",
+        "[Home/End] first/last pane",
+        "[gg/G] first/last pane",
+        "[PgUp/PgDn] page",
+        "[Ctrl-u/Ctrl-d] half page",
+        "[H/M/L] screen top/middle/bottom",
+        "[r] refresh now",
+        "[s] cycle sort field",
+        "[S] toggle sort direction",
+        "[/] filter",
+        "[Enter] readonly attach",
+        "[a] read-write jump",
+        "[c] capture detail",
+        "[i] inspect and refresh",
+        "[x] kill selected pane",
+        "[e] rename session",
+        "[n] create session",
+        "[t] create from template",
+        "[p] spawn pane",
+        "[z] send keys",
+        "[d] toggle detail pane",
+        "[?] toggle help",
+        "[q] quit",
+    ];
+
+    if width < 72 {
+        return HELP.iter().map(|item| Line::from(*item)).collect();
+    }
+
+    let split = HELP.len().div_ceil(2);
+    (0..split)
+        .map(|index| {
+            let left = HELP[index];
+            let right = HELP.get(index + split).copied().unwrap_or("");
+            Line::from(format!("{left:<34}{right}"))
+        })
+        .collect()
+}
+
+fn status_hint(width: u16) -> &'static str {
+    if width < 110 {
+        "[↑↓] move  [Enter/a] attach  [i] inspect  [/] filter  [?] help  [q] quit   "
+    } else {
+        "[↑↓ PgUp/PgDn] move  [gg/G] ends  [Enter/a] attach  [s/S] sort  [t] template  [z] send  [i] inspect  [/] filter  [d] details  [?] help  [q] quit   "
+    }
 }
 
 fn draw_context_rail(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
@@ -3497,6 +3533,29 @@ mod tests {
         assert!(handle_navigation_key(&mut app, key(KeyCode::Char('g')), 5));
         assert!(!handle_navigation_key(&mut app, key(KeyCode::Char('q')), 5));
         assert_eq!(app.pending_key, None);
+    }
+
+    #[test]
+    fn visible_table_rows_accounts_for_header_and_border() {
+        assert_eq!(visible_table_rows_from_height(24), 19);
+        assert_eq!(visible_table_rows_from_height(3), 1);
+    }
+
+    #[test]
+    fn help_lines_fit_normal_terminal_height() {
+        let compact = help_lines(78);
+        assert!(compact.len() <= 20);
+        assert!(
+            compact
+                .iter()
+                .any(|line| line_text(line.clone()).contains("[q] quit"))
+        );
+    }
+
+    #[test]
+    fn status_hint_has_compact_form_for_narrow_terminals() {
+        assert!(status_hint(100).len() < status_hint(140).len());
+        assert!(status_hint(100).contains("[?] help"));
     }
 
     #[test]
