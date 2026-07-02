@@ -38,3 +38,7 @@ validate-fixtures:
     ! cargo run --locked -- --config fixtures/config/invalid-duration.yaml hosts
 
 ci: fetch fmt-check lint test release help validate-fixtures
+
+# bump version (patch|minor|major|X.Y.Z), commit, tag; push manually after
+release bump:
+    scripts/release.sh {{bump}}
