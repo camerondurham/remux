@@ -146,7 +146,7 @@ fn resolve_command(
         }),
         None => Err(Cli::command().error(
             ErrorKind::MissingSubcommand,
-            "a subcommand is required when options are provided",
+            "a subcommand is required when options are provided; to launch the TUI with options, use `remux tui`",
         )),
     }
 }
@@ -186,6 +186,34 @@ mod tests {
         let err = resolve_command(cli.command, true).unwrap_err();
 
         assert_eq!(err.kind(), ErrorKind::MissingSubcommand);
+        assert!(
+            err.to_string().contains("use `remux tui`"),
+            "expected TUI hint in error: {err}"
+        );
+    }
+
+    #[test]
+    fn help_shows_documented_aliases_and_config_hint() {
+        let mut command = Cli::command();
+        let help = command.render_help().to_string();
+
+        assert!(help.contains("--config <PATH>"));
+        assert!(help.contains("Path to a config file"));
+        assert!(help.contains("list"));
+        assert!(help.contains("ls"));
+        assert!(help.contains("inspect 'pi/work:0.1'"));
+    }
+
+    #[test]
+    fn capture_rejects_zero_lines_at_parse_time() {
+        let err =
+            Cli::try_parse_from(["remux", "capture", "codex-agent", "--lines", "0"]).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+        assert!(
+            err.to_string().contains("must be greater than zero"),
+            "expected positive range hint in error: {err}"
+        );
     }
 
     #[test]

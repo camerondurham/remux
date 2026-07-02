@@ -122,6 +122,24 @@ fn does_not_treat_plain_pi_host_title_as_agent() {
     assert_eq!(infer_coding_agent("node", None, Some("pi")), None);
 }
 
+#[test]
+fn malformed_pane_target_explains_expected_shape() {
+    let err = parse_pane_target_or_explain("pi/work").unwrap_err();
+    let message = format!("{err:#}");
+
+    assert!(message.contains("invalid pane target `pi/work`"));
+    assert!(message.contains("<host>/<session>:<window>.<pane>"));
+    assert!(message.contains("pi/work:0.1"));
+}
+
+#[test]
+fn unknown_watch_or_target_points_to_list() {
+    let message = unknown_watch_or_target_message("codex-agent");
+
+    assert!(message.contains("unknown watch or pane target `codex-agent`"));
+    assert!(message.contains("remux list"));
+}
+
 fn watch(id: &str, matcher: WatchMatchConfig) -> IndexedWatch {
     IndexedWatch {
         index: 0,

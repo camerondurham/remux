@@ -21,7 +21,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
 use std::cmp::Ordering;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::{self, Stdout};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -138,6 +138,7 @@ struct App {
     inspect_pending: Option<String>,
     pending_selection: Option<SelectionPreference>,
     pending_key: Option<PendingKey>,
+    refresh_id: RefreshId,
 }
 
 #[derive(Clone)]
@@ -253,6 +254,7 @@ impl App {
             inspect_pending: None,
             pending_selection: None,
             pending_key: None,
+            refresh_id: 0,
         }
     }
 
@@ -483,7 +485,8 @@ impl App {
             .unwrap_or(usize::MAX)
     }
 
-    fn begin_refresh(&mut self, host_ids: Vec<String>) {
+    fn begin_refresh(&mut self, host_ids: Vec<String>) -> RefreshId {
+        self.refresh_id = self.refresh_id.wrapping_add(1);
         self.refresh_started_at = Some(Instant::now());
         self.refresh_completed_at = None;
         self.host_progress = host_ids
@@ -497,11 +500,12 @@ impl App {
             })
             .collect();
         self.status = self.progress_summary();
+        self.refresh_id
     }
 
     fn apply_refresh(&mut self, message: RefreshMessage) {
         match message {
-            RefreshMessage::HostStarted { host } => {
+            RefreshMessage::HostStarted { refresh_id, host } if refresh_id == self.refresh_id => {
                 if let Some(progress) = self.host_progress.iter_mut().find(|item| item.id == host) {
                     progress.state = HostProgressState::Polling;
                     progress.started_at = Some(Instant::now());
@@ -509,24 +513,39 @@ impl App {
                 }
                 self.status = self.progress_summary();
             }
-            RefreshMessage::HostFinished { snapshot } => {
+            RefreshMessage::HostStarted { .. } => {}
+            RefreshMessage::HostFinished {
+                refresh_id,
+                snapshot,
+            } if refresh_id == self.refresh_id => {
                 let selected_identity = self.selected_row_identity();
                 self.update_host_finished(&snapshot);
                 self.upsert_snapshot(snapshot);
                 self.restore_selection_after_refresh(selected_identity);
                 self.status = self.progress_summary();
             }
-            RefreshMessage::Complete => {
+            RefreshMessage::HostFinished { .. } => {}
+            RefreshMessage::Complete { refresh_id } if refresh_id == self.refresh_id => {
+                if !self.is_polling() && self.refresh_completed_at.is_some() {
+                    return;
+                }
                 // Force any still-pending hosts to Unreachable. If we get here
                 // with Queued/Polling entries, poll_hosts detached wedged
                 // workers past the deadline. Marking them terminal keeps
                 // is_polling() honest so the UI can refresh again.
+                let timeout_message = self
+                    .refresh_started_at
+                    .map(|started| {
+                        format!("poll timed out after {}", format_elapsed(started.elapsed()))
+                    })
+                    .unwrap_or_else(|| "poll timed out".to_string());
                 for progress in &mut self.host_progress {
                     if progress.state == HostProgressState::Queued
                         || progress.state == HostProgressState::Polling
                     {
                         progress.state = HostProgressState::Unreachable;
                         progress.finished_at = Some(Instant::now());
+                        progress.message = Some(timeout_message.clone());
                     }
                 }
                 self.last_refresh_duration = self.refresh_started_at.map(|t| t.elapsed());
@@ -534,6 +553,7 @@ impl App {
                 self.restore_pending_selection();
                 self.status = format!("scan complete: {}", self.progress_summary());
             }
+            RefreshMessage::Complete { .. } => {}
             RefreshMessage::InspectResult { display_id, result } => {
                 if self.inspect_pending.as_deref() == Some(display_id.as_str()) {
                     self.inspect_pending = None;
@@ -688,17 +708,23 @@ impl HostProgressState {
 #[allow(clippy::large_enum_variant)]
 enum RefreshMessage {
     HostStarted {
+        refresh_id: RefreshId,
         host: String,
     },
     HostFinished {
+        refresh_id: RefreshId,
         snapshot: HostSnapshot,
     },
-    Complete,
+    Complete {
+        refresh_id: RefreshId,
+    },
     InspectResult {
         display_id: String,
         result: anyhow::Result<PaneDetail>,
     },
 }
+
+type RefreshId = u64;
 
 fn spawn_refresh(
     config: &Config,
@@ -710,10 +736,16 @@ fn spawn_refresh(
         return Ok(());
     }
     let host_ids = host_ids_for_refresh(config, host.as_deref())?;
-    app.begin_refresh(host_ids.clone());
+    let refresh_id = app.begin_refresh(host_ids.clone());
     let config = config.clone();
+    let watchdog_tx = tx.clone();
+    let watchdog_timeout = refresh_deadline(&config, &host_ids);
     thread::spawn(move || {
-        poll_hosts(&config, host_ids, tx);
+        thread::sleep(watchdog_timeout);
+        let _ = watchdog_tx.send(RefreshMessage::Complete { refresh_id });
+    });
+    thread::spawn(move || {
+        poll_hosts(&config, host_ids, refresh_id, tx);
     });
     Ok(())
 }
@@ -759,13 +791,19 @@ fn host_ids_for_refresh(config: &Config, host: Option<&str>) -> Result<Vec<Strin
     })
 }
 
-fn poll_hosts(config: &Config, host_ids: Vec<String>, tx: mpsc::Sender<RefreshMessage>) {
+fn poll_hosts(
+    config: &Config,
+    host_ids: Vec<String>,
+    refresh_id: RefreshId,
+    tx: mpsc::Sender<RefreshMessage>,
+) {
     if host_ids.is_empty() {
-        let _ = tx.send(RefreshMessage::Complete);
+        let _ = tx.send(RefreshMessage::Complete { refresh_id });
         return;
     }
 
     let worker_count = config.poll.max_concurrency.min(host_ids.len()).max(1);
+    let deadline = Instant::now() + refresh_deadline(config, &host_ids);
     let queue = Arc::new(Mutex::new(VecDeque::from(host_ids)));
     let mut handles = Vec::new();
 
@@ -784,6 +822,7 @@ fn poll_hosts(config: &Config, host_ids: Vec<String>, tx: mpsc::Sender<RefreshMe
                 };
                 if tx
                     .send(RefreshMessage::HostStarted {
+                        refresh_id,
                         host: host_id.clone(),
                     })
                     .is_err()
@@ -792,16 +831,22 @@ fn poll_hosts(config: &Config, host_ids: Vec<String>, tx: mpsc::Sender<RefreshMe
                 }
                 let snapshot = snapshot::snapshot_host(&config, &host_id)
                     .unwrap_or_else(|err| synthetic_error_snapshot(host_id, err));
-                if tx.send(RefreshMessage::HostFinished { snapshot }).is_err() {
+                if tx
+                    .send(RefreshMessage::HostFinished {
+                        refresh_id,
+                        snapshot,
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
         }));
     }
 
-    // Give workers up to command_timeout + 2s to finish cleanly. Beyond that,
-    // detach remaining workers and send Complete so the UI can resume refreshes.
-    let deadline = Instant::now() + config.poll.command_timeout + Duration::from_secs(2);
+    // Give workers up to the full snapshot budget to finish cleanly. Beyond
+    // that, detach remaining workers and send Complete so the UI can resume
+    // refreshes.
     for handle in handles {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -816,7 +861,34 @@ fn poll_hosts(config: &Config, host_ids: Vec<String>, tx: mpsc::Sender<RefreshMe
         }
         // else: detach — thread continues in background but we move on
     }
-    let _ = tx.send(RefreshMessage::Complete);
+    let _ = tx.send(RefreshMessage::Complete { refresh_id });
+}
+
+fn refresh_deadline(config: &Config, host_ids: &[String]) -> Duration {
+    let command_units = host_ids
+        .iter()
+        .map(|host_id| snapshot_command_budget_units(config, host_id))
+        .sum::<usize>()
+        .max(1);
+    config
+        .poll
+        .command_timeout
+        .saturating_mul(command_units.min(u32::MAX as usize) as u32)
+        + Duration::from_secs(2)
+}
+
+fn snapshot_command_budget_units(config: &Config, host_id: &str) -> usize {
+    let configured_repos = config
+        .watches_for_host(host_id)
+        .into_iter()
+        .filter_map(|watch| watch.watch.repo)
+        .collect::<HashSet<_>>()
+        .len();
+
+    // Full host snapshot budget:
+    // - one inventory/capture command
+    // - two git commands for each unique configured watch repo
+    1 + configured_repos.saturating_mul(2)
 }
 
 fn synthetic_error_snapshot(host: String, err: anyhow::Error) -> HostSnapshot {
@@ -994,7 +1066,7 @@ fn visible_table_rows(terminal: &Terminal<CrosstermBackend<Stdout>>) -> Result<u
 }
 
 fn visible_table_rows_from_height(terminal_height: u16) -> usize {
-    terminal_height.saturating_sub(3).max(1) as usize
+    terminal_height.saturating_sub(5).max(1) as usize
 }
 
 fn handle_navigation_key(app: &mut App, key: KeyEvent, visible_rows: usize) -> bool {
@@ -1602,10 +1674,10 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     draw_summary(frame, chunks[0], app);
     if app.inspect_mode || app.help {
         draw_inspector(frame, chunks[1], app);
-    } else if app.show_context && area.width > 110 {
+    } else if app.show_context && area.width >= 96 {
         let body = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+            .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
             .split(chunks[1]);
         draw_live_table(frame, body[0], app);
         draw_context_rail(frame, body[1], app);
@@ -1657,43 +1729,59 @@ fn draw_summary(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         "browse"
     };
 
-    let mut spans = vec![
-        Span::styled("remux", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(" | "),
-        Span::raw("/ "),
-    ];
+    let compact = area.width < 110;
+    let mut spans = vec![Span::styled(
+        "remux",
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
+    spans.push(Span::raw(if compact { " " } else { " | " }));
+    spans.push(Span::raw("/ "));
     if app.editing_filter {
         spans.extend(app.filter.cursor_spans());
     } else {
         spans.push(Span::raw(filter_label(app)));
     }
-    spans.extend([
-        Span::raw(" | "),
-        Span::raw(format!("{total} panes  ")),
-        Span::styled(format!("•{free} free"), Style::default().fg(Color::White)),
-        Span::raw("  "),
-        Span::styled(
-            format!("◆{watched} watched"),
-            Style::default().fg(Color::Cyan),
-        ),
-    ]);
-    if problems > 0 {
-        spans.push(Span::raw("  "));
+    if compact {
+        spans.push(Span::raw(format!(" | {total} panes")));
+        if problems > 0 {
+            spans.push(Span::styled(
+                format!(" !{problems}"),
+                Style::default().fg(Color::Red),
+            ));
+        }
+        spans.push(Span::raw(format!(
+            " | {host_done}/{host_total} hosts {elapsed_str} | "
+        )));
+        spans.push(Span::styled(mode, Style::default().fg(Color::Cyan)));
+    } else {
+        spans.extend([
+            Span::raw(" | "),
+            Span::raw(format!("{total} panes  ")),
+            Span::styled(format!("•{free} free"), Style::default().fg(Color::White)),
+            Span::raw("  "),
+            Span::styled(
+                format!("◆{watched} watched"),
+                Style::default().fg(Color::Cyan),
+            ),
+        ]);
+        if problems > 0 {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                format!("!{problems} issues"),
+                Style::default().fg(Color::Red),
+            ));
+        }
+        spans.push(Span::raw(format!(
+            " | {host_done}/{host_total} hosts {elapsed_str}"
+        )));
+        spans.push(Span::raw(" | "));
+        spans.push(Span::styled(mode, Style::default().fg(Color::Cyan)));
+        spans.push(Span::raw(" | sort "));
         spans.push(Span::styled(
-            format!("!{problems} issues"),
-            Style::default().fg(Color::Red),
+            sort_label(app.sort_field, app.sort_direction),
+            muted_style(),
         ));
     }
-    spans.push(Span::raw(format!(
-        " | {host_done}/{host_total} hosts {elapsed_str}"
-    )));
-    spans.push(Span::raw(" | "));
-    spans.push(Span::styled(mode, Style::default().fg(Color::Cyan)));
-    spans.push(Span::raw(" | sort "));
-    spans.push(Span::styled(
-        sort_label(app.sort_field, app.sort_direction),
-        muted_style(),
-    ));
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -1940,10 +2028,7 @@ fn draw_live_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         return;
     }
 
-    // PREVIEW column gets whatever width remains after fixed columns.
-    // Fixed: selector(2) + glyph(2) + name(min 20) + age(6) + cmd(12) + gaps ≈ 42
-    // We compute a reasonable preview width; ratatui Min(0) will expand it.
-    let preview_min: u16 = 30;
+    let preview_min: u16 = 20;
 
     let selected_idx = app.selected.min(rows.len() - 1);
     let display_rows = live_table_rows(&rows);
@@ -1974,7 +2059,7 @@ fn draw_live_table(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         Row::new(["NAME", "AGE", "CMD", "PREVIEW"])
             .style(Style::default().add_modifier(Modifier::BOLD)),
     )
-    .block(Block::default())
+    .block(Block::default().borders(Borders::ALL).title("live tree"))
     .row_highlight_style(
         Style::default()
             .fg(Color::Black)
@@ -2065,32 +2150,7 @@ fn draw_inspector(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(block, area);
 
     if app.help {
-        let text = Text::from(vec![
-            Line::from("[j/↓] select next"),
-            Line::from("[k/↑] select previous"),
-            Line::from("[Home/End] first/last pane"),
-            Line::from("[gg/G] first/last pane"),
-            Line::from("[PgUp/PgDn] page"),
-            Line::from("[Ctrl-u/Ctrl-d] half page"),
-            Line::from("[H/M/L] screen top/middle/bottom"),
-            Line::from("[r] refresh now"),
-            Line::from("[s] cycle table sort field"),
-            Line::from("[S] toggle table sort direction"),
-            Line::from("[/] filter"),
-            Line::from("[Enter] readonly attach"),
-            Line::from("[a] read-write jump"),
-            Line::from("[c] capture into detail"),
-            Line::from("[i] inspect and refresh detail"),
-            Line::from("[x] kill selected pane"),
-            Line::from("[e] rename selected session"),
-            Line::from("[n] create session (<host>/<session>)"),
-            Line::from("[t] create session from template"),
-            Line::from("[p] spawn pane (<host>/<session>)"),
-            Line::from("[z] send keys to selected pane"),
-            Line::from("[d] toggle detail pane"),
-            Line::from("[?] toggle this help"),
-            Line::from("[q] quit"),
-        ]);
+        let text = Text::from(help_lines(inner.width));
         frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
         return;
     }
@@ -2175,9 +2235,7 @@ fn draw_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         "ready"
     };
     let spans = vec![
-        Span::raw(
-            "[↑↓ PgUp/PgDn] move  [gg/G] ends  [Enter] attach ro  [a] jump rw  [s/S] sort  [t] template  [z] send keys  [i] refresh  [/] filter  [d] details  [?] help  [x] kill  [q] quit   ",
-        ),
+        Span::raw(status_hint(area.width)),
         Span::styled(mode, Style::default().fg(Color::Cyan)),
         Span::raw("  "),
         Span::styled(short_message(&app.status), muted_style()),
@@ -2185,11 +2243,73 @@ fn draw_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+fn help_lines(width: u16) -> Vec<Line<'static>> {
+    const HELP: &[&str] = &[
+        "[j/↓] select next",
+        "[k/↑] select previous",
+        "[Home/End] first/last pane",
+        "[gg/G] first/last pane",
+        "[PgUp/PgDn] page",
+        "[Ctrl-u/Ctrl-d] half page",
+        "[H/M/L] screen top/middle/bottom",
+        "[r] refresh now",
+        "[s] cycle sort field",
+        "[S] toggle sort direction",
+        "[/] filter",
+        "[Enter] readonly attach",
+        "[a] read-write jump",
+        "[c] capture detail",
+        "[i] inspect and refresh",
+        "[x] kill selected pane",
+        "[e] rename session",
+        "[n] create session",
+        "[t] create from template",
+        "[p] spawn pane",
+        "[z] send keys",
+        "[d] toggle detail pane",
+        "[?] toggle help",
+        "[q] quit",
+    ];
+
+    if width < 72 {
+        return HELP.iter().map(|item| Line::from(*item)).collect();
+    }
+
+    let split = HELP.len().div_ceil(2);
+    (0..split)
+        .map(|index| {
+            let left = HELP[index];
+            let right = HELP.get(index + split).copied().unwrap_or("");
+            Line::from(format!("{left:<34}{right}"))
+        })
+        .collect()
+}
+
+fn status_hint(width: u16) -> &'static str {
+    if width < 110 {
+        "[↑↓] move  [Enter/a] attach  [i] inspect  [/] filter  [?] help  [q] quit   "
+    } else {
+        "[↑↓ PgUp/PgDn] move  [gg/G] ends  [Enter/a] attach  [s/S] sort  [t] template  [z] send  [i] inspect  [/] filter  [d] details  [?] help  [q] quit   "
+    }
+}
+
 fn draw_context_rail(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let Some(selected) = app.selected_row() else {
         return;
     };
 
+    let lines = context_rail_lines(app, selected, area.height);
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().title("context").borders(Borders::LEFT)),
+        area,
+    );
+}
+
+fn context_rail_lines(
+    app: &App,
+    selected: &SessionSnapshot,
+    available_height: u16,
+) -> Vec<Line<'static>> {
     // Action line: spinner while pending, otherwise hotkey hints.
     let is_pending = app.inspect_pending.as_deref() == Some(selected.display_id.as_str());
     let action_line = if is_pending {
@@ -2208,42 +2328,6 @@ fn draw_context_rail(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             "[i] refresh · [Enter] attach ro · [a] jump rw · [t] template · [z] send keys · [c] capture",
             muted_style(),
         ))
-    };
-
-    // Cached output section.
-    let output_lines: Vec<Line<'static>> = if let Some(output) = selected.output.as_ref() {
-        let age = {
-            let age_str = if let Some(ts) = output.last_output_at {
-                let secs = Utc::now().signed_duration_since(ts).num_seconds().max(0);
-                if secs < 60 {
-                    format!("{secs}s ago")
-                } else if secs < 3600 {
-                    format!("{}m ago", secs / 60)
-                } else {
-                    format!("{}h ago", secs / 3600)
-                }
-            } else {
-                "unknown age".to_string()
-            };
-            Line::from(Span::styled(format!("captured {age_str}"), muted_style()))
-        };
-        let text = if output.recent.is_empty() {
-            output.preview.as_str()
-        } else {
-            output.recent.as_str()
-        };
-        // Fit preview into available height: 4 meta lines + blank + age + action = 7 overhead.
-        let max_preview = (area.height as usize).saturating_sub(7).max(1);
-        let mut lines: Vec<Line<'static>> = vec![age];
-        for line in tail_lines(text, max_preview) {
-            lines.push(Line::from(line));
-        }
-        lines
-    } else {
-        vec![Line::from(Span::styled(
-            "no capture yet — press [i] to fetch",
-            muted_style(),
-        ))]
     };
 
     let mut lines = vec![
@@ -2295,14 +2379,60 @@ fn draw_context_rail(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     if selected.repo.is_some() {
         lines.push(Line::from(""));
     }
+
+    // Reserve one blank separator plus the action line. If fixed metadata
+    // consumes nearly all of a short rail, trim it before budgeting output so
+    // the bottom action hint remains visible.
+    let reserved_tail = 2usize;
+    let available_height = available_height as usize;
+    let max_fixed_lines = available_height.saturating_sub(reserved_tail + 1);
+    if lines.len() > max_fixed_lines {
+        lines.truncate(max_fixed_lines);
+        lines.push(Line::from(Span::styled("...", muted_style())));
+    }
+    let output_budget = available_height
+        .saturating_sub(lines.len() + reserved_tail)
+        .max(1);
+
+    // Cached output section.
+    let output_lines: Vec<Line<'static>> = if let Some(output) = selected.output.as_ref() {
+        let age = {
+            let age_str = if let Some(ts) = output.last_output_at {
+                let secs = Utc::now().signed_duration_since(ts).num_seconds().max(0);
+                if secs < 60 {
+                    format!("{secs}s ago")
+                } else if secs < 3600 {
+                    format!("{}m ago", secs / 60)
+                } else {
+                    format!("{}h ago", secs / 3600)
+                }
+            } else {
+                "unknown age".to_string()
+            };
+            Line::from(Span::styled(format!("captured {age_str}"), muted_style()))
+        };
+        let text = if output.recent.is_empty() {
+            output.preview.as_str()
+        } else {
+            output.recent.as_str()
+        };
+        let max_preview = output_budget.saturating_sub(1);
+        let mut lines: Vec<Line<'static>> = vec![age];
+        for line in tail_lines(text, max_preview) {
+            lines.push(Line::from(line));
+        }
+        lines
+    } else {
+        vec![Line::from(Span::styled(
+            "no capture yet — press [i] to fetch",
+            muted_style(),
+        ))]
+    };
+
     lines.extend(output_lines);
     lines.push(Line::from(""));
     lines.push(action_line);
-
-    frame.render_widget(
-        Paragraph::new(lines).block(Block::default().title("context").borders(Borders::LEFT)),
-        area,
-    );
+    lines
 }
 
 fn canonical_state(row: &SessionSnapshot) -> &'static str {
@@ -3166,8 +3296,13 @@ fn short_message(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{
+        HostConfig, HostKind, PollConfig, SessionTemplatesConfig, WatchConfig, WatchMatchConfig,
+    };
+    use crate::git::RepoSnapshot;
     use crate::snapshot::{
-        HostSnapshot, MatchStatus, SessionSnapshot, SessionState, SnapshotStatus, TmuxSnapshot,
+        HostSnapshot, MatchStatus, OutputSnapshot, ProcessSnapshot, SessionSnapshot, SessionState,
+        SnapshotStatus, TmuxSnapshot,
     };
     use crate::tui::session_template::SessionTemplatePrefix;
 
@@ -3500,6 +3635,29 @@ mod tests {
     }
 
     #[test]
+    fn visible_table_rows_accounts_for_header_and_border() {
+        assert_eq!(visible_table_rows_from_height(24), 19);
+        assert_eq!(visible_table_rows_from_height(3), 1);
+    }
+
+    #[test]
+    fn help_lines_fit_normal_terminal_height() {
+        let compact = help_lines(78);
+        assert!(compact.len() <= 20);
+        assert!(
+            compact
+                .iter()
+                .any(|line| line_text(line.clone()).contains("[q] quit"))
+        );
+    }
+
+    #[test]
+    fn status_hint_has_compact_form_for_narrow_terminals() {
+        assert!(status_hint(100).len() < status_hint(140).len());
+        assert!(status_hint(100).contains("[?] help"));
+    }
+
+    #[test]
     fn selected_row_actions_still_resolve_panes_after_tree_navigation() {
         let mut app = app_with_rows(vec![
             row_at("local", "work", "0", "0", "pane-0"),
@@ -3552,11 +3710,13 @@ mod tests {
             vec![row_at("local", "old-work", "0", "0", "old")],
         )];
 
-        app.apply_refresh(RefreshMessage::Complete);
+        let refresh_id = app.begin_refresh(vec!["local".to_string()]);
+        app.apply_refresh(RefreshMessage::Complete { refresh_id });
 
         assert!(app.pending_selection.is_some());
 
         app.apply_refresh(RefreshMessage::HostFinished {
+            refresh_id,
             snapshot: host_snapshot(
                 "local",
                 vec![
@@ -3571,6 +3731,151 @@ mod tests {
             Some("local/new-work:0.0")
         );
         assert!(app.pending_selection.is_none());
+    }
+
+    #[test]
+    fn refresh_complete_marks_in_flight_hosts_unreachable() {
+        let mut app = App::new(
+            String::new(),
+            TuiSortField::Attention,
+            TuiSortDirection::Desc,
+        );
+        let refresh_id = app.begin_refresh(vec!["local".to_string(), "pi".to_string()]);
+
+        app.apply_refresh(RefreshMessage::HostStarted {
+            refresh_id,
+            host: "local".to_string(),
+        });
+        app.apply_refresh(RefreshMessage::Complete { refresh_id });
+
+        assert!(!app.is_polling());
+        assert!(app.refresh_completed_at.is_some());
+        assert!(app.host_progress.iter().all(|host| {
+            matches!(host.state, HostProgressState::Unreachable) && host.finished_at.is_some()
+        }));
+    }
+
+    #[test]
+    fn refresh_deadline_allows_configured_repo_collect_commands() {
+        let config = Config {
+            poll: PollConfig {
+                command_timeout: Duration::from_secs(2),
+                ..PollConfig::default()
+            },
+            tui: Default::default(),
+            session_templates: SessionTemplatesConfig::default(),
+            hosts: vec![HostConfig {
+                id: "local".to_string(),
+                kind: HostKind::Local,
+                tmux_socket: None,
+                session_roots: Vec::new(),
+                ssh: None,
+            }],
+            watches: vec![
+                WatchConfig {
+                    id: "one".to_string(),
+                    host: "local".to_string(),
+                    matcher: WatchMatchConfig {
+                        command: Some("node".to_string()),
+                        cwd: None,
+                        cwd_prefix: None,
+                        tmux: None,
+                    },
+                    repo: Some("/repo/one".to_string()),
+                    agent_hint: None,
+                },
+                WatchConfig {
+                    id: "two".to_string(),
+                    host: "local".to_string(),
+                    matcher: WatchMatchConfig {
+                        command: Some("bash".to_string()),
+                        cwd: None,
+                        cwd_prefix: None,
+                        tmux: None,
+                    },
+                    repo: Some("/repo/two".to_string()),
+                    agent_hint: None,
+                },
+            ],
+            sessions: Vec::new(),
+        };
+
+        assert_eq!(
+            refresh_deadline(&config, &["local".to_string()]),
+            Duration::from_secs(12)
+        );
+    }
+
+    #[test]
+    fn stale_refresh_messages_are_ignored_after_new_refresh_starts() {
+        let mut app = App::new(
+            String::new(),
+            TuiSortField::Attention,
+            TuiSortDirection::Desc,
+        );
+        let stale_refresh_id = app.begin_refresh(vec!["local".to_string()]);
+        let current_refresh_id = app.begin_refresh(vec!["local".to_string()]);
+
+        app.apply_refresh(RefreshMessage::HostFinished {
+            refresh_id: stale_refresh_id,
+            snapshot: host_snapshot("local", vec![row_at("local", "old", "0", "0", "old")]),
+        });
+
+        assert!(app.snapshots.is_empty());
+
+        app.apply_refresh(RefreshMessage::HostFinished {
+            refresh_id: current_refresh_id,
+            snapshot: host_snapshot("local", vec![row_at("local", "new", "0", "0", "new")]),
+        });
+
+        assert_eq!(
+            app.selected_row().and_then(|row| row.raw_target.as_deref()),
+            Some("local/new:0.0")
+        );
+    }
+
+    #[test]
+    fn context_rail_preserves_action_hint_at_normal_terminal_height() {
+        let mut row = row_at("local", "work", "0", "0", "pane");
+        row.process = Some(ProcessSnapshot {
+            pid: Some(42),
+            command: "node".to_string(),
+            cwd: "/repo".to_string(),
+        });
+        row.repo = Some(RepoSnapshot {
+            path: "/repo".to_string(),
+            branch: Some("main".to_string()),
+            dirty_count: Some(4),
+            changed_files: vec![
+                " M src/one.rs".to_string(),
+                " M src/two.rs".to_string(),
+                " M src/three.rs".to_string(),
+                " M src/four.rs".to_string(),
+            ],
+            error: None,
+        });
+        row.output = Some(OutputSnapshot {
+            preview: "line 12".to_string(),
+            recent: (1..=12)
+                .map(|line| format!("line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            hash: "abc".to_string(),
+            last_output_at: Some(Utc::now()),
+        });
+        let app = app_with_rows(vec![row]);
+        let selected = app.selected_row().expect("selected pane");
+
+        let lines = context_rail_lines(&app, selected, 22);
+        let rendered: Vec<String> = lines.into_iter().map(line_text).collect();
+
+        assert!(rendered.len() <= 22);
+        assert!(
+            rendered
+                .last()
+                .is_some_and(|line| line.contains("[i] refresh")),
+            "expected action hint to remain visible: {rendered:?}"
+        );
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -3665,8 +3970,6 @@ mod tests {
 
         assert!(line_text(input_prompt_line(&prompt)).contains("local/_work"));
     }
-
-    use crate::snapshot::ProcessSnapshot;
 
     fn row_with_meta(
         cmd: &str,

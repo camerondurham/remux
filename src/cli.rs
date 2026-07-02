@@ -6,9 +6,10 @@ use std::path::PathBuf;
     name = "remux",
     version,
     about = "Inspect tmux panes across local and SSH hosts",
-    after_help = "Run without a command to launch the TUI."
+    after_help = "Run `remux` with no arguments to launch the TUI. Use `remux tui` when passing TUI options.\n\nExamples:\n  remux onboard --write\n  remux doctor\n  remux list --group sessions\n  remux inspect 'pi/work:0.1'\n  remux attach --readonly 'pi/work:0.1'\n  remux tui --host pi --filter codex"
 )]
 pub struct Cli {
+    /// Path to a config file.
     #[arg(long, global = true, value_name = "PATH")]
     pub config: Option<PathBuf>,
 
@@ -51,7 +52,10 @@ pub enum Command {
         json: bool,
     },
     /// List watches and discovered panes across all hosts.
-    #[command(alias = "ls")]
+    #[command(
+        visible_alias = "ls",
+        after_help = "Examples:\n  remux list\n  remux list --group sessions\n  remux list --json"
+    )]
     List {
         /// Emit structured JSON.
         #[arg(long)]
@@ -70,7 +74,10 @@ pub enum Command {
         json: bool,
     },
     /// Pick a pane or session through fzf.
-    #[command(alias = "p")]
+    #[command(
+        visible_alias = "p",
+        after_help = "Examples:\n  remux pick\n  remux pick --host pi --filter codex\n  remux pick --sessions"
+    )]
     Pick {
         /// Poll only one configured host.
         #[arg(long)]
@@ -89,7 +96,10 @@ pub enum Command {
         no_fzf: bool,
     },
     /// Inspect one watch id or discovered pane target.
-    #[command(alias = "i")]
+    #[command(
+        visible_alias = "i",
+        after_help = "Examples:\n  remux inspect codex-agent\n  remux inspect 'pi/work:0.1'\n  remux inspect 'pi/work:0.1' --json"
+    )]
     Inspect {
         /// Watch id or <host>/<session>:<window>.<pane> target.
         id: String,
@@ -101,18 +111,24 @@ pub enum Command {
         color: bool,
     },
     /// Capture recent visible output from one watch or pane.
+    #[command(
+        after_help = "Examples:\n  remux capture codex-agent\n  remux capture 'pi/work:0.1' --lines 200\n  remux capture 'pi/work:0.1' --color"
+    )]
     Capture {
         /// Watch id or <host>/<session>:<window>.<pane> target.
         id: String,
         /// Number of recent lines to capture.
-        #[arg(long, default_value_t = 120)]
+        #[arg(long, default_value_t = 120, value_parser = parse_positive_usize)]
         lines: usize,
         /// Preserve ANSI escape sequences.
         #[arg(long)]
         color: bool,
     },
     /// Attach interactively to a watch or pane.
-    #[command(alias = "a")]
+    #[command(
+        visible_alias = "a",
+        after_help = "Examples:\n  remux attach --readonly codex-agent\n  remux attach --readonly 'pi/work:0.1'\n  remux attach 'pi/work:0.1'"
+    )]
     Attach {
         /// Attach in tmux read-only mode.
         #[arg(long)]
@@ -166,4 +182,14 @@ pub enum Command {
 pub enum ListGroup {
     Panes,
     Sessions,
+}
+
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|err| format!("invalid positive integer `{value}`: {err}"))?;
+    if parsed == 0 {
+        return Err("must be greater than zero".to_string());
+    }
+    Ok(parsed)
 }
