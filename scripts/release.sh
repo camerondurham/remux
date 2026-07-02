@@ -43,9 +43,8 @@ if git rev-parse "$tag" >/dev/null 2>&1; then
     exit 1
 fi
 
-sed -i.bak "0,/^version = \"[0-9.]*\"/s//version = \"${next}\"/" Cargo.toml
-rm -f Cargo.toml.bak
-cargo update --locked -p remux --precise "$next" 2>/dev/null || cargo update -p remux --precise "$next"
+sed -i '' -E '1,10s/^version = "[0-9.]+"/version = "'"${next}"'"/' Cargo.toml
+cargo check --quiet
 
 git add Cargo.toml Cargo.lock
 git commit -m "release: v${next}"
