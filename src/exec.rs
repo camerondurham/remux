@@ -33,8 +33,11 @@ pub fn output(
             .try_wait()
             .with_context(|| format!("failed to wait for {description}"))?
         {
-            let stdout = join_reader(stdout_handle, "stdout", &description)?;
-            let stderr = join_reader(stderr_handle, "stderr", &description)?;
+            let deadline = Instant::now() + Duration::from_millis(500);
+            let stdout =
+                join_reader_with_deadline(stdout_handle, "stdout", &description, deadline)?;
+            let stderr =
+                join_reader_with_deadline(stderr_handle, "stderr", &description, deadline)?;
             return Ok(Output {
                 status,
                 stdout,
@@ -80,6 +83,21 @@ fn join_reader(
         .with_context(|| format!("failed to read {stream} for {description}"))
 }
 
+fn join_reader_with_deadline(
+    handle: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    stream: &str,
+    description: &str,
+    deadline: Instant,
+) -> Result<Vec<u8>> {
+    while Instant::now() < deadline {
+        if handle.is_finished() {
+            return join_reader(handle, stream, description);
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    bail!("{description} exited but {stream} did not close");
+}
+
 fn try_join_reader_with_deadline(
     handle: thread::JoinHandle<std::io::Result<Vec<u8>>>,
     deadline: Instant,
@@ -103,5 +121,25 @@ fn format_duration(duration: Duration) -> String {
         format!("{}s", duration.as_secs())
     } else {
         format!("{:.3}s", duration.as_secs_f64())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_does_not_block_forever_when_descendant_holds_stdout_open() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("printf ready; sleep 4 &");
+
+        let started = Instant::now();
+        let err = output(&mut command, Duration::from_secs(5), "leaky stdout").unwrap_err();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "output waited for inherited pipe instead of failing fast"
+        );
+        assert!(format!("{err:#}").contains("stdout did not close"));
     }
 }

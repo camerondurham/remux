@@ -138,6 +138,7 @@ struct App {
     inspect_pending: Option<String>,
     pending_selection: Option<SelectionPreference>,
     pending_key: Option<PendingKey>,
+    refresh_id: RefreshId,
 }
 
 #[derive(Clone)]
@@ -253,6 +254,7 @@ impl App {
             inspect_pending: None,
             pending_selection: None,
             pending_key: None,
+            refresh_id: 0,
         }
     }
 
@@ -483,7 +485,8 @@ impl App {
             .unwrap_or(usize::MAX)
     }
 
-    fn begin_refresh(&mut self, host_ids: Vec<String>) {
+    fn begin_refresh(&mut self, host_ids: Vec<String>) -> RefreshId {
+        self.refresh_id = self.refresh_id.wrapping_add(1);
         self.refresh_started_at = Some(Instant::now());
         self.refresh_completed_at = None;
         self.host_progress = host_ids
@@ -497,11 +500,12 @@ impl App {
             })
             .collect();
         self.status = self.progress_summary();
+        self.refresh_id
     }
 
     fn apply_refresh(&mut self, message: RefreshMessage) {
         match message {
-            RefreshMessage::HostStarted { host } => {
+            RefreshMessage::HostStarted { refresh_id, host } if refresh_id == self.refresh_id => {
                 if let Some(progress) = self.host_progress.iter_mut().find(|item| item.id == host) {
                     progress.state = HostProgressState::Polling;
                     progress.started_at = Some(Instant::now());
@@ -509,24 +513,39 @@ impl App {
                 }
                 self.status = self.progress_summary();
             }
-            RefreshMessage::HostFinished { snapshot } => {
+            RefreshMessage::HostStarted { .. } => {}
+            RefreshMessage::HostFinished {
+                refresh_id,
+                snapshot,
+            } if refresh_id == self.refresh_id => {
                 let selected_identity = self.selected_row_identity();
                 self.update_host_finished(&snapshot);
                 self.upsert_snapshot(snapshot);
                 self.restore_selection_after_refresh(selected_identity);
                 self.status = self.progress_summary();
             }
-            RefreshMessage::Complete => {
+            RefreshMessage::HostFinished { .. } => {}
+            RefreshMessage::Complete { refresh_id } if refresh_id == self.refresh_id => {
+                if !self.is_polling() && self.refresh_completed_at.is_some() {
+                    return;
+                }
                 // Force any still-pending hosts to Unreachable. If we get here
                 // with Queued/Polling entries, poll_hosts detached wedged
                 // workers past the deadline. Marking them terminal keeps
                 // is_polling() honest so the UI can refresh again.
+                let timeout_message = self
+                    .refresh_started_at
+                    .map(|started| {
+                        format!("poll timed out after {}", format_elapsed(started.elapsed()))
+                    })
+                    .unwrap_or_else(|| "poll timed out".to_string());
                 for progress in &mut self.host_progress {
                     if progress.state == HostProgressState::Queued
                         || progress.state == HostProgressState::Polling
                     {
                         progress.state = HostProgressState::Unreachable;
                         progress.finished_at = Some(Instant::now());
+                        progress.message = Some(timeout_message.clone());
                     }
                 }
                 self.last_refresh_duration = self.refresh_started_at.map(|t| t.elapsed());
@@ -534,6 +553,7 @@ impl App {
                 self.restore_pending_selection();
                 self.status = format!("scan complete: {}", self.progress_summary());
             }
+            RefreshMessage::Complete { .. } => {}
             RefreshMessage::InspectResult { display_id, result } => {
                 if self.inspect_pending.as_deref() == Some(display_id.as_str()) {
                     self.inspect_pending = None;
@@ -688,17 +708,23 @@ impl HostProgressState {
 #[allow(clippy::large_enum_variant)]
 enum RefreshMessage {
     HostStarted {
+        refresh_id: RefreshId,
         host: String,
     },
     HostFinished {
+        refresh_id: RefreshId,
         snapshot: HostSnapshot,
     },
-    Complete,
+    Complete {
+        refresh_id: RefreshId,
+    },
     InspectResult {
         display_id: String,
         result: anyhow::Result<PaneDetail>,
     },
 }
+
+type RefreshId = u64;
 
 fn spawn_refresh(
     config: &Config,
@@ -710,10 +736,16 @@ fn spawn_refresh(
         return Ok(());
     }
     let host_ids = host_ids_for_refresh(config, host.as_deref())?;
-    app.begin_refresh(host_ids.clone());
+    let refresh_id = app.begin_refresh(host_ids.clone());
     let config = config.clone();
+    let watchdog_tx = tx.clone();
+    let watchdog_timeout = refresh_deadline(&config);
     thread::spawn(move || {
-        poll_hosts(&config, host_ids, tx);
+        thread::sleep(watchdog_timeout);
+        let _ = watchdog_tx.send(RefreshMessage::Complete { refresh_id });
+    });
+    thread::spawn(move || {
+        poll_hosts(&config, host_ids, refresh_id, tx);
     });
     Ok(())
 }
@@ -759,9 +791,14 @@ fn host_ids_for_refresh(config: &Config, host: Option<&str>) -> Result<Vec<Strin
     })
 }
 
-fn poll_hosts(config: &Config, host_ids: Vec<String>, tx: mpsc::Sender<RefreshMessage>) {
+fn poll_hosts(
+    config: &Config,
+    host_ids: Vec<String>,
+    refresh_id: RefreshId,
+    tx: mpsc::Sender<RefreshMessage>,
+) {
     if host_ids.is_empty() {
-        let _ = tx.send(RefreshMessage::Complete);
+        let _ = tx.send(RefreshMessage::Complete { refresh_id });
         return;
     }
 
@@ -784,6 +821,7 @@ fn poll_hosts(config: &Config, host_ids: Vec<String>, tx: mpsc::Sender<RefreshMe
                 };
                 if tx
                     .send(RefreshMessage::HostStarted {
+                        refresh_id,
                         host: host_id.clone(),
                     })
                     .is_err()
@@ -792,7 +830,13 @@ fn poll_hosts(config: &Config, host_ids: Vec<String>, tx: mpsc::Sender<RefreshMe
                 }
                 let snapshot = snapshot::snapshot_host(&config, &host_id)
                     .unwrap_or_else(|err| synthetic_error_snapshot(host_id, err));
-                if tx.send(RefreshMessage::HostFinished { snapshot }).is_err() {
+                if tx
+                    .send(RefreshMessage::HostFinished {
+                        refresh_id,
+                        snapshot,
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -801,7 +845,7 @@ fn poll_hosts(config: &Config, host_ids: Vec<String>, tx: mpsc::Sender<RefreshMe
 
     // Give workers up to command_timeout + 2s to finish cleanly. Beyond that,
     // detach remaining workers and send Complete so the UI can resume refreshes.
-    let deadline = Instant::now() + config.poll.command_timeout + Duration::from_secs(2);
+    let deadline = Instant::now() + refresh_deadline(config);
     for handle in handles {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -816,7 +860,11 @@ fn poll_hosts(config: &Config, host_ids: Vec<String>, tx: mpsc::Sender<RefreshMe
         }
         // else: detach — thread continues in background but we move on
     }
-    let _ = tx.send(RefreshMessage::Complete);
+    let _ = tx.send(RefreshMessage::Complete { refresh_id });
+}
+
+fn refresh_deadline(config: &Config) -> Duration {
+    config.poll.command_timeout + Duration::from_secs(2)
 }
 
 fn synthetic_error_snapshot(host: String, err: anyhow::Error) -> HostSnapshot {
@@ -3611,11 +3659,13 @@ mod tests {
             vec![row_at("local", "old-work", "0", "0", "old")],
         )];
 
-        app.apply_refresh(RefreshMessage::Complete);
+        let refresh_id = app.begin_refresh(vec!["local".to_string()]);
+        app.apply_refresh(RefreshMessage::Complete { refresh_id });
 
         assert!(app.pending_selection.is_some());
 
         app.apply_refresh(RefreshMessage::HostFinished {
+            refresh_id,
             snapshot: host_snapshot(
                 "local",
                 vec![
@@ -3630,6 +3680,56 @@ mod tests {
             Some("local/new-work:0.0")
         );
         assert!(app.pending_selection.is_none());
+    }
+
+    #[test]
+    fn refresh_complete_marks_in_flight_hosts_unreachable() {
+        let mut app = App::new(
+            String::new(),
+            TuiSortField::Attention,
+            TuiSortDirection::Desc,
+        );
+        let refresh_id = app.begin_refresh(vec!["local".to_string(), "pi".to_string()]);
+
+        app.apply_refresh(RefreshMessage::HostStarted {
+            refresh_id,
+            host: "local".to_string(),
+        });
+        app.apply_refresh(RefreshMessage::Complete { refresh_id });
+
+        assert!(!app.is_polling());
+        assert!(app.refresh_completed_at.is_some());
+        assert!(app.host_progress.iter().all(|host| {
+            matches!(host.state, HostProgressState::Unreachable) && host.finished_at.is_some()
+        }));
+    }
+
+    #[test]
+    fn stale_refresh_messages_are_ignored_after_new_refresh_starts() {
+        let mut app = App::new(
+            String::new(),
+            TuiSortField::Attention,
+            TuiSortDirection::Desc,
+        );
+        let stale_refresh_id = app.begin_refresh(vec!["local".to_string()]);
+        let current_refresh_id = app.begin_refresh(vec!["local".to_string()]);
+
+        app.apply_refresh(RefreshMessage::HostFinished {
+            refresh_id: stale_refresh_id,
+            snapshot: host_snapshot("local", vec![row_at("local", "old", "0", "0", "old")]),
+        });
+
+        assert!(app.snapshots.is_empty());
+
+        app.apply_refresh(RefreshMessage::HostFinished {
+            refresh_id: current_refresh_id,
+            snapshot: host_snapshot("local", vec![row_at("local", "new", "0", "0", "new")]),
+        });
+
+        assert_eq!(
+            app.selected_row().and_then(|row| row.raw_target.as_deref()),
+            Some("local/new:0.0")
+        );
     }
 
     fn key(code: KeyCode) -> KeyEvent {

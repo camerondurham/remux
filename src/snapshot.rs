@@ -246,11 +246,11 @@ pub fn inspect_with_color(config: &Config, id_or_target: &str, color: bool) -> R
     if config.find_watch(id_or_target).is_some() {
         return inspect_watch(config, id_or_target, color);
     }
-    if let Ok(target) = PaneTarget::parse(id_or_target) {
+    if let Some(target) = parse_pane_target_or_explain(id_or_target)? {
         return inspect_target(config, &target, color);
     }
 
-    bail!("unknown watch or pane target `{id_or_target}`")
+    bail!("{}", unknown_watch_or_target_message(id_or_target))
 }
 
 /// Refresh the capture for an already-known pane without re-running host inventory.
@@ -291,11 +291,29 @@ pub fn target_for_action(config: &Config, id_or_target: &str, action: &str) -> R
     if config.find_watch(id_or_target).is_some() {
         return target_for_watch(config, id_or_target, action);
     }
-    if let Ok(target) = PaneTarget::parse(id_or_target) {
+    if let Some(target) = parse_pane_target_or_explain(id_or_target)? {
         return Ok(target);
     }
 
-    bail!("unknown watch or pane target `{id_or_target}`")
+    bail!("{}", unknown_watch_or_target_message(id_or_target))
+}
+
+fn parse_pane_target_or_explain(input: &str) -> Result<Option<PaneTarget>> {
+    match PaneTarget::parse(input) {
+        Ok(target) => Ok(Some(target)),
+        Err(err) if input.contains('/') || input.contains(':') => {
+            bail!(
+                "invalid pane target `{input}`: {err:#}; expected <host>/<session>:<window>.<pane>, for example pi/work:0.1"
+            )
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+fn unknown_watch_or_target_message(input: &str) -> String {
+    format!(
+        "unknown watch or pane target `{input}`; run `remux list` to see watch ids and pane targets"
+    )
 }
 
 fn inspect_watch(config: &Config, watch_id: &str, color: bool) -> Result<PaneDetail> {
