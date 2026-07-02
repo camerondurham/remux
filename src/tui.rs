@@ -21,7 +21,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
 use std::cmp::Ordering;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::{self, Stdout};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -739,7 +739,7 @@ fn spawn_refresh(
     let refresh_id = app.begin_refresh(host_ids.clone());
     let config = config.clone();
     let watchdog_tx = tx.clone();
-    let watchdog_timeout = refresh_deadline(&config);
+    let watchdog_timeout = refresh_deadline(&config, &host_ids);
     thread::spawn(move || {
         thread::sleep(watchdog_timeout);
         let _ = watchdog_tx.send(RefreshMessage::Complete { refresh_id });
@@ -803,6 +803,7 @@ fn poll_hosts(
     }
 
     let worker_count = config.poll.max_concurrency.min(host_ids.len()).max(1);
+    let deadline = Instant::now() + refresh_deadline(config, &host_ids);
     let queue = Arc::new(Mutex::new(VecDeque::from(host_ids)));
     let mut handles = Vec::new();
 
@@ -843,9 +844,9 @@ fn poll_hosts(
         }));
     }
 
-    // Give workers up to command_timeout + 2s to finish cleanly. Beyond that,
-    // detach remaining workers and send Complete so the UI can resume refreshes.
-    let deadline = Instant::now() + refresh_deadline(config);
+    // Give workers up to the full snapshot budget to finish cleanly. Beyond
+    // that, detach remaining workers and send Complete so the UI can resume
+    // refreshes.
     for handle in handles {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -863,8 +864,31 @@ fn poll_hosts(
     let _ = tx.send(RefreshMessage::Complete { refresh_id });
 }
 
-fn refresh_deadline(config: &Config) -> Duration {
-    config.poll.command_timeout + Duration::from_secs(2)
+fn refresh_deadline(config: &Config, host_ids: &[String]) -> Duration {
+    let command_units = host_ids
+        .iter()
+        .map(|host_id| snapshot_command_budget_units(config, host_id))
+        .sum::<usize>()
+        .max(1);
+    config
+        .poll
+        .command_timeout
+        .saturating_mul(command_units.min(u32::MAX as usize) as u32)
+        + Duration::from_secs(2)
+}
+
+fn snapshot_command_budget_units(config: &Config, host_id: &str) -> usize {
+    let configured_repos = config
+        .watches_for_host(host_id)
+        .into_iter()
+        .filter_map(|watch| watch.watch.repo)
+        .collect::<HashSet<_>>()
+        .len();
+
+    // Full host snapshot budget:
+    // - one inventory/capture command
+    // - two git commands for each unique configured watch repo
+    1 + configured_repos.saturating_mul(2)
 }
 
 fn synthetic_error_snapshot(host: String, err: anyhow::Error) -> HostSnapshot {
@@ -2274,6 +2298,18 @@ fn draw_context_rail(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         return;
     };
 
+    let lines = context_rail_lines(app, selected, area.height);
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::default().title("context").borders(Borders::LEFT)),
+        area,
+    );
+}
+
+fn context_rail_lines(
+    app: &App,
+    selected: &SessionSnapshot,
+    available_height: u16,
+) -> Vec<Line<'static>> {
     // Action line: spinner while pending, otherwise hotkey hints.
     let is_pending = app.inspect_pending.as_deref() == Some(selected.display_id.as_str());
     let action_line = if is_pending {
@@ -2292,42 +2328,6 @@ fn draw_context_rail(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             "[i] refresh · [Enter] attach ro · [a] jump rw · [t] template · [z] send keys · [c] capture",
             muted_style(),
         ))
-    };
-
-    // Cached output section.
-    let output_lines: Vec<Line<'static>> = if let Some(output) = selected.output.as_ref() {
-        let age = {
-            let age_str = if let Some(ts) = output.last_output_at {
-                let secs = Utc::now().signed_duration_since(ts).num_seconds().max(0);
-                if secs < 60 {
-                    format!("{secs}s ago")
-                } else if secs < 3600 {
-                    format!("{}m ago", secs / 60)
-                } else {
-                    format!("{}h ago", secs / 3600)
-                }
-            } else {
-                "unknown age".to_string()
-            };
-            Line::from(Span::styled(format!("captured {age_str}"), muted_style()))
-        };
-        let text = if output.recent.is_empty() {
-            output.preview.as_str()
-        } else {
-            output.recent.as_str()
-        };
-        // Fit preview into available height: 4 meta lines + blank + age + action = 7 overhead.
-        let max_preview = (area.height as usize).saturating_sub(7).max(1);
-        let mut lines: Vec<Line<'static>> = vec![age];
-        for line in tail_lines(text, max_preview) {
-            lines.push(Line::from(line));
-        }
-        lines
-    } else {
-        vec![Line::from(Span::styled(
-            "no capture yet — press [i] to fetch",
-            muted_style(),
-        ))]
     };
 
     let mut lines = vec![
@@ -2379,14 +2379,60 @@ fn draw_context_rail(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     if selected.repo.is_some() {
         lines.push(Line::from(""));
     }
+
+    // Reserve one blank separator plus the action line. If fixed metadata
+    // consumes nearly all of a short rail, trim it before budgeting output so
+    // the bottom action hint remains visible.
+    let reserved_tail = 2usize;
+    let available_height = available_height as usize;
+    let max_fixed_lines = available_height.saturating_sub(reserved_tail + 1);
+    if lines.len() > max_fixed_lines {
+        lines.truncate(max_fixed_lines);
+        lines.push(Line::from(Span::styled("...", muted_style())));
+    }
+    let output_budget = available_height
+        .saturating_sub(lines.len() + reserved_tail)
+        .max(1);
+
+    // Cached output section.
+    let output_lines: Vec<Line<'static>> = if let Some(output) = selected.output.as_ref() {
+        let age = {
+            let age_str = if let Some(ts) = output.last_output_at {
+                let secs = Utc::now().signed_duration_since(ts).num_seconds().max(0);
+                if secs < 60 {
+                    format!("{secs}s ago")
+                } else if secs < 3600 {
+                    format!("{}m ago", secs / 60)
+                } else {
+                    format!("{}h ago", secs / 3600)
+                }
+            } else {
+                "unknown age".to_string()
+            };
+            Line::from(Span::styled(format!("captured {age_str}"), muted_style()))
+        };
+        let text = if output.recent.is_empty() {
+            output.preview.as_str()
+        } else {
+            output.recent.as_str()
+        };
+        let max_preview = output_budget.saturating_sub(1);
+        let mut lines: Vec<Line<'static>> = vec![age];
+        for line in tail_lines(text, max_preview) {
+            lines.push(Line::from(line));
+        }
+        lines
+    } else {
+        vec![Line::from(Span::styled(
+            "no capture yet — press [i] to fetch",
+            muted_style(),
+        ))]
+    };
+
     lines.extend(output_lines);
     lines.push(Line::from(""));
     lines.push(action_line);
-
-    frame.render_widget(
-        Paragraph::new(lines).block(Block::default().title("context").borders(Borders::LEFT)),
-        area,
-    );
+    lines
 }
 
 fn canonical_state(row: &SessionSnapshot) -> &'static str {
@@ -3250,8 +3296,13 @@ fn short_message(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{
+        HostConfig, HostKind, PollConfig, SessionTemplatesConfig, WatchConfig, WatchMatchConfig,
+    };
+    use crate::git::RepoSnapshot;
     use crate::snapshot::{
-        HostSnapshot, MatchStatus, SessionSnapshot, SessionState, SnapshotStatus, TmuxSnapshot,
+        HostSnapshot, MatchStatus, OutputSnapshot, ProcessSnapshot, SessionSnapshot, SessionState,
+        SnapshotStatus, TmuxSnapshot,
     };
     use crate::tui::session_template::SessionTemplatePrefix;
 
@@ -3705,6 +3756,57 @@ mod tests {
     }
 
     #[test]
+    fn refresh_deadline_allows_configured_repo_collect_commands() {
+        let config = Config {
+            poll: PollConfig {
+                command_timeout: Duration::from_secs(2),
+                ..PollConfig::default()
+            },
+            tui: Default::default(),
+            session_templates: SessionTemplatesConfig::default(),
+            hosts: vec![HostConfig {
+                id: "local".to_string(),
+                kind: HostKind::Local,
+                tmux_socket: None,
+                session_roots: Vec::new(),
+                ssh: None,
+            }],
+            watches: vec![
+                WatchConfig {
+                    id: "one".to_string(),
+                    host: "local".to_string(),
+                    matcher: WatchMatchConfig {
+                        command: Some("node".to_string()),
+                        cwd: None,
+                        cwd_prefix: None,
+                        tmux: None,
+                    },
+                    repo: Some("/repo/one".to_string()),
+                    agent_hint: None,
+                },
+                WatchConfig {
+                    id: "two".to_string(),
+                    host: "local".to_string(),
+                    matcher: WatchMatchConfig {
+                        command: Some("bash".to_string()),
+                        cwd: None,
+                        cwd_prefix: None,
+                        tmux: None,
+                    },
+                    repo: Some("/repo/two".to_string()),
+                    agent_hint: None,
+                },
+            ],
+            sessions: Vec::new(),
+        };
+
+        assert_eq!(
+            refresh_deadline(&config, &["local".to_string()]),
+            Duration::from_secs(12)
+        );
+    }
+
+    #[test]
     fn stale_refresh_messages_are_ignored_after_new_refresh_starts() {
         let mut app = App::new(
             String::new(),
@@ -3729,6 +3831,50 @@ mod tests {
         assert_eq!(
             app.selected_row().and_then(|row| row.raw_target.as_deref()),
             Some("local/new:0.0")
+        );
+    }
+
+    #[test]
+    fn context_rail_preserves_action_hint_at_normal_terminal_height() {
+        let mut row = row_at("local", "work", "0", "0", "pane");
+        row.process = Some(ProcessSnapshot {
+            pid: Some(42),
+            command: "node".to_string(),
+            cwd: "/repo".to_string(),
+        });
+        row.repo = Some(RepoSnapshot {
+            path: "/repo".to_string(),
+            branch: Some("main".to_string()),
+            dirty_count: Some(4),
+            changed_files: vec![
+                " M src/one.rs".to_string(),
+                " M src/two.rs".to_string(),
+                " M src/three.rs".to_string(),
+                " M src/four.rs".to_string(),
+            ],
+            error: None,
+        });
+        row.output = Some(OutputSnapshot {
+            preview: "line 12".to_string(),
+            recent: (1..=12)
+                .map(|line| format!("line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            hash: "abc".to_string(),
+            last_output_at: Some(Utc::now()),
+        });
+        let app = app_with_rows(vec![row]);
+        let selected = app.selected_row().expect("selected pane");
+
+        let lines = context_rail_lines(&app, selected, 22);
+        let rendered: Vec<String> = lines.into_iter().map(line_text).collect();
+
+        assert!(rendered.len() <= 22);
+        assert!(
+            rendered
+                .last()
+                .is_some_and(|line| line.contains("[i] refresh")),
+            "expected action hint to remain visible: {rendered:?}"
         );
     }
 
@@ -3824,8 +3970,6 @@ mod tests {
 
         assert!(line_text(input_prompt_line(&prompt)).contains("local/_work"));
     }
-
-    use crate::snapshot::ProcessSnapshot;
 
     fn row_with_meta(
         cmd: &str,
