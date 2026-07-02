@@ -15,6 +15,11 @@ if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
 fi
 
 current=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+latest_tag=$(git tag --list 'v*' --sort=-v:refname | head -1)
+latest_tag=${latest_tag#v}
+if [[ -n "$latest_tag" ]] && [[ "$(printf '%s\n%s' "$current" "$latest_tag" | sort -V | tail -1)" == "$latest_tag" ]]; then
+    current="$latest_tag"
+fi
 IFS='.' read -r major minor patch <<< "$current"
 
 case "${1:-}" in
@@ -38,7 +43,7 @@ if git rev-parse "$tag" >/dev/null 2>&1; then
     exit 1
 fi
 
-sed -i.bak "0,/^version = \"${current}\"/s//version = \"${next}\"/" Cargo.toml
+sed -i.bak "0,/^version = \"[0-9.]*\"/s//version = \"${next}\"/" Cargo.toml
 rm -f Cargo.toml.bak
 cargo update --locked -p remux --precise "$next" 2>/dev/null || cargo update -p remux --precise "$next"
 
