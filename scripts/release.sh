@@ -8,7 +8,7 @@ set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
 
-if [[ -n "$(git status --porcelain)" ]]; then
+if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
     echo "error: working tree not clean" >&2
     git status --short >&2
     exit 1
