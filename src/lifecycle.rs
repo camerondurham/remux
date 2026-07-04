@@ -1,6 +1,7 @@
 use crate::config::{Config, HostKind};
 use crate::exit::ExitFailure;
 use crate::host;
+use crate::launch_template::{LaunchTemplatePreset, launch_session_name, launch_template_preset};
 use crate::snapshot::{self, MatchStatus};
 use crate::tmux::{self, PaneTarget};
 use anyhow::{Context, Result};
@@ -19,6 +20,14 @@ enum SendTarget {
 struct SessionTarget {
     host: String,
     session: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct LaunchTemplateStartOptions<'a> {
+    pub cwd: Option<&'a str>,
+    pub window_name: Option<&'a str>,
+    pub send_startup_keys: bool,
+    pub verbose: bool,
 }
 
 pub fn new_session(
@@ -70,6 +79,53 @@ pub fn send_keys(
     let target = resolve_send_target(config, target)?;
     let (host_id, command) = target.command(config, keys, enter)?;
     run_lifecycle_command(config, host_id, &command, verbose)
+}
+
+pub fn start_launch_template(
+    config: &Config,
+    host_id: &str,
+    preset_id: &str,
+    session_name_suffix: &str,
+    options: LaunchTemplateStartOptions<'_>,
+) -> Result<String> {
+    let preset = launch_template_preset(config, preset_id)?;
+    start_launch_template_preset(config, host_id, &preset, session_name_suffix, options)
+}
+
+pub fn start_launch_template_preset(
+    config: &Config,
+    host_id: &str,
+    preset: &LaunchTemplatePreset,
+    session_name_suffix: &str,
+    options: LaunchTemplateStartOptions<'_>,
+) -> Result<String> {
+    let session_name = launch_session_name(preset, session_name_suffix)?;
+    let window_name = options.window_name.or(preset.window_name.as_deref());
+    new_session(
+        config,
+        host_id,
+        &session_name,
+        options.cwd,
+        window_name,
+        options.verbose,
+    )?;
+    if options.send_startup_keys {
+        send_keys_to_session(
+            config,
+            host_id,
+            &session_name,
+            &preset.command,
+            true,
+            options.verbose,
+        )
+        .with_context(|| {
+            format!(
+                "failed to send launch template `{}` startup keys to `{host_id}/{session_name}`",
+                preset.id
+            )
+        })?;
+    }
+    Ok(session_name)
 }
 
 pub fn rename_session(
@@ -131,6 +187,19 @@ pub fn new_pane(config: &Config, host_id: &str, session: &str, verbose: bool) ->
         verbose,
     )
     .with_context(|| format!("failed to spawn pane in `{host_id}/{session}`"))
+}
+
+fn send_keys_to_session(
+    config: &Config,
+    host_id: &str,
+    session: &str,
+    keys: &str,
+    enter: bool,
+    verbose: bool,
+) -> Result<()> {
+    let host = config.host(host_id)?;
+    let command = tmux::send_keys_command(session, keys, enter, host.tmux_socket());
+    run_lifecycle_command(config, host_id, &command, verbose)
 }
 
 fn resolve_kill_target(config: &Config, target: &str) -> Result<KillTarget> {

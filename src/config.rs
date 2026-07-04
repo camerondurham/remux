@@ -12,7 +12,7 @@ pub struct Config {
     #[serde(default)]
     pub tui: TuiConfig,
     #[serde(default)]
-    pub session_templates: SessionTemplatesConfig,
+    pub launch_templates: LaunchTemplatesConfig,
     #[serde(default)]
     pub hosts: Vec<HostConfig>,
     #[serde(default)]
@@ -95,16 +95,19 @@ pub struct PollConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
-pub struct SessionTemplatesConfig {
+pub struct LaunchTemplatesConfig {
     #[serde(default)]
-    pub presets: Vec<SessionTemplatePresetConfig>,
+    pub presets: Vec<LaunchTemplatePresetConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct SessionTemplatePresetConfig {
+pub struct LaunchTemplatePresetConfig {
     pub id: String,
     pub label: String,
-    pub prefix: String,
+    pub session_prefix: String,
+    pub command: String,
+    #[serde(default)]
+    pub window_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -295,7 +298,7 @@ impl Config {
         {
             bail!("poll.auto_refresh_interval must be 0s (disabled) or at least 1s");
         }
-        validate_session_templates(&self.session_templates)?;
+        validate_launch_templates(&self.launch_templates)?;
 
         let mut host_ids = HashSet::new();
         for host in &self.hosts {
@@ -510,30 +513,40 @@ fn default_auto_refresh_interval() -> Duration {
     Duration::from_secs(15)
 }
 
-pub const BUILTIN_SESSION_TEMPLATE_IDS: &[&str] = &["date", "work", "fix", "spike"];
+pub const BUILTIN_LAUNCH_TEMPLATE_IDS: &[&str] = &["pi"];
 
-fn validate_session_templates(config: &SessionTemplatesConfig) -> Result<()> {
+fn validate_launch_templates(config: &LaunchTemplatesConfig) -> Result<()> {
     let mut ids = HashSet::new();
     for preset in &config.presets {
         let id = preset.id.trim();
         if id.is_empty() {
-            bail!("session template preset id must not be empty");
+            bail!("launch template preset id must not be empty");
         }
-        if BUILTIN_SESSION_TEMPLATE_IDS.contains(&id) {
-            bail!("session template preset `{id}` conflicts with a built-in preset");
+        if BUILTIN_LAUNCH_TEMPLATE_IDS.contains(&id) {
+            bail!("launch template preset `{id}` conflicts with a built-in preset");
         }
         if !ids.insert(id) {
-            bail!("duplicate session template preset id `{id}`");
+            bail!("duplicate launch template preset id `{id}`");
         }
         if preset.label.trim().is_empty() {
-            bail!("session template preset `{id}` label must not be empty");
+            bail!("launch template preset `{id}` label must not be empty");
         }
-        let prefix = preset.prefix.trim();
+        let prefix = preset.session_prefix.trim();
         if prefix.is_empty() {
-            bail!("session template preset `{id}` prefix must not be empty");
+            bail!("launch template preset `{id}` session_prefix must not be empty");
         }
         if prefix.contains('/') || prefix.contains(':') {
-            bail!("session template preset `{id}` prefix must not contain `/` or `:`");
+            bail!("launch template preset `{id}` session_prefix must not contain `/` or `:`");
+        }
+        if preset.command.trim().is_empty() {
+            bail!("launch template preset `{id}` command must not be empty");
+        }
+        if preset
+            .window_name
+            .as_ref()
+            .is_some_and(|window_name| window_name.trim().is_empty())
+        {
+            bail!("launch template preset `{id}` window_name must not be empty");
         }
     }
     Ok(())
@@ -654,11 +667,13 @@ hosts:
       - ~/code
     ssh:
       target: cam@192.168.0.197
-session_templates:
+launch_templates:
   presets:
-    - id: client
-      label: Client Work
-      prefix: client
+    - id: agent
+      label: Coding Agent
+      session_prefix: agent
+      command: pi
+      window_name: agent
 sessions:
   - id: agent
     host: pi
@@ -697,8 +712,13 @@ watches:
             config.host("pi").unwrap().ssh().unwrap().target().unwrap(),
             "cam@192.168.0.197"
         );
-        assert_eq!(config.session_templates.presets.len(), 1);
-        assert_eq!(config.session_templates.presets[0].prefix, "client");
+        assert_eq!(config.launch_templates.presets.len(), 1);
+        assert_eq!(config.launch_templates.presets[0].session_prefix, "agent");
+        assert_eq!(config.launch_templates.presets[0].command, "pi");
+        assert_eq!(
+            config.launch_templates.presets[0].window_name.as_deref(),
+            Some("agent")
+        );
         assert_eq!(
             config.watch("agent").unwrap().watch.agent_hint.as_deref(),
             Some("codex")
@@ -760,17 +780,19 @@ hosts:
     }
 
     #[test]
-    fn rejects_duplicate_session_template_presets() {
+    fn rejects_duplicate_launch_template_presets() {
         let config: Config = yaml_serde::from_str(
             r#"
-session_templates:
+launch_templates:
   presets:
-    - id: client
-      label: Client
-      prefix: client
-    - id: client
-      label: Other Client
-      prefix: other
+    - id: agent
+      label: Agent
+      session_prefix: agent
+      command: pi
+    - id: agent
+      label: Other Agent
+      session_prefix: other
+      command: codex
 "#,
         )
         .unwrap();
@@ -780,19 +802,20 @@ session_templates:
                 .validate()
                 .unwrap_err()
                 .to_string()
-                .contains("duplicate session template preset id `client`")
+                .contains("duplicate launch template preset id `agent`")
         );
     }
 
     #[test]
-    fn rejects_session_template_presets_conflicting_with_builtins() {
+    fn rejects_launch_template_presets_conflicting_with_builtins() {
         let config: Config = yaml_serde::from_str(
             r#"
-session_templates:
+launch_templates:
   presets:
-    - id: date
-      label: Date
-      prefix: custom-date
+    - id: pi
+      label: Custom Pi
+      session_prefix: custom-pi
+      command: custom-pi
 "#,
         )
         .unwrap();
@@ -807,14 +830,15 @@ session_templates:
     }
 
     #[test]
-    fn rejects_empty_session_template_preset_fields() {
+    fn rejects_empty_launch_template_preset_fields() {
         let config: Config = yaml_serde::from_str(
             r#"
-session_templates:
+launch_templates:
   presets:
-    - id: client
-      label: " "
-      prefix: client
+    - id: agent
+      label: Agent
+      session_prefix: agent
+      command: " "
 "#,
         )
         .unwrap();
@@ -824,19 +848,20 @@ session_templates:
                 .validate()
                 .unwrap_err()
                 .to_string()
-                .contains("label must not be empty")
+                .contains("command must not be empty")
         );
     }
 
     #[test]
-    fn rejects_invalid_session_template_prefix_chars() {
+    fn rejects_invalid_launch_template_prefix_chars() {
         let config: Config = yaml_serde::from_str(
             r#"
-session_templates:
+launch_templates:
   presets:
-    - id: client
-      label: Client
-      prefix: client/work
+    - id: agent
+      label: Agent
+      session_prefix: agent/work
+      command: pi
 "#,
         )
         .unwrap();
@@ -846,7 +871,7 @@ session_templates:
                 .validate()
                 .unwrap_err()
                 .to_string()
-                .contains("prefix must not contain `/` or `:`")
+                .contains("session_prefix must not contain `/` or `:`")
         );
     }
 

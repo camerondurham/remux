@@ -132,6 +132,14 @@ watches:
       cwd_prefix: /home/cam/openclaw
     repo: /home/cam/openclaw
     agent_hint: codex
+
+launch_templates:
+  presets:
+    - id: coding
+      label: Coding Agent
+      session_prefix: coding
+      command: pi
+      window_name: agent
 ```
 
 ### Use it
@@ -169,6 +177,7 @@ remux capture 'pi/work:0.1'
 remux attach --readonly 'pi/work:0.1'
 remux attach 'pi/work:0.1'
 remux send-keys 'pi/work:0.1' 'cargo test'
+remux start pi pi implement-auth --cwd /home/cam/work/app
 ```
 
 ## Core capabilities
@@ -199,6 +208,7 @@ remux send-keys <watch-id-or-pane-target> <keys> [--no-enter]
 remux pick [--host HOST] [--filter TEXT] [--sessions] [--color] [--no-fzf]
 remux tui [--host HOST] [--filter TEXT]
 remux new <host> <session-name> [--cwd PATH] [--window-name NAME]
+remux start <host> <preset-id> <name> [--cwd PATH] [--window-name NAME] [--no-send]
 remux kill <watch-id-or-pane-target> [--yes]
 ```
 
@@ -233,21 +243,22 @@ remux a [--readonly] <watch-id-or-pane-target>
 - `session_roots` gives the TUI a bounded fzf directory list for new sessions
 - watches give important panes stable IDs
 - match fields are exact and combined with AND semantics
-- `session_templates.presets` adds custom TUI prefixes for templated session creation
+- `launch_templates.presets` adds custom launch presets for `remux start` and the TUI `[t]` flow
 - default config path is `~/.config/remux/config.yaml`
 - legacy `sessions` entries are still accepted as exact tmux-coordinate watches
 
-Example session template presets:
+The built-in launch preset `pi` creates a `pi-*` session, names the first window
+`agent`, and sends `pi` with Enter. Custom launch presets can add other startup
+commands:
 
 ```yaml
-session_templates:
+launch_templates:
   presets:
-    - id: client
-      label: Client Work
-      prefix: client
-    - id: ops
-      label: Operations
-      prefix: ops
+    - id: coding
+      label: Coding Agent
+      session_prefix: coding
+      command: pi
+      window_name: agent
 ```
 
 ## TUI keys
@@ -255,7 +266,7 @@ session_templates:
 Main keys:
 
 ```text
-[↑↓ PgUp/PgDn] move  [gg/G] ends  [Enter] attach ro  [a] jump rw  [s/S] sort  [t] template  [z] send keys  [i] refresh  [/] filter  [d] details  [?] help  [x] kill  [q] quit
+[↑↓ PgUp/PgDn] move  [gg/G] ends  [Enter] attach ro  [a] jump rw  [s/S] sort  [t] start template  [z] send keys  [i] refresh  [/] filter  [d] details  [?] help  [x] kill  [q] quit
 ```
 
 More keys available in the help overlay (`?`):
@@ -274,7 +285,7 @@ More keys available in the help overlay (`?`):
 | `c` | Capture selected pane output into the detail view |
 | `e` | Rename the selected session |
 | `n` | Create a new tmux session on a host (`<host>/<session>`, then optional cwd) |
-| `t` | Create a new tmux session from a host and prefix template, then optional cwd |
+| `t` | Create a new tmux session from a launch template, then send startup keys |
 | `p` | Spawn a new pane in an existing session |
 | `z` | Send keys to the selected pane |
 | `d` | Toggle the detail pane |
