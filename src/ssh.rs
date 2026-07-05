@@ -73,7 +73,16 @@ fn base_command(host: &HostConfig, default_timeout: Duration, tty: bool) -> Resu
     if let Some(config_file) = &ssh.config_file {
         command.arg("-F").arg(config_file);
     }
-    for (key, value) in ssh.ssh_options(default_timeout) {
+    let mut options = ssh.ssh_options(default_timeout);
+    if tty {
+        // A long-lived interactive attach should not reuse a stale multiplexed
+        // master connection after sleep/wake. Polling may still opt into muxing
+        // for speed, and explicit remux ssh.options can override this default.
+        options
+            .entry("ControlMaster".to_string())
+            .or_insert_with(|| "no".to_string());
+    }
+    for (key, value) in options {
         command.arg("-o").arg(format!("{key}={value}"));
     }
     if let Some(port) = ssh.port {
@@ -134,11 +143,55 @@ fn shell_single_quote(input: &str) -> String {
 mod tests {
     use crate::config::{HostConfig, HostKind, SshConfig};
     use std::collections::BTreeMap;
+    use std::process::Command;
     use std::time::Duration;
 
     #[test]
     fn ssh_options_default_to_non_interactive_timeout() {
-        let host = HostConfig {
+        let host = ssh_host(BTreeMap::new());
+
+        let options = host.ssh.unwrap().ssh_options(Duration::from_secs(5));
+        assert_eq!(options.get("BatchMode").unwrap(), "yes");
+        assert_eq!(options.get("ConnectTimeout").unwrap(), "5");
+        assert_eq!(options.get("ServerAliveInterval").unwrap(), "3");
+        assert_eq!(options.get("ServerAliveCountMax").unwrap(), "2");
+    }
+
+    #[test]
+    fn interactive_ssh_disables_control_master_by_default() {
+        let host = ssh_host(BTreeMap::new());
+
+        let command = super::base_command(&host, Duration::from_secs(5), true).unwrap();
+        let args = command_args(&command);
+
+        assert!(has_ssh_option(&args, "ControlMaster=no"));
+    }
+
+    #[test]
+    fn non_interactive_ssh_does_not_disable_control_master_by_default() {
+        let host = ssh_host(BTreeMap::new());
+
+        let command = super::base_command(&host, Duration::from_secs(5), false).unwrap();
+        let args = command_args(&command);
+
+        assert!(!args.iter().any(|arg| arg.starts_with("ControlMaster=")));
+    }
+
+    #[test]
+    fn explicit_control_master_option_overrides_interactive_default() {
+        let mut options = BTreeMap::new();
+        options.insert("ControlMaster".to_string(), "auto".to_string());
+        let host = ssh_host(options);
+
+        let command = super::base_command(&host, Duration::from_secs(5), true).unwrap();
+        let args = command_args(&command);
+
+        assert!(has_ssh_option(&args, "ControlMaster=auto"));
+        assert!(!has_ssh_option(&args, "ControlMaster=no"));
+    }
+
+    fn ssh_host(options: BTreeMap<String, String>) -> HostConfig {
+        HostConfig {
             id: "pi".to_string(),
             kind: HostKind::Ssh,
             tmux_socket: None,
@@ -149,15 +202,21 @@ mod tests {
                 user: None,
                 port: None,
                 config_file: None,
-                options: BTreeMap::new(),
+                options,
                 remote_shell: None,
             }),
-        };
+        }
+    }
 
-        let options = host.ssh.unwrap().ssh_options(Duration::from_secs(5));
-        assert_eq!(options.get("BatchMode").unwrap(), "yes");
-        assert_eq!(options.get("ConnectTimeout").unwrap(), "5");
-        assert_eq!(options.get("ServerAliveInterval").unwrap(), "3");
-        assert_eq!(options.get("ServerAliveCountMax").unwrap(), "2");
+    fn command_args(command: &Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn has_ssh_option(args: &[String], expected: &str) -> bool {
+        args.windows(2)
+            .any(|window| window[0] == "-o" && window[1] == expected)
     }
 }
