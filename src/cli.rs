@@ -6,7 +6,7 @@ use std::path::PathBuf;
     name = "remux",
     version,
     about = "Inspect tmux panes across local and SSH hosts",
-    after_help = "Run `remux` with no arguments to launch the TUI. Use `remux tui` when passing TUI options.\n\nExamples:\n  remux onboard --write\n  remux doctor\n  remux list --group sessions\n  remux inspect 'pi/work:0.1'\n  remux attach --readonly 'pi/work:0.1'\n  remux tui --host pi --filter codex"
+    after_help = "Run `remux` with no arguments to launch the TUI. Use `remux tui` when passing TUI options.\n\nExamples:\n  remux onboard --write\n  remux doctor\n  remux list --group sessions\n  remux inspect 'pi/work:0.1'\n  remux attach --readonly 'pi/work:0.1'\n  remux start pi pi implement-auth --cwd /home/cam/work/app\n  remux tui --host pi --filter codex"
 )]
 pub struct Cli {
     /// Path to a config file.
@@ -157,6 +157,27 @@ pub enum Command {
         /// Initial tmux window name.
         #[arg(long)]
         window_name: Option<String>,
+    },
+    /// Create a tmux session from a launch template and send startup keys.
+    #[command(
+        after_help = "Examples:\n  remux start pi pi implement-auth --cwd /home/cam/work/app\n  remux start local agent fix-tests --window-name codex\n  remux start pi pi spike --no-send"
+    )]
+    Start {
+        /// Configured host id.
+        host: String,
+        /// Launch template preset id.
+        preset: String,
+        /// Session name suffix appended to the preset prefix.
+        name: String,
+        /// Initial working directory for the session.
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Initial tmux window name, overriding the preset default.
+        #[arg(long)]
+        window_name: Option<String>,
+        /// Create the session without sending the preset startup command.
+        #[arg(long)]
+        no_send: bool,
     },
     /// Kill a tmux session or pane.
     Kill {

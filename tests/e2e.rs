@@ -256,6 +256,67 @@ fn send_keys_submits_text_with_symbolic_enter() {
 }
 
 #[test]
+fn lifecycle_start_launch_template_creates_session_and_sends_startup_keys() {
+    let env = TestEnv::new();
+    env.write_config(
+        r#"
+poll:
+  capture_lines: 2
+hosts:
+  - id: pi
+    type: ssh
+    ssh:
+      target: fake-pi
+launch_templates:
+  presets:
+    - id: coding
+      label: Coding Agent
+      session_prefix: coding
+      command: pi --resume spec
+      window_name: agent
+"#,
+    );
+
+    let start = env.remux([
+        "--config",
+        env.config_path(),
+        "start",
+        "pi",
+        "coding",
+        "implement-auth",
+        "--cwd",
+        "/home/cam/work/app",
+    ]);
+    assert_success(&start);
+
+    let no_send = env.remux([
+        "--config",
+        env.config_path(),
+        "start",
+        "pi",
+        "coding",
+        "dry-run",
+        "--cwd",
+        "/tmp/dry-run",
+        "--window-name",
+        "main",
+        "--no-send",
+    ]);
+    assert_success(&no_send);
+
+    let missing = env.remux([
+        "--config",
+        env.config_path(),
+        "start",
+        "pi",
+        "missing",
+        "task",
+    ]);
+    assert_failure(&missing);
+    assert!(stderr(&missing).contains("unknown launch template `missing`"));
+}
+
+#[test]
 fn session_grouped_list_warns_about_unreachable_hosts() {
     let env = TestEnv::new();
     env.write_config(
@@ -1076,6 +1137,18 @@ if [[ "$remote" == "tmux attach-session -t 'work' \\; select-window -t '0' \\; s
 fi
 
 if [[ "$remote" == "tmux new-session -d -s 'new-work' -c '/tmp/new-work' -n 'main'" ]]; then
+  exit 0
+fi
+
+if [[ "$remote" == "tmux new-session -d -s 'coding-implement-auth' -c '/home/cam/work/app' -n 'agent'" ]]; then
+  exit 0
+fi
+
+if [[ "$remote" == "tmux send-keys -t 'coding-implement-auth' -l 'pi --resume spec' && sleep 0.05 && tmux send-keys -t 'coding-implement-auth' Enter" ]]; then
+  exit 0
+fi
+
+if [[ "$remote" == "tmux new-session -d -s 'coding-dry-run' -c '/tmp/dry-run' -n 'main'" ]]; then
   exit 0
 fi
 

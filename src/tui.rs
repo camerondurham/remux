@@ -1,6 +1,9 @@
 use crate::attach;
 use crate::config::{Config, TuiSortDirection, TuiSortField};
 use crate::dir_picker;
+use crate::launch_template::{
+    LaunchTemplatePreset, launch_session_name, launch_template_label, launch_template_presets,
+};
 use crate::lifecycle;
 use crate::snapshot::{
     self, HostSnapshot, MatchStatus, PaneDetail, SessionSnapshot, SessionState, SnapshotError,
@@ -28,13 +31,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod line_editor;
-mod session_template;
-
 use line_editor::LineEditor;
-use session_template::{
-    SessionTemplatePreset, session_template_presets, template_prefix_preview,
-    template_preset_label, templated_session_name,
-};
 
 pub fn run(config: &Config, host: Option<String>, filter: Option<String>) -> Result<()> {
     if let Some(host_id) = &host {
@@ -177,23 +174,36 @@ enum TemplatePromptStep {
     },
     Preset {
         host: String,
-        presets: Vec<SessionTemplatePreset>,
+        presets: Vec<LaunchTemplatePreset>,
         selected: usize,
     },
     Name {
         host: String,
-        preset: SessionTemplatePreset,
+        preset: LaunchTemplatePreset,
         value: LineEditor,
     },
 }
 
 #[derive(Clone)]
 enum InputPromptKind {
-    RenameSession { host: String, current: String },
+    RenameSession {
+        host: String,
+        current: String,
+    },
     NewSession,
-    NewSessionCwd { host: String, session: String },
+    NewSessionCwd {
+        host: String,
+        session: String,
+    },
+    LaunchTemplateCwd {
+        host: String,
+        preset: LaunchTemplatePreset,
+        suffix: String,
+    },
     NewPane,
-    SendKeys { target: String },
+    SendKeys {
+        target: String,
+    },
 }
 
 #[derive(Clone)]
@@ -1195,7 +1205,7 @@ fn begin_template_prompt(scoped_host: Option<&str>, app: &mut App) {
             value: LineEditor::new(host),
         },
     });
-    app.status = "new templated session: enter host".to_string();
+    app.status = "start from template: enter host".to_string();
 }
 
 fn begin_send_keys_prompt(config: &Config, app: &mut App) {
@@ -1273,7 +1283,7 @@ fn handle_template_prompt_key(
             KeyCode::Enter => {
                 let host_id = value.as_str().trim().to_string();
                 if host_id.is_empty() {
-                    app.status = "template session expects a host".to_string();
+                    app.status = "launch template expects a host".to_string();
                     app.template_prompt = Some(TemplatePrompt {
                         step: TemplatePromptStep::Host { value },
                     });
@@ -1300,11 +1310,11 @@ fn handle_template_prompt_key(
                 app.template_prompt = Some(TemplatePrompt {
                     step: TemplatePromptStep::Preset {
                         host: host_id.clone(),
-                        presets: session_template_presets(config),
+                        presets: launch_template_presets(config),
                         selected: 0,
                     },
                 });
-                app.status = format!("new templated session on {host_id}: choose prefix");
+                app.status = format!("start from template on {host_id}: choose preset");
             }
             _ => {
                 value.apply_key(key);
@@ -1345,7 +1355,7 @@ fn handle_template_prompt_key(
             }
             KeyCode::Enter => {
                 let Some(preset) = presets.get(selected).cloned() else {
-                    app.status = "no session templates configured".to_string();
+                    app.status = "no launch templates configured".to_string();
                     return Ok(());
                 };
                 app.template_prompt = Some(TemplatePrompt {
@@ -1355,7 +1365,7 @@ fn handle_template_prompt_key(
                         value: LineEditor::default(),
                     },
                 });
-                app.status = format!("new templated session on {host}: enter name");
+                app.status = format!("start {} on {host}: enter session name", preset.id);
             }
             _ => {
                 app.template_prompt = Some(TemplatePrompt {
@@ -1376,27 +1386,20 @@ fn handle_template_prompt_key(
                 app.status = "action cancelled".to_string();
             }
             KeyCode::Enter => {
-                let session_name = match templated_session_name(&preset, value.as_str().trim()) {
-                    Ok(session_name) => session_name,
-                    Err(err) => {
-                        app.status = format!("{err:#}");
-                        app.template_prompt = Some(TemplatePrompt {
-                            step: TemplatePromptStep::Name {
-                                host,
-                                preset,
-                                value,
-                            },
-                        });
-                        return Ok(());
-                    }
-                };
-                create_session_after_directory_selection(
-                    config,
-                    &host,
-                    &session_name,
-                    tx,
-                    app,
-                    terminal,
+                let suffix = value.as_str().trim().to_string();
+                if let Err(err) = launch_session_name(&preset, &suffix) {
+                    app.status = format!("{err:#}");
+                    app.template_prompt = Some(TemplatePrompt {
+                        step: TemplatePromptStep::Name {
+                            host,
+                            preset,
+                            value,
+                        },
+                    });
+                    return Ok(());
+                }
+                start_template_after_directory_selection(
+                    config, &host, preset, suffix, tx, app, terminal,
                 )?;
             }
             _ => {
@@ -1410,6 +1413,92 @@ fn handle_template_prompt_key(
                 });
             }
         },
+    }
+    Ok(())
+}
+
+fn start_template_after_directory_selection(
+    config: &Config,
+    host_id: &str,
+    preset: LaunchTemplatePreset,
+    suffix: String,
+    tx: mpsc::Sender<RefreshMessage>,
+    app: &mut App,
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+) -> Result<()> {
+    let selection = suspend_terminal(terminal, || dir_picker::pick_directory(config, host_id));
+    match selection {
+        Ok(Some(cwd)) => start_template_session(
+            config,
+            host_id,
+            preset,
+            &suffix,
+            Some(cwd.as_str()),
+            tx,
+            app,
+        ),
+        Ok(None) => {
+            begin_launch_cwd_prompt(app, host_id, preset, suffix, "directory picker cancelled");
+            Ok(())
+        }
+        Err(err) => {
+            begin_launch_cwd_prompt(
+                app,
+                host_id,
+                preset,
+                suffix,
+                &format!("directory picker unavailable: {err:#}"),
+            );
+            Ok(())
+        }
+    }
+}
+
+fn begin_launch_cwd_prompt(
+    app: &mut App,
+    host_id: &str,
+    preset: LaunchTemplatePreset,
+    suffix: String,
+    reason: &str,
+) {
+    app.input_prompt = Some(InputPrompt {
+        kind: InputPromptKind::LaunchTemplateCwd {
+            host: host_id.to_string(),
+            preset,
+            suffix,
+        },
+        value: LineEditor::default(),
+    });
+    app.status = format!("{reason}; type cwd or press Enter for default");
+}
+
+fn start_template_session(
+    config: &Config,
+    host_id: &str,
+    preset: LaunchTemplatePreset,
+    suffix: &str,
+    cwd: Option<&str>,
+    tx: mpsc::Sender<RefreshMessage>,
+    app: &mut App,
+) -> Result<()> {
+    match lifecycle::start_launch_template_preset(
+        config,
+        host_id,
+        &preset,
+        suffix,
+        lifecycle::LaunchTemplateStartOptions {
+            cwd,
+            window_name: None,
+            send_startup_keys: true,
+            verbose: false,
+        },
+    ) {
+        Ok(session_name) => {
+            app.pending_selection = Some(SelectionPreference::new_session(host_id, &session_name));
+            app.status = format!("started {host_id}/{session_name} with {}", preset.id);
+            spawn_refresh(config, Some(host_id.to_string()), tx, app)?;
+        }
+        Err(err) => app.status = format!("{err:#}"),
     }
     Ok(())
 }
@@ -1474,6 +1563,15 @@ fn execute_input_prompt(
             let cwd = prompt.value.as_str().trim();
             let cwd = if cwd.is_empty() { None } else { Some(cwd) };
             create_session(config, &host, &session, cwd, tx, app)?;
+        }
+        InputPromptKind::LaunchTemplateCwd {
+            host,
+            preset,
+            suffix,
+        } => {
+            let cwd = prompt.value.as_str().trim();
+            let cwd = if cwd.is_empty() { None } else { Some(cwd) };
+            start_template_session(config, &host, preset, &suffix, cwd, tx, app)?;
         }
         InputPromptKind::NewPane => {
             let Some((host_id, session_name)) = parse_host_session(prompt.value.as_str().trim())
@@ -2263,7 +2361,7 @@ fn help_lines(width: u16) -> Vec<Line<'static>> {
         "[x] kill selected pane",
         "[e] rename session",
         "[n] create session",
-        "[t] create from template",
+        "[t] start from template",
         "[p] spawn pane",
         "[z] send keys",
         "[d] toggle detail pane",
@@ -2289,7 +2387,7 @@ fn status_hint(width: u16) -> &'static str {
     if width < 110 {
         "[↑↓] move  [Enter/a] attach  [i] inspect  [/] filter  [?] help  [q] quit   "
     } else {
-        "[↑↓ PgUp/PgDn] move  [gg/G] ends  [Enter/a] attach  [s/S] sort  [t] template  [z] send  [i] inspect  [/] filter  [d] details  [?] help  [q] quit   "
+        "[↑↓ PgUp/PgDn] move  [gg/G] ends  [Enter/a] attach  [s/S] sort  [t] start  [z] send  [i] inspect  [/] filter  [d] details  [?] help  [q] quit   "
     }
 }
 
@@ -2325,7 +2423,7 @@ fn context_rail_lines(
         ))
     } else {
         Line::from(Span::styled(
-            "[i] refresh · [Enter] attach ro · [a] jump rw · [t] template · [z] send keys · [c] capture",
+            "[i] refresh · [Enter] attach ro · [a] jump rw · [t] start · [z] send keys · [c] capture",
             muted_style(),
         ))
     };
@@ -2496,6 +2594,17 @@ fn input_prompt_line(prompt: &InputPrompt) -> Line<'static> {
             format!("cwd for {host}/{session} "),
             "optional path; empty uses tmux default (Esc to cancel)",
         ),
+        InputPromptKind::LaunchTemplateCwd {
+            host,
+            preset,
+            suffix,
+        } => (
+            format!(
+                "cwd for {host}/{} ",
+                launch_session_name(preset, suffix).unwrap_or_else(|_| suffix.clone())
+            ),
+            "optional path; Enter starts template (Esc to cancel)",
+        ),
         InputPromptKind::NewPane => (
             "new pane ".to_string(),
             "enter <host>/<session> (Esc to cancel)",
@@ -2522,7 +2631,7 @@ fn template_prompt_line(prompt: &TemplatePrompt) -> Line<'static> {
         } => {
             let selected_preset = presets
                 .get(*selected)
-                .map(template_preset_label)
+                .map(launch_template_label)
                 .unwrap_or_else(|| "-".to_string());
             Line::from(vec![
                 Span::styled(
@@ -2542,9 +2651,9 @@ fn template_prompt_line(prompt: &TemplatePrompt) -> Line<'static> {
             preset,
             value,
         } => editable_prompt_line(
-            format!("template {host}/{}-", template_prefix_preview(preset)),
+            format!("template {host}/{}-", preset.session_prefix),
             value,
-            "Enter creates session (Esc to cancel)",
+            "Enter starts template (Esc to cancel)",
         ),
     }
 }
@@ -3297,14 +3406,13 @@ fn short_message(message: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::{
-        HostConfig, HostKind, PollConfig, SessionTemplatesConfig, WatchConfig, WatchMatchConfig,
+        HostConfig, HostKind, LaunchTemplatesConfig, PollConfig, WatchConfig, WatchMatchConfig,
     };
     use crate::git::RepoSnapshot;
     use crate::snapshot::{
         HostSnapshot, MatchStatus, OutputSnapshot, ProcessSnapshot, SessionSnapshot, SessionState,
         SnapshotStatus, TmuxSnapshot,
     };
-    use crate::tui::session_template::SessionTemplatePrefix;
 
     fn make_row(match_status: MatchStatus, state: SessionState) -> SessionSnapshot {
         SessionSnapshot {
@@ -3763,7 +3871,7 @@ mod tests {
                 ..PollConfig::default()
             },
             tui: Default::default(),
-            session_templates: SessionTemplatesConfig::default(),
+            launch_templates: LaunchTemplatesConfig::default(),
             hosts: vec![HostConfig {
                 id: "local".to_string(),
                 kind: HostKind::Local,
@@ -4080,90 +4188,6 @@ mod tests {
     }
 
     #[test]
-    fn built_in_session_template_presets_are_first() {
-        let config: Config = yaml_serde::from_str(
-            r#"
-session_templates:
-  presets:
-    - id: client
-      label: Client
-      prefix: client
-"#,
-        )
-        .unwrap();
-        let presets = session_template_presets(&config);
-        let ids: Vec<&str> = presets.iter().map(|preset| preset.id.as_str()).collect();
-        assert_eq!(ids, vec!["date", "work", "fix", "spike", "client"]);
-    }
-
-    #[test]
-    fn templated_session_name_uses_literal_prefix() {
-        let preset = SessionTemplatePreset {
-            id: "client".to_string(),
-            label: "Client".to_string(),
-            prefix: SessionTemplatePrefix::Literal("client".to_string()),
-        };
-
-        assert_eq!(
-            templated_session_name(&preset, "api").unwrap(),
-            "client-api"
-        );
-    }
-
-    #[test]
-    fn templated_session_name_uses_utc_date_prefix() {
-        let preset = SessionTemplatePreset {
-            id: "date".to_string(),
-            label: "Date".to_string(),
-            prefix: SessionTemplatePrefix::Date,
-        };
-        let expected = Utc::now().format("%Y-%m-%d").to_string();
-
-        assert_eq!(
-            templated_session_name(&preset, "investigate").unwrap(),
-            format!("{expected}-investigate")
-        );
-    }
-
-    #[test]
-    fn templated_session_name_rejects_empty_suffix() {
-        let preset = SessionTemplatePreset {
-            id: "fix".to_string(),
-            label: "Fix".to_string(),
-            prefix: SessionTemplatePrefix::Literal("fix".to_string()),
-        };
-
-        assert!(
-            templated_session_name(&preset, " ")
-                .unwrap_err()
-                .to_string()
-                .contains("expects a name")
-        );
-    }
-
-    #[test]
-    fn templated_session_name_rejects_target_separators() {
-        let preset = SessionTemplatePreset {
-            id: "fix".to_string(),
-            label: "Fix".to_string(),
-            prefix: SessionTemplatePrefix::Literal("fix".to_string()),
-        };
-
-        assert!(
-            templated_session_name(&preset, "api/work")
-                .unwrap_err()
-                .to_string()
-                .contains("must not contain")
-        );
-        assert!(
-            templated_session_name(&preset, "api:0")
-                .unwrap_err()
-                .to_string()
-                .contains("must not contain")
-        );
-    }
-
-    #[test]
     fn cwd_prompt_keeps_pending_session_context() {
         let mut app = App::new(
             String::new(),
@@ -4181,6 +4205,47 @@ session_templates:
             }
             _ => panic!("expected cwd prompt"),
         }
+        assert!(prompt.value.as_str().is_empty());
+        assert!(app.status.contains("type cwd or press Enter for default"));
+    }
+
+    #[test]
+    fn launch_cwd_prompt_keeps_pending_template_context() {
+        let mut app = App::new(
+            String::new(),
+            TuiSortField::Attention,
+            TuiSortDirection::Desc,
+        );
+        let preset = LaunchTemplatePreset {
+            id: "agent".to_string(),
+            label: "Agent".to_string(),
+            session_prefix: "agent".to_string(),
+            command: "pi".to_string(),
+            window_name: Some("agent".to_string()),
+        };
+
+        begin_launch_cwd_prompt(
+            &mut app,
+            "local",
+            preset,
+            "implement-auth".to_string(),
+            "fzf unavailable",
+        );
+
+        let prompt = app.input_prompt.as_ref().unwrap();
+        match &prompt.kind {
+            InputPromptKind::LaunchTemplateCwd {
+                host,
+                preset,
+                suffix,
+            } => {
+                assert_eq!(host, "local");
+                assert_eq!(preset.id, "agent");
+                assert_eq!(suffix, "implement-auth");
+            }
+            _ => panic!("expected launch cwd prompt"),
+        }
+        assert!(line_text(input_prompt_line(prompt)).contains("local/agent-implement-auth"));
         assert!(prompt.value.as_str().is_empty());
         assert!(app.status.contains("type cwd or press Enter for default"));
     }

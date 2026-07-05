@@ -9,6 +9,7 @@ mod exit;
 mod fzf;
 mod git;
 mod host;
+mod launch_template;
 mod lifecycle;
 mod local;
 mod onboard;
@@ -125,6 +126,28 @@ fn run_cli(cli: Cli, args_were_provided: bool) -> Result<()> {
             window_name.as_deref(),
             verbose,
         ),
+        Command::Start {
+            host,
+            preset,
+            name,
+            cwd,
+            window_name,
+            no_send,
+        } => {
+            lifecycle::start_launch_template(
+                &config,
+                &host,
+                &preset,
+                &name,
+                lifecycle::LaunchTemplateStartOptions {
+                    cwd: cwd.as_deref(),
+                    window_name: window_name.as_deref(),
+                    send_startup_keys: !no_send,
+                    verbose,
+                },
+            )?;
+            Ok(())
+        }
         Command::Kill { target, yes } => lifecycle::kill(&config, &target, yes, verbose),
         Command::SendKeys {
             target,

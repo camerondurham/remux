@@ -259,7 +259,7 @@ fn render_config(hosts: &[String]) -> String {
     }
 
     out.push_str(
-        "\n# Optional: add custom prefixes for TUI templated session creation.\n# session_templates:\n#   presets:\n#     - id: client\n#       label: Client Work\n#       prefix: client\n\n# Optional: give important panes stable IDs you can inspect/attach quickly.\n# watches:\n#   - id: prod-api\n#     host: prod\n#     match:\n#       command: node\n#       cwd_prefix: /srv/api\n#     repo: /srv/api\n#     agent_hint: codex\n",
+        "\n# Optional: add launch presets for `remux start` and the TUI [t] flow.\n# The built-in `pi` preset starts a `pi-*` session and sends `pi`.\n# launch_templates:\n#   presets:\n#     - id: coding\n#       label: Coding Agent\n#       session_prefix: coding\n#       command: pi\n#       window_name: agent\n\n# Optional: give important panes stable IDs you can inspect/attach quickly.\n# watches:\n#   - id: prod-api\n#     host: prod\n#     match:\n#       command: node\n#       cwd_prefix: /srv/api\n#     repo: /srv/api\n#     agent_hint: codex\n",
     );
 
     out

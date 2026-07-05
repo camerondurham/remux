@@ -40,5 +40,5 @@ validate-fixtures:
 ci: fetch fmt-check lint test release help validate-fixtures
 
 # bump version (patch|minor|major|X.Y.Z), commit, tag; push manually after
-release bump:
+release-bump bump:
     scripts/release.sh {{bump}}

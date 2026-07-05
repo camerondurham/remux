@@ -88,7 +88,7 @@ fn run_fzf(rows: &[String]) -> Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{HostConfig, HostKind, PollConfig, SessionTemplatesConfig};
+    use crate::config::{HostConfig, HostKind, LaunchTemplatesConfig, PollConfig};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -115,7 +115,7 @@ mod tests {
         let config = Config {
             poll: PollConfig::default(),
             tui: Default::default(),
-            session_templates: SessionTemplatesConfig::default(),
+            launch_templates: LaunchTemplatesConfig::default(),
             hosts: vec![HostConfig {
                 id: "local".to_string(),
                 kind: HostKind::Local,

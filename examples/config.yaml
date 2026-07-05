@@ -38,14 +38,13 @@ hosts:
         BatchMode: "yes"
         ConnectTimeout: "5"
 
-session_templates:
+launch_templates:
   presets:
-    - id: client
-      label: Client Work
-      prefix: client
-    - id: ops
-      label: Operations
-      prefix: ops
+    - id: coding
+      label: Coding Agent
+      session_prefix: coding
+      command: pi
+      window_name: agent
 
 watches:
   - id: local-shell
