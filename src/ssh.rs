@@ -108,7 +108,7 @@ fn apply_interactive_options(
     if control_master
         .as_deref()
         .is_none_or(control_master_disables_muxing)
-        && !contains_option(options, "ControlPath")
+        && option_value(options, "ControlPath").is_none()
     {
         options.insert("ControlPath".to_string(), "none".to_string());
     }
@@ -119,23 +119,11 @@ fn control_master_disables_muxing(value: &str) -> bool {
     value.eq_ignore_ascii_case("no") || value.eq_ignore_ascii_case("false")
 }
 
-fn contains_option(options: &BTreeMap<String, String>, key: &str) -> bool {
-    option_value(options, key).is_some()
-}
-
 fn option_value<'a>(options: &'a BTreeMap<String, String>, key: &str) -> Option<&'a str> {
     options
         .iter()
         .find(|(option_key, _)| option_key.eq_ignore_ascii_case(key))
         .map(|(_, value)| value.as_str())
-}
-
-fn remove_option(options: &mut BTreeMap<String, String>, key: &str) -> Option<String> {
-    let existing = options
-        .keys()
-        .find(|option_key| option_key.eq_ignore_ascii_case(key))
-        .cloned()?;
-    options.remove(&existing)
 }
 
 fn disable_proxyjump_muxing(
@@ -144,7 +132,7 @@ fn disable_proxyjump_muxing(
     port: Option<u16>,
     target: &str,
 ) {
-    if contains_option(options, "ProxyCommand") {
+    if option_value(options, "ProxyCommand").is_some() {
         return;
     }
     let explicit_proxy_jump = option_value(options, "ProxyJump").map(str::to_string);
@@ -156,7 +144,13 @@ fn disable_proxyjump_muxing(
     let Some(proxy_command) = proxyjump_proxy_command(&proxy_jump, options, config_file) else {
         return;
     };
-    remove_option(options, "ProxyJump");
+    if let Some(key) = options
+        .keys()
+        .find(|key| key.eq_ignore_ascii_case("ProxyJump"))
+        .cloned()
+    {
+        options.remove(&key);
+    }
     options.insert("ProxyCommand".to_string(), proxy_command);
 }
 
@@ -179,9 +173,7 @@ fn proxyjump_proxy_command(
 
 #[derive(Debug, PartialEq, Eq)]
 struct ProxyJumpHop {
-    user: Option<String>,
-    host: String,
-    bracketed_host: bool,
+    destination: String,
     port: Option<u16>,
 }
 
@@ -190,55 +182,43 @@ fn parse_proxyjump_hop(raw: &str) -> Option<ProxyJumpHop> {
     if raw.is_empty() {
         return None;
     }
-    let (user, host_port) = raw
-        .rsplit_once('@')
-        .map(|(user, host_port)| (Some(user.to_string()), host_port))
-        .unwrap_or((None, raw));
+    let (user_prefix, host_port) = match raw.rsplit_once('@') {
+        Some((_, "")) => return None,
+        Some((user, host_port)) => (format!("{user}@"), host_port),
+        None => (String::new(), raw),
+    };
 
-    let (host, bracketed_host, port) = if let Some(rest) = host_port.strip_prefix('[') {
+    let (host, port) = if let Some(rest) = host_port.strip_prefix('[') {
         let close = rest.find(']')?;
-        let host = rest[..close].to_string();
+        let host = format!("[{}]", &rest[..close]);
         let suffix = &rest[close + 1..];
+        if !suffix.is_empty() && !suffix.starts_with(':') {
+            return None;
+        }
         let port = suffix
             .strip_prefix(':')
             .filter(|port| !port.is_empty())
             .map(str::parse)
             .transpose()
             .ok()?;
-        (host, true, port)
+        (host, port)
     } else if let Some((host, port)) = host_port.rsplit_once(':') {
         if host.contains(':') {
-            (host_port.to_string(), false, None)
+            (host_port.to_string(), None)
         } else {
-            (host.to_string(), false, Some(port.parse().ok()?))
+            (host.to_string(), Some(port.parse().ok()?))
         }
     } else {
-        (host_port.to_string(), false, None)
+        (host_port.to_string(), None)
     };
 
     if host.is_empty() {
         return None;
     }
     Some(ProxyJumpHop {
-        user,
-        host,
-        bracketed_host,
+        destination: format!("{user_prefix}{host}"),
         port,
     })
-}
-
-impl ProxyJumpHop {
-    fn destination(&self) -> String {
-        let host = if self.bracketed_host {
-            format!("[{}]", self.host)
-        } else {
-            self.host.clone()
-        };
-        match &self.user {
-            Some(user) => format!("{user}@{host}"),
-            None => host,
-        }
-    }
 }
 
 fn proxy_command_for_hop(
@@ -278,7 +258,7 @@ fn proxy_command_for_hop(
         parts.push("-p".to_string());
         parts.push(shell_single_quote(&port.to_string()));
     }
-    parts.push(shell_single_quote(&hop.destination()));
+    parts.push(shell_single_quote(&hop.destination));
     Some(parts.join(" "))
 }
 
@@ -313,17 +293,11 @@ fn resolved_proxy_jump_from_ssh_config(
     if !output.status.success() {
         return None;
     }
-    parse_ssh_g_proxy(&String::from_utf8_lossy(&output.stdout)).proxy_jump
+    parse_ssh_g_proxy(&String::from_utf8_lossy(&output.stdout))
 }
 
-#[derive(Default)]
-struct SshConfigProxy {
-    proxy_jump: Option<String>,
-    proxy_command: Option<String>,
-}
-
-fn parse_ssh_g_proxy(raw: &str) -> SshConfigProxy {
-    let mut proxy = SshConfigProxy::default();
+fn parse_ssh_g_proxy(raw: &str) -> Option<String> {
+    let mut proxy_jump = None;
     for line in raw.lines() {
         let Some((key, value)) = line.split_once(char::is_whitespace) else {
             continue;
@@ -333,15 +307,12 @@ fn parse_ssh_g_proxy(raw: &str) -> SshConfigProxy {
             continue;
         }
         if key.eq_ignore_ascii_case("proxyjump") {
-            proxy.proxy_jump = Some(value.to_string());
+            proxy_jump = Some(value.to_string());
         } else if key.eq_ignore_ascii_case("proxycommand") {
-            proxy.proxy_command = Some(value.to_string());
+            return None;
         }
     }
-    if proxy.proxy_command.is_some() {
-        proxy.proxy_jump = None;
-    }
-    proxy
+    proxy_jump
 }
 
 fn append_remote_command(
@@ -524,18 +495,14 @@ mod tests {
         assert_eq!(
             super::parse_proxyjump_hop("user@bastion:2222"),
             Some(super::ProxyJumpHop {
-                user: Some("user".to_string()),
-                host: "bastion".to_string(),
-                bracketed_host: false,
+                destination: "user@bastion".to_string(),
                 port: Some(2222),
             })
         );
         assert_eq!(
             super::parse_proxyjump_hop("user@[2001:db8::1]:2222"),
             Some(super::ProxyJumpHop {
-                user: Some("user".to_string()),
-                host: "2001:db8::1".to_string(),
-                bracketed_host: true,
+                destination: "user@[2001:db8::1]".to_string(),
                 port: Some(2222),
             })
         );
@@ -560,8 +527,7 @@ mod tests {
         let proxy =
             super::parse_ssh_g_proxy("hostname final.example\nproxyjump jump\nproxycommand none\n");
 
-        assert_eq!(proxy.proxy_jump.as_deref(), Some("jump"));
-        assert_eq!(proxy.proxy_command, None);
+        assert_eq!(proxy.as_deref(), Some("jump"));
     }
 
     #[test]
@@ -569,11 +535,7 @@ mod tests {
         let proxy =
             super::parse_ssh_g_proxy("proxyjump jump\nproxycommand ssh -W final.example:22 jump\n");
 
-        assert_eq!(proxy.proxy_jump, None);
-        assert_eq!(
-            proxy.proxy_command.as_deref(),
-            Some("ssh -W final.example:22 jump")
-        );
+        assert_eq!(proxy, None);
     }
 
     fn ssh_host(options: BTreeMap<String, String>) -> HostConfig {
