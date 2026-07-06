@@ -222,6 +222,7 @@ fn parse_proxyjump_hop(raw: &str) -> Option<ProxyJumpHop> {
         return None;
     }
     if let Some(uri) = raw.strip_prefix("ssh://") {
+        let uri = uri.strip_suffix('/').unwrap_or(uri);
         return parse_proxyjump_hop(uri);
     }
     let (user_prefix, host_port) = match raw.rsplit_once('@') {
@@ -302,7 +303,10 @@ fn proxy_command_for_hop(
         parts.push("-p".to_string());
         parts.push(shell_single_quote(port));
     }
-    parts.push(shell_single_quote(&hop.destination));
+    parts.push(shell_single_quote(&escape_percent_tokens(
+        &hop.destination,
+        escape_level + 1,
+    )));
     Some(parts.join(" "))
 }
 
@@ -583,6 +587,19 @@ Host jump2
     }
 
     #[test]
+    fn proxyjump_helper_escapes_destination_percent_tokens() {
+        let mut options = BTreeMap::new();
+        options.insert("ProxyJump".to_string(), "[fe80::1%en0]".to_string());
+        let host = ssh_host(options);
+
+        let command = super::base_command(&host, Duration::from_secs(5), true).unwrap();
+        let args = command_args(&command);
+        let proxy_command = ssh_option(&args, "ProxyCommand").expect("ProxyCommand");
+
+        assert!(proxy_command.contains("'fe80::1%%en0'"));
+    }
+
+    #[test]
     fn parses_proxyjump_hops_with_inline_ports_and_ipv6() {
         assert_eq!(
             super::parse_proxyjump_hop("user@bastion:2222"),
@@ -607,6 +624,13 @@ Host jump2
         );
         assert_eq!(
             super::parse_proxyjump_hop("ssh://jump"),
+            Some(super::ProxyJumpHop {
+                destination: "jump".to_string(),
+                port: None,
+            })
+        );
+        assert_eq!(
+            super::parse_proxyjump_hop("ssh://jump/"),
             Some(super::ProxyJumpHop {
                 destination: "jump".to_string(),
                 port: None,
