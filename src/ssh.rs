@@ -174,7 +174,7 @@ fn proxyjump_proxy_command(
 #[derive(Debug, PartialEq, Eq)]
 struct ProxyJumpHop {
     destination: String,
-    port: Option<u16>,
+    port: Option<String>,
 }
 
 fn parse_proxyjump_hop(raw: &str) -> Option<ProxyJumpHop> {
@@ -190,7 +190,7 @@ fn parse_proxyjump_hop(raw: &str) -> Option<ProxyJumpHop> {
 
     let (host, port) = if let Some(rest) = host_port.strip_prefix('[') {
         let close = rest.find(']')?;
-        let host = format!("[{}]", &rest[..close]);
+        let host = rest[..close].to_string();
         let suffix = &rest[close + 1..];
         if !suffix.is_empty() && !suffix.starts_with(':') {
             return None;
@@ -198,15 +198,13 @@ fn parse_proxyjump_hop(raw: &str) -> Option<ProxyJumpHop> {
         let port = suffix
             .strip_prefix(':')
             .filter(|port| !port.is_empty())
-            .map(str::parse)
-            .transpose()
-            .ok()?;
+            .map(str::to_string);
         (host, port)
     } else if let Some((host, port)) = host_port.rsplit_once(':') {
         if host.contains(':') {
             (host_port.to_string(), None)
         } else {
-            (host.to_string(), Some(port.parse().ok()?))
+            (host.to_string(), Some(port.to_string()))
         }
     } else {
         (host_port.to_string(), None)
@@ -254,9 +252,9 @@ fn proxy_command_for_hop(
     }
     parts.push("-W".to_string());
     parts.push(shell_single_quote(&stdio_forward_target(escape_level)));
-    if let Some(port) = hop.port {
+    if let Some(port) = &hop.port {
         parts.push("-p".to_string());
-        parts.push(shell_single_quote(&port.to_string()));
+        parts.push(shell_single_quote(port));
     }
     parts.push(shell_single_quote(&hop.destination));
     Some(parts.join(" "))
@@ -496,14 +494,21 @@ mod tests {
             super::parse_proxyjump_hop("user@bastion:2222"),
             Some(super::ProxyJumpHop {
                 destination: "user@bastion".to_string(),
-                port: Some(2222),
+                port: Some("2222".to_string()),
             })
         );
         assert_eq!(
             super::parse_proxyjump_hop("user@[2001:db8::1]:2222"),
             Some(super::ProxyJumpHop {
-                destination: "user@[2001:db8::1]".to_string(),
-                port: Some(2222),
+                destination: "user@2001:db8::1".to_string(),
+                port: Some("2222".to_string()),
+            })
+        );
+        assert_eq!(
+            super::parse_proxyjump_hop("bastion:ssh"),
+            Some(super::ProxyJumpHop {
+                destination: "bastion".to_string(),
+                port: Some("ssh".to_string()),
             })
         );
     }
