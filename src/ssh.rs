@@ -6,6 +6,8 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
+const MAX_PROXYJUMP_EXPANSION_DEPTH: usize = 8;
+
 pub fn run(
     host: &HostConfig,
     remote_command: &str,
@@ -136,8 +138,10 @@ fn disable_proxyjump_muxing(
         return;
     }
     let explicit_proxy_jump = option_value(options, "ProxyJump").map(str::to_string);
-    let proxy_jump = explicit_proxy_jump
-        .or_else(|| resolved_proxy_jump_from_ssh_config(config_file, port, target, options));
+    let port = port.map(|port| port.to_string());
+    let proxy_jump = explicit_proxy_jump.or_else(|| {
+        resolved_proxy_jump_from_ssh_config(config_file, port.as_deref(), target, options)
+    });
     let Some(proxy_jump) = proxy_jump else {
         return;
     };
@@ -162,13 +166,48 @@ fn proxyjump_proxy_command(
     if proxy_jump.eq_ignore_ascii_case("none") {
         return None;
     }
-    let jumps: Vec<ProxyJumpHop> = proxy_jump
+    let jumps = parse_proxyjump_chain(proxy_jump)?;
+    let jumps = expand_proxyjump_aliases(jumps, options, config_file, 0)?;
+    proxy_command_for_hop(&jumps, jumps.len().checked_sub(1)?, options, config_file, 0)
+}
+
+fn parse_proxyjump_chain(proxy_jump: &str) -> Option<Vec<ProxyJumpHop>> {
+    proxy_jump
         .split(',')
         .map(str::trim)
         .filter(|jump| !jump.is_empty())
         .map(parse_proxyjump_hop)
-        .collect::<Option<_>>()?;
-    proxy_command_for_hop(&jumps, jumps.len().checked_sub(1)?, options, config_file, 0)
+        .collect::<Option<_>>()
+}
+
+fn expand_proxyjump_aliases(
+    jumps: Vec<ProxyJumpHop>,
+    options: &BTreeMap<String, String>,
+    config_file: Option<&Path>,
+    depth: usize,
+) -> Option<Vec<ProxyJumpHop>> {
+    if depth >= MAX_PROXYJUMP_EXPANSION_DEPTH {
+        return None;
+    }
+    let mut expanded = Vec::new();
+    for hop in jumps {
+        if let Some(proxy_jump) = resolved_proxy_jump_from_ssh_config(
+            config_file,
+            hop.port.as_deref(),
+            &hop.destination,
+            options,
+        ) {
+            let nested = parse_proxyjump_chain(&proxy_jump)?;
+            expanded.extend(expand_proxyjump_aliases(
+                nested,
+                options,
+                config_file,
+                depth + 1,
+            )?);
+        }
+        expanded.push(hop);
+    }
+    Some(expanded)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -181,6 +220,9 @@ fn parse_proxyjump_hop(raw: &str) -> Option<ProxyJumpHop> {
     let raw = raw.trim();
     if raw.is_empty() {
         return None;
+    }
+    if let Some(uri) = raw.strip_prefix("ssh://") {
+        return parse_proxyjump_hop(uri);
     }
     let (user_prefix, host_port) = match raw.rsplit_once('@') {
         Some((_, "")) => return None,
@@ -204,7 +246,8 @@ fn parse_proxyjump_hop(raw: &str) -> Option<ProxyJumpHop> {
         if host.contains(':') {
             (host_port.to_string(), None)
         } else {
-            (host.to_string(), Some(port.to_string()))
+            let port = (!port.is_empty()).then(|| port.to_string());
+            (host.to_string(), port)
         }
     } else {
         (host_port.to_string(), None)
@@ -241,7 +284,10 @@ fn proxy_command_for_hop(
     ] {
         if let Some(value) = option_value(options, key) {
             parts.push("-o".to_string());
-            parts.push(shell_single_quote(&format!("{key}={value}")));
+            parts.push(shell_single_quote(&format!(
+                "{key}={}",
+                escape_percent_tokens(value, escape_level + 1)
+            )));
         }
     }
     if index > 0 {
@@ -261,13 +307,21 @@ fn proxy_command_for_hop(
 }
 
 fn stdio_forward_target(escape_level: usize) -> String {
-    let percent = "%".repeat(1usize.checked_shl(escape_level as u32).unwrap_or(1));
+    let percent = percent_tokens(escape_level);
     format!("[{percent}h]:{percent}p")
+}
+
+fn escape_percent_tokens(value: &str, escape_level: usize) -> String {
+    value.replace('%', &percent_tokens(escape_level))
+}
+
+fn percent_tokens(escape_level: usize) -> String {
+    "%".repeat(1usize.checked_shl(escape_level as u32).unwrap_or(1))
 }
 
 fn resolved_proxy_jump_from_ssh_config(
     config_file: Option<&Path>,
-    port: Option<u16>,
+    port: Option<&str>,
     target: &str,
     options: &BTreeMap<String, String>,
 ) -> Option<String> {
@@ -283,7 +337,7 @@ fn resolved_proxy_jump_from_ssh_config(
         command.arg("-o").arg(format!("{key}={value}"));
     }
     if let Some(port) = port {
-        command.arg("-p").arg(port.to_string());
+        command.arg("-p").arg(port);
     }
     command.arg(target);
 
@@ -361,9 +415,10 @@ fn shell_single_quote(input: &str) -> String {
 mod tests {
     use crate::config::{HostConfig, HostKind, SshConfig};
     use std::collections::BTreeMap;
+    use std::fs;
     use std::path::PathBuf;
     use std::process::Command;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn ssh_options_default_to_non_interactive_timeout() {
@@ -489,6 +544,45 @@ mod tests {
     }
 
     #[test]
+    fn proxyjump_expands_nested_alias_proxyjumps() {
+        let config_file = temp_ssh_config(
+            r#"
+Host jump2
+  ProxyJump jump1
+"#,
+        );
+        let mut options = BTreeMap::new();
+        options.insert("ProxyJump".to_string(), "jump2".to_string());
+        let host = ssh_host_with_config(options, config_file.clone());
+
+        let command = super::base_command(&host, Duration::from_secs(5), true).unwrap();
+        let args = command_args(&command);
+        let proxy_command = ssh_option(&args, "ProxyCommand").expect("ProxyCommand");
+        let _ = fs::remove_file(config_file);
+
+        assert!(proxy_command.contains("ProxyCommand="));
+        assert!(proxy_command.contains("-W '[%h]:%p' 'jump2'"));
+        assert!(proxy_command.contains("[%%h]:%%p"));
+        assert!(proxy_command.contains("jump1"));
+        assert!(!proxy_command.contains(" -J "));
+    }
+
+    #[test]
+    fn proxyjump_helper_escapes_controlpath_tokens() {
+        let mut options = BTreeMap::new();
+        options.insert("ProxyJump".to_string(), "jump".to_string());
+        options.insert("ControlMaster".to_string(), "auto".to_string());
+        options.insert("ControlPath".to_string(), "/tmp/remux-%r@%h:%p".to_string());
+        let host = ssh_host(options);
+
+        let command = super::base_command(&host, Duration::from_secs(5), true).unwrap();
+        let args = command_args(&command);
+        let proxy_command = ssh_option(&args, "ProxyCommand").expect("ProxyCommand");
+
+        assert!(proxy_command.contains("'ControlPath=/tmp/remux-%%r@%%h:%%p'"));
+    }
+
+    #[test]
     fn parses_proxyjump_hops_with_inline_ports_and_ipv6() {
         assert_eq!(
             super::parse_proxyjump_hop("user@bastion:2222"),
@@ -509,6 +603,20 @@ mod tests {
             Some(super::ProxyJumpHop {
                 destination: "bastion".to_string(),
                 port: Some("ssh".to_string()),
+            })
+        );
+        assert_eq!(
+            super::parse_proxyjump_hop("ssh://jump"),
+            Some(super::ProxyJumpHop {
+                destination: "jump".to_string(),
+                port: None,
+            })
+        );
+        assert_eq!(
+            super::parse_proxyjump_hop("jump:"),
+            Some(super::ProxyJumpHop {
+                destination: "jump".to_string(),
+                port: None,
             })
         );
     }
@@ -544,6 +652,10 @@ mod tests {
     }
 
     fn ssh_host(options: BTreeMap<String, String>) -> HostConfig {
+        ssh_host_with_config(options, PathBuf::from("/dev/null"))
+    }
+
+    fn ssh_host_with_config(options: BTreeMap<String, String>, config_file: PathBuf) -> HostConfig {
         HostConfig {
             id: "pi".to_string(),
             kind: HostKind::Ssh,
@@ -554,7 +666,7 @@ mod tests {
                 host: None,
                 user: None,
                 port: None,
-                config_file: Some(PathBuf::from("/dev/null")),
+                config_file: Some(config_file),
                 options,
                 remote_shell: None,
             }),
@@ -579,5 +691,18 @@ mod tests {
             .filter_map(|window| window[1].split_once('='))
             .find(|(option_key, _)| option_key.eq_ignore_ascii_case(key))
             .map(|(_, value)| value)
+    }
+
+    fn temp_ssh_config(contents: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "remux-ssh-test-{}-{nanos}.conf",
+            std::process::id()
+        ));
+        fs::write(&path, contents).unwrap();
+        path
     }
 }
