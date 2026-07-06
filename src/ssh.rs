@@ -101,15 +101,22 @@ fn apply_interactive_options(
     // A long-lived interactive attach should not reuse a stale multiplexed
     // connection after sleep/wake. Polling may still opt into muxing for speed,
     // and explicit remux ssh.options can override these defaults.
-    ensure_option(options, "ControlMaster", "no");
-    ensure_option(options, "ControlPath", "none");
+    let control_master = option_value(options, "ControlMaster").map(str::to_string);
+    if control_master.is_none() {
+        options.insert("ControlMaster".to_string(), "no".to_string());
+    }
+    if control_master
+        .as_deref()
+        .is_none_or(control_master_disables_muxing)
+        && !contains_option(options, "ControlPath")
+    {
+        options.insert("ControlPath".to_string(), "none".to_string());
+    }
     disable_proxyjump_muxing(options, config_file, port, target);
 }
 
-fn ensure_option(options: &mut BTreeMap<String, String>, key: &str, value: &str) {
-    if !contains_option(options, key) {
-        options.insert(key.to_string(), value.to_string());
-    }
+fn control_master_disables_muxing(value: &str) -> bool {
+    value.eq_ignore_ascii_case("no") || value.eq_ignore_ascii_case("false")
 }
 
 fn contains_option(options: &BTreeMap<String, String>, key: &str) -> bool {
@@ -161,20 +168,93 @@ fn proxyjump_proxy_command(
     if proxy_jump.eq_ignore_ascii_case("none") {
         return None;
     }
-    let mut jumps: Vec<&str> = proxy_jump
+    let jumps: Vec<ProxyJumpHop> = proxy_jump
         .split(',')
         .map(str::trim)
         .filter(|jump| !jump.is_empty())
-        .collect();
-    let destination = jumps.pop()?;
+        .map(parse_proxyjump_hop)
+        .collect::<Option<_>>()?;
+    proxy_command_for_hop(&jumps, jumps.len().checked_sub(1)?, options, config_file, 0)
+}
 
+#[derive(Debug, PartialEq, Eq)]
+struct ProxyJumpHop {
+    user: Option<String>,
+    host: String,
+    bracketed_host: bool,
+    port: Option<u16>,
+}
+
+fn parse_proxyjump_hop(raw: &str) -> Option<ProxyJumpHop> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let (user, host_port) = raw
+        .rsplit_once('@')
+        .map(|(user, host_port)| (Some(user.to_string()), host_port))
+        .unwrap_or((None, raw));
+
+    let (host, bracketed_host, port) = if let Some(rest) = host_port.strip_prefix('[') {
+        let close = rest.find(']')?;
+        let host = rest[..close].to_string();
+        let suffix = &rest[close + 1..];
+        let port = suffix
+            .strip_prefix(':')
+            .filter(|port| !port.is_empty())
+            .map(str::parse)
+            .transpose()
+            .ok()?;
+        (host, true, port)
+    } else if let Some((host, port)) = host_port.rsplit_once(':') {
+        if host.contains(':') {
+            (host_port.to_string(), false, None)
+        } else {
+            (host.to_string(), false, Some(port.parse().ok()?))
+        }
+    } else {
+        (host_port.to_string(), false, None)
+    };
+
+    if host.is_empty() {
+        return None;
+    }
+    Some(ProxyJumpHop {
+        user,
+        host,
+        bracketed_host,
+        port,
+    })
+}
+
+impl ProxyJumpHop {
+    fn destination(&self) -> String {
+        let host = if self.bracketed_host {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        match &self.user {
+            Some(user) => format!("{user}@{host}"),
+            None => host,
+        }
+    }
+}
+
+fn proxy_command_for_hop(
+    jumps: &[ProxyJumpHop],
+    index: usize,
+    options: &BTreeMap<String, String>,
+    config_file: Option<&Path>,
+    escape_level: usize,
+) -> Option<String> {
+    let hop = jumps.get(index)?;
     let mut parts = vec!["ssh".to_string()];
     if let Some(config_file) = config_file {
         parts.push("-F".to_string());
         parts.push(shell_single_quote(&config_file.to_string_lossy()));
     }
     for key in [
-        "BatchMode",
         "ConnectTimeout",
         "ServerAliveInterval",
         "ServerAliveCountMax",
@@ -186,14 +266,25 @@ fn proxyjump_proxy_command(
             parts.push(shell_single_quote(&format!("{key}={value}")));
         }
     }
-    if !jumps.is_empty() {
-        parts.push("-J".to_string());
-        parts.push(shell_single_quote(&jumps.join(",")));
+    if index > 0 {
+        let nested =
+            proxy_command_for_hop(jumps, index - 1, options, config_file, escape_level + 1)?;
+        parts.push("-o".to_string());
+        parts.push(shell_single_quote(&format!("ProxyCommand={nested}")));
     }
     parts.push("-W".to_string());
-    parts.push(shell_single_quote("%h:%p"));
-    parts.push(shell_single_quote(destination));
+    parts.push(shell_single_quote(&stdio_forward_target(escape_level)));
+    if let Some(port) = hop.port {
+        parts.push("-p".to_string());
+        parts.push(shell_single_quote(&port.to_string()));
+    }
+    parts.push(shell_single_quote(&hop.destination()));
     Some(parts.join(" "))
+}
+
+fn stdio_forward_target(escape_level: usize) -> String {
+    let percent = "%".repeat(1usize.checked_shl(escape_level as u32).unwrap_or(1));
+    format!("[{percent}h]:{percent}p")
 }
 
 fn resolved_proxy_jump_from_ssh_config(
@@ -367,7 +458,87 @@ mod tests {
         let proxy_command = ssh_option(&args, "ProxyCommand").expect("ProxyCommand");
         assert!(proxy_command.contains("'ControlMaster=no'"));
         assert!(proxy_command.contains("'ControlPath=none'"));
-        assert!(proxy_command.contains("-W '%h:%p' 'jump'"));
+        assert!(proxy_command.contains("-W '[%h]:%p' 'jump'"));
+        assert!(!proxy_command.contains("BatchMode"));
+    }
+
+    #[test]
+    fn explicit_control_master_auto_inherits_configured_control_path() {
+        let mut options = BTreeMap::new();
+        options.insert("ControlMaster".to_string(), "auto".to_string());
+        let host = ssh_host(options);
+
+        let command = super::base_command(&host, Duration::from_secs(5), true).unwrap();
+        let args = command_args(&command);
+
+        assert!(has_ssh_option(&args, "ControlMaster=auto"));
+        assert!(!has_ssh_option(&args, "ControlPath=none"));
+    }
+
+    #[test]
+    fn explicit_control_master_no_still_disables_control_path() {
+        let mut options = BTreeMap::new();
+        options.insert("ControlMaster".to_string(), "no".to_string());
+        let host = ssh_host(options);
+
+        let command = super::base_command(&host, Duration::from_secs(5), true).unwrap();
+        let args = command_args(&command);
+
+        assert!(has_ssh_option(&args, "ControlMaster=no"));
+        assert!(has_ssh_option(&args, "ControlPath=none"));
+    }
+
+    #[test]
+    fn proxyjump_inline_port_becomes_helper_port_argument() {
+        let mut options = BTreeMap::new();
+        options.insert("ProxyJump".to_string(), "bastion:2222".to_string());
+        let host = ssh_host(options);
+
+        let command = super::base_command(&host, Duration::from_secs(5), true).unwrap();
+        let args = command_args(&command);
+        let proxy_command = ssh_option(&args, "ProxyCommand").expect("ProxyCommand");
+
+        assert!(proxy_command.contains("-p '2222' 'bastion'"));
+        assert!(!proxy_command.contains("'bastion:2222'"));
+    }
+
+    #[test]
+    fn proxyjump_multiple_hops_uses_nested_proxycommands_not_nested_j() {
+        let mut options = BTreeMap::new();
+        options.insert("ProxyJump".to_string(), "jump1,jump2".to_string());
+        let host = ssh_host(options);
+
+        let command = super::base_command(&host, Duration::from_secs(5), true).unwrap();
+        let args = command_args(&command);
+        let proxy_command = ssh_option(&args, "ProxyCommand").expect("ProxyCommand");
+
+        assert!(proxy_command.contains("ProxyCommand="));
+        assert!(proxy_command.contains("-W '[%h]:%p' 'jump2'"));
+        assert!(proxy_command.contains("[%%h]:%%p"));
+        assert!(proxy_command.contains("jump1"));
+        assert!(!proxy_command.contains(" -J "));
+    }
+
+    #[test]
+    fn parses_proxyjump_hops_with_inline_ports_and_ipv6() {
+        assert_eq!(
+            super::parse_proxyjump_hop("user@bastion:2222"),
+            Some(super::ProxyJumpHop {
+                user: Some("user".to_string()),
+                host: "bastion".to_string(),
+                bracketed_host: false,
+                port: Some(2222),
+            })
+        );
+        assert_eq!(
+            super::parse_proxyjump_hop("user@[2001:db8::1]:2222"),
+            Some(super::ProxyJumpHop {
+                user: Some("user".to_string()),
+                host: "2001:db8::1".to_string(),
+                bracketed_host: true,
+                port: Some(2222),
+            })
+        );
     }
 
     #[test]
