@@ -12,7 +12,10 @@ use crate::snapshot::{
 use crate::tmux::PaneTarget;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, Event, KeyCode, KeyEvent,
+    KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -25,7 +28,13 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
 use std::cmp::Ordering;
 use std::collections::{HashSet, VecDeque};
+#[cfg(unix)]
+use std::fs::{File, OpenOptions};
 use std::io::{self, Stdout};
+#[cfg(unix)]
+use std::mem::MaybeUninit;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -38,6 +47,7 @@ pub fn run(config: &Config, host: Option<String>, filter: Option<String>) -> Res
         config.host(host_id)?;
     }
 
+    let saved_terminal_mode = SavedTerminalMode::capture()?;
     let mut terminal = enter_terminal()?;
     let result = run_app(
         config.clone(),
@@ -46,6 +56,7 @@ pub fn run(config: &Config, host: Option<String>, filter: Option<String>) -> Res
         &mut terminal,
     );
     leave_terminal(&mut terminal)?;
+    saved_terminal_mode.restore()?;
     result
 }
 
@@ -86,7 +97,14 @@ fn run_app(
 fn enter_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode().context("failed to enable terminal raw mode")?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
+    execute!(
+        stdout,
+        DisableMouseCapture,
+        DisableFocusChange,
+        DisableBracketedPaste,
+        EnterAlternateScreen
+    )
+    .context("failed to reset terminal modes and enter alternate screen")?;
     let backend = CrosstermBackend::new(stdout);
     Terminal::new(backend).context("failed to initialize terminal")
 }
@@ -103,9 +121,110 @@ fn suspend_terminal<T>(
     action: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
     leave_terminal(terminal)?;
+    let saved_terminal_mode = SavedTerminalMode::capture()?;
     let result = action();
+    // An abruptly terminated ssh/tmux client is not guaranteed to restore the
+    // local TTY. In particular, a proxy can leave stdin in its raw mode while
+    // remux successfully returns to its alternate screen, making the TUI look
+    // alive while it no longer receives usable key events. Restore the mode
+    // captured before the interactive action before crossterm establishes a
+    // new raw-mode baseline.
+    saved_terminal_mode.restore()?;
     *terminal = enter_terminal()?;
     result
+}
+
+struct SavedTerminalMode {
+    #[cfg(unix)]
+    mode: libc::termios,
+}
+
+impl SavedTerminalMode {
+    fn capture() -> Result<Self> {
+        #[cfg(unix)]
+        {
+            let tty =
+                TerminalFile::open().context("failed to open terminal before starting TUI")?;
+            Self::capture_fd(tty.fd())
+                .context("failed to capture terminal mode before starting TUI")
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {})
+        }
+    }
+
+    fn restore(&self) -> Result<()> {
+        #[cfg(unix)]
+        {
+            let tty = TerminalFile::open()
+                .context("failed to open terminal after interactive command")?;
+            self.restore_fd(tty.fd())
+                .context("failed to restore terminal mode after interactive command")?;
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn capture_fd(fd: RawFd) -> io::Result<Self> {
+        terminal_mode(fd).map(|mode| Self { mode })
+    }
+
+    #[cfg(unix)]
+    fn restore_fd(&self, fd: RawFd) -> io::Result<()> {
+        set_terminal_mode(fd, &self.mode)
+    }
+}
+
+#[cfg(unix)]
+enum TerminalFile {
+    Stdin,
+    Tty(File),
+}
+
+#[cfg(unix)]
+impl TerminalFile {
+    fn open() -> io::Result<Self> {
+        // SAFETY: isatty only inspects the process-owned stdin descriptor.
+        if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
+            Ok(Self::Stdin)
+        } else {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/tty")
+                .map(Self::Tty)
+        }
+    }
+
+    fn fd(&self) -> RawFd {
+        match self {
+            Self::Stdin => libc::STDIN_FILENO,
+            Self::Tty(file) => file.as_raw_fd(),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn terminal_mode(fd: libc::c_int) -> io::Result<libc::termios> {
+    let mut mode = MaybeUninit::uninit();
+    // SAFETY: `mode` points to writable storage for a termios value and `fd`
+    // is only passed to libc for the duration of this call.
+    if unsafe { libc::tcgetattr(fd, mode.as_mut_ptr()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: tcgetattr returned success and initialized the termios value.
+    Ok(unsafe { mode.assume_init() })
+}
+
+#[cfg(unix)]
+fn set_terminal_mode(fd: libc::c_int, mode: &libc::termios) -> io::Result<()> {
+    // SAFETY: `mode` is a valid termios value captured by tcgetattr and remains
+    // alive for the duration of the call.
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, mode) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 struct App {
@@ -3413,6 +3532,56 @@ mod tests {
         HostSnapshot, MatchStatus, OutputSnapshot, ProcessSnapshot, SessionSnapshot, SessionState,
         SnapshotStatus, TmuxSnapshot,
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_mode_round_trip_repairs_raw_tty_state() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        use std::ptr;
+
+        let mut master_fd = -1;
+        let mut slave_fd = -1;
+        // SAFETY: openpty initializes both file descriptors on success; the
+        // remaining optional output pointers are intentionally null.
+        let status = unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, 0, "openpty failed: {}", io::Error::last_os_error());
+        // SAFETY: openpty returned two newly owned file descriptors.
+        let _master = unsafe { OwnedFd::from_raw_fd(master_fd) };
+        // SAFETY: openpty returned two newly owned file descriptors.
+        let slave = unsafe { OwnedFd::from_raw_fd(slave_fd) };
+
+        let saved = SavedTerminalMode::capture_fd(slave_fd).unwrap();
+        let original = saved.mode;
+        let mut corrupted = original;
+        // SAFETY: `corrupted` is an initialized termios value.
+        unsafe { libc::cfmakeraw(&mut corrupted) };
+        set_terminal_mode(slave_fd, &corrupted).unwrap();
+        let raw = terminal_mode(slave_fd).unwrap();
+        assert_ne!(raw.c_lflag, original.c_lflag);
+
+        saved.restore_fd(slave_fd).unwrap();
+        let restored = terminal_mode(slave_fd).unwrap();
+        assert_eq!(restored.c_iflag, original.c_iflag);
+        assert_eq!(restored.c_oflag, original.c_oflag);
+        assert_eq!(restored.c_cflag, original.c_cflag);
+        let input_behavior_flags =
+            libc::ECHO | libc::ECHONL | libc::ICANON | libc::IEXTEN | libc::ISIG;
+        assert_eq!(
+            restored.c_lflag & input_behavior_flags,
+            original.c_lflag & input_behavior_flags
+        );
+        assert_eq!(restored.c_cc, original.c_cc);
+
+        drop(slave);
+    }
 
     fn make_row(match_status: MatchStatus, state: SessionState) -> SessionSnapshot {
         SessionSnapshot {
