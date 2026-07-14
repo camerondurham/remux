@@ -753,12 +753,13 @@ dependencies = [
 
 [[package]]
 name = "remux"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "chrono",
  "clap",
  "crossterm",
+ "libc",
  "ratatui",
  "serde",
  "serde_json",
